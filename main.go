@@ -19,6 +19,9 @@ import (
 const halfCloseIdleTimeout = 30 * time.Second
 const dialTimeout = 5 * time.Second
 
+// copyChunkSize is the most data moved per read/splice call in either direction.
+const copyChunkSize = 64 << 10
+
 type forwardsFlag []string
 
 func (f *forwardsFlag) String() string { return strings.Join(*f, ",") }
@@ -96,7 +99,7 @@ func run(ctx context.Context, forwards []forwarding) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			acceptConnections(ctx, f.listener, f.target)
+			acceptConnections(ctx, f.listener, f.target, halfCloseIdleTimeout)
 		}()
 	}
 	<-ctx.Done()
@@ -107,7 +110,7 @@ func run(ctx context.Context, forwards []forwarding) error {
 	return ctx.Err()
 }
 
-func acceptConnections(ctx context.Context, ln net.Listener, target string) {
+func acceptConnections(ctx context.Context, ln net.Listener, target string, idleTimeout time.Duration) {
 	for {
 		client, err := ln.Accept()
 		if err != nil {
@@ -116,11 +119,11 @@ func acceptConnections(ctx context.Context, ln net.Listener, target string) {
 			}
 			return
 		}
-		go handleConnection(client, target)
+		go handleConnection(client, target, idleTimeout)
 	}
 }
 
-func handleConnection(client net.Conn, target string) {
+func handleConnection(client net.Conn, target string, idleTimeout time.Duration) {
 	upstream, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
 		log.Printf("connect to %s: %v", target, err)
@@ -134,8 +137,14 @@ func handleConnection(client net.Conn, target string) {
 	// without preventing the opposite direction from returning a final response.
 	done := make(chan struct{}, 2)
 	activity := make(chan struct{}, 1)
+	signalActivity := func() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
 	copyDirection := func(dst, src net.Conn) {
-		_, _ = io.Copy(&activityWriter{conn: dst, activity: activity}, src)
+		_ = copyStream(dst, src, signalActivity)
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
@@ -152,7 +161,7 @@ func handleConnection(client net.Conn, target string) {
 		case <-done:
 			completed++
 			if completed == 1 {
-				timer = time.NewTimer(halfCloseIdleTimeout)
+				timer = time.NewTimer(idleTimeout)
 				timeout = timer.C
 			}
 		case <-activity:
@@ -163,7 +172,7 @@ func handleConnection(client net.Conn, target string) {
 					default:
 					}
 				}
-				timer.Reset(halfCloseIdleTimeout)
+				timer.Reset(idleTimeout)
 			}
 		case <-timeout:
 			return // deferred Close interrupts the remaining blocked copy.
@@ -174,18 +183,23 @@ func handleConnection(client net.Conn, target string) {
 	}
 }
 
-type activityWriter struct {
-	conn     net.Conn
-	activity chan<- struct{}
-}
-
-func (w *activityWriter) Write(p []byte) (int, error) {
-	n, err := w.conn.Write(p)
-	if n > 0 {
-		select {
-		case w.activity <- struct{}{}:
-		default:
+// copyBuffered moves src to dst through a user-space buffer, reporting
+// activity after every write that makes progress.
+func copyBuffered(dst, src net.Conn, activity func()) error {
+	buf := make([]byte, copyChunkSize)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			activity()
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
 		}
 	}
-	return n, err
 }
