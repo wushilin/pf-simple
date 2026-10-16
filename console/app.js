@@ -149,12 +149,54 @@ function chevron() {
   return svg;
 }
 
-function metric(label, cls) {
+function arrowIcon(dir) {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("class", "arrow-icon");
+  svg.setAttribute("aria-hidden", "true");
+  const p = document.createElementNS(SVG, "path");
+  p.setAttribute("d", dir === "up" ? "M8 13V3M3.5 7.5 8 3l4.5 4.5" : "M8 3v10M3.5 8.5 8 13l4.5-4.5");
+  p.setAttribute("fill", "none");
+  p.setAttribute("stroke", "currentColor");
+  p.setAttribute("stroke-width", "1.9");
+  p.setAttribute("stroke-linecap", "round");
+  p.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(p);
+  return svg;
+}
+
+// metric builds a label/value pair; dir adds an up or down arrow icon.
+function metric(label, cls, dir) {
   const box = el("div", "metric " + cls);
-  box.appendChild(el("span", "k", label));
+  const k = el("span", "k");
+  if (dir) k.appendChild(arrowIcon(dir));
+  k.appendChild(document.createTextNode(label));
+  box.appendChild(k);
   const v = el("span", "v " + cls, "—");
   box.appendChild(v);
   return [box, v];
+}
+
+// updown builds the stacked "↑ bytes / ↓ bytes" cell.
+function updown(cls) {
+  const box = el("span", cls);
+  const up = el("span", "up");
+  const down = el("span", "down");
+  const upV = el("span");
+  const downV = el("span");
+  up.append(arrowIcon("up"), upV);
+  down.append(arrowIcon("down"), downV);
+  box.append(up, down);
+  return [box, upV, downV];
+}
+
+function actionButton(label, cls, icon) {
+  const b = el("button", "act " + cls);
+  b.type = "button";
+  if (icon) b.appendChild(el("span", "ico"));
+  const t = el("span", "", label);
+  b.appendChild(t);
+  return [b, t];
 }
 
 // ---------- charts ----------
@@ -260,8 +302,9 @@ function drawSpark(c, ring) {
 
 function buildListener(l) {
   const card = el("article", "listener");
-  const head = el("button", "l-head");
-  head.type = "button";
+  const head = el("div", "l-head");
+  head.tabIndex = 0;
+  head.setAttribute("role", "button");
   head.setAttribute("aria-expanded", "false");
   head.appendChild(chevron());
 
@@ -270,28 +313,39 @@ function buildListener(l) {
   const listen = el("span", "listen");
   const target = el("span", "target");
   const chips = el("span", "chips");
+  const status = el("span", "chip warn");
   const active = el("span", "chip");
   const accepted = el("span", "chip");
   const failed = el("span", "chip bad");
   const refused = el("span", "chip bad");
   const limTotal = el("span", "chip limit");
   const limConn = el("span", "chip limit");
-  chips.append(active, accepted, failed, refused, limTotal, limConn);
-  route.append(lname, listen, el("span", "arrow", "→"), target, chips);
+  chips.append(status, active, accepted, failed, refused, limTotal, limConn);
+  const line = el("div", "route-line");
+  line.append(lname, listen, el("span", "arrow", "→"), target);
+  route.append(line, chips);
   head.appendChild(route);
 
   const spark = el("canvas", "spark");
   spark.setAttribute("aria-hidden", "true");
   head.appendChild(spark);
-  const [txBox, tx] = metric("To upstream", "tx");
-  const [rxBox, rx] = metric("To clients", "rx");
-  const [totBox, total] = metric("Total", "total");
-  head.append(txBox, rxBox, totBox);
+  const [txBox, tx] = metric("Rate", "tx", "up");
+  const [rxBox, rx] = metric("Rate", "rx", "down");
+  const [upBox, totalUp] = metric("Sent", "tx", "up");
+  const [downBox, totalDown] = metric("Sent", "rx", "down");
+  head.append(txBox, rxBox, upBox, downBox);
+
+  const actions = el("div", "l-actions");
+  const [toggleBtn, toggleLabel] = actionButton("Stop", "", true);
+  const [editBtn] = actionButton("Edit", "");
+  const [delBtn, delLabel] = actionButton("Delete", "danger");
+  actions.append(toggleBtn, editBtn, delBtn);
+  head.appendChild(actions);
 
   const body = el("div", "l-body");
   body.hidden = true;
   const thead = el("div", "t-head cols");
-  ["", "ID", "Client", "Age", "State", "To upstream", "To clients", "Total", ""].forEach((label, i) => {
+  ["", "ID", "Client", "Age", "State", "To upstream", "To clients", "Transferred", ""].forEach((label, i) => {
     thead.appendChild(el("span", i >= 5 && i <= 7 ? "r" : "", label));
   });
   const empty = el("div", "empty");
@@ -303,14 +357,26 @@ function buildListener(l) {
   const more = el("div", "more");
   body.append(thead, empty, more);
 
-  head.addEventListener("click", () => {
+  const toggle = () => {
     if (ui.expanded.has(l.id)) ui.expanded.delete(l.id); else ui.expanded.add(l.id);
     renderRows(ui.L.get(l.id));
     paint();
+  };
+  head.addEventListener("click", (ev) => { if (!actions.contains(ev.target)) toggle(); });
+  head.addEventListener("keydown", (ev) => {
+    if (ev.target !== head) return;
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); }
   });
+  toggleBtn.addEventListener("click", () => onStartStop(l.id));
+  editBtn.addEventListener("click", () => openEditor(ui.L.get(l.id).data));
+  delBtn.addEventListener("click", () => onDeleteListener(l.id));
 
   card.append(head, body);
-  return { id: l.id, data: l, card, head, lname, listen, target, active, accepted, failed, refused, limTotal, limConn, spark, tx, rx, total, body, thead, empty, sleepy, emptyText, more, shown: [] };
+  return {
+    id: l.id, data: l, card, head, lname, listen, target, status, active, accepted, failed, refused, limTotal, limConn,
+    spark, tx, rx, totalUp, totalDown, toggleBtn, toggleLabel, editBtn, delBtn, delLabel,
+    body, thead, empty, sleepy, emptyText, more, shown: [],
+  };
 }
 
 // ---------- pipe rows ----------
@@ -363,7 +429,7 @@ function buildPipe(p) {
   stateCell.appendChild(state);
   const tx = el("span", "p-rate tx r");
   const rx = el("span", "p-rate rx r");
-  const total = el("span", "p-total r");
+  const [total, totalUp, totalDown] = updown("p-total r");
   const action = el("span", "p-action");
   const stop = el("button", "stop");
   stop.type = "button";
@@ -411,7 +477,7 @@ function buildPipe(p) {
   stop.addEventListener("click", (ev) => { ev.stopPropagation(); onStop(p.id); });
 
   return {
-    id: p.id, data: p, wrap, row, client, age, state, tx, rx, total, stop, stopLabel, detail,
+    id: p.id, data: p, wrap, row, client, age, state, tx, rx, totalUp, totalDown, stop, stopLabel, detail,
     cRemote, pfIn, pfOut, uRemote, c2p, p2c, p2u, u2p, opened, duration, inflight, delivered,
   };
 }
@@ -482,7 +548,10 @@ function disarm(id) {
 }
 
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") for (const id of [...ui.armed.keys()]) disarm(id);
+  if (ev.key === "Escape") {
+    for (const id of [...ui.armed.keys()]) disarm(id);
+    for (const id of [...armedDeletes.keys()]) disarmDelete(id);
+  }
 });
 
 // ---------- applying pushed state ----------
@@ -543,6 +612,9 @@ function applyState(s) {
     if (seenL.has(id)) continue;
     lr.card.remove();
     ui.L.delete(id);
+    clearTimeout(armedDeletes.get(id));
+    armedDeletes.delete(id);
+    pendingListeners.delete(id);
     ui.history.delete(id);
     ui.expanded.delete(id);
     ui.meters.delete("lt" + id);
@@ -582,7 +654,9 @@ function renderRows(lr) {
   if (want.length === 0) {
     const none = l.pipeCount === 0;
     lr.sleepy.hidden = !none;
-    setText(lr.emptyText, none ? `No active pipes. Connections to ${l.name ? `${l.name} [${l.listen}]` : l.listen} show up here.` : `No pipes match “${ui.filter}”.`);
+    const label = l.name ? `${l.name} [${l.listen}]` : l.listen;
+    const idle = l.running ? `No active pipes. Connections to ${label} show up here.` : `${label} is stopped. Start it to accept connections.`;
+    setText(lr.emptyText, none ? idle : `No pipes match “${ui.filter}”.`);
   }
   const hidden = visible.length - want.length;
   const capped = l.pipeCount - l.pipes.length;
@@ -599,13 +673,15 @@ function paint() {
   const s = ui.state;
   if (!s) return;
   const now = serverNow();
-  let active = 0, accepted = 0, txAll = 0, rxAll = 0, total = 0, matched = 0, all = 0;
+  let active = 0, accepted = 0, txAll = 0, rxAll = 0, totalUp = 0, totalDown = 0, matched = 0, all = 0, running = 0;
 
   for (const lr of ui.L.values()) {
     const l = lr.data;
     const tx = meter("lt" + l.id).rate(now);
     const rx = meter("lr" + l.id).rate(now);
-    active += l.pipeCount; accepted += l.accepted; txAll += tx; rxAll += rx; total += l.bytesUp + l.bytesDown;
+    active += l.pipeCount; accepted += l.accepted; txAll += tx; rxAll += rx;
+    totalUp += l.bytesUp; totalDown += l.bytesDown;
+    if (l.running) running++;
     all += l.pipes.length;
     if (ui.filter) matched += l.pipes.filter((p) => matches(p, l)).length;
     lr.lname.hidden = !l.name;
@@ -613,6 +689,12 @@ function paint() {
     setText(lr.listen, l.name ? `[${l.listen}]` : l.listen);
     lr.listen.classList.toggle("bracketed", !!l.name);
     setText(lr.target, l.target);
+    lr.card.classList.toggle("stopped", !l.running);
+    lr.status.hidden = l.running;
+    setText(lr.status, l.error ? "failed to start" : "stopped");
+    lr.status.className = l.error ? "chip bad" : "chip warn";
+    lr.status.title = l.error || "Not accepting connections";
+    lr.active.hidden = !l.running && l.pipeCount === 0;
     setText(lr.active, l.maxConns > 0 ? `${l.pipeCount} / ${l.maxConns} active` : `${l.pipeCount} active`);
     const full = l.maxConns > 0 && l.pipeCount >= l.maxConns;
     lr.active.className = full ? "chip bad" : l.pipeCount > 0 ? "chip live" : "chip";
@@ -632,7 +714,9 @@ function paint() {
     lr.failed.title = "Upstream connection attempts that failed";
     setText(lr.tx, fmtRate(tx));
     setText(lr.rx, fmtRate(rx));
-    setText(lr.total, fmtBytes(l.bytesUp + l.bytesDown));
+    setText(lr.totalUp, fmtBytes(l.bytesUp));
+    setText(lr.totalDown, fmtBytes(l.bytesDown));
+    paintListenerActions(lr, l, s.manage);
 
     for (const id of lr.shown) {
       const pr = ui.P.get(id);
@@ -644,7 +728,10 @@ function paint() {
   setText($("k-accepted"), String(accepted));
   setText($("k-tx"), fmtRate(txAll));
   setText($("k-rx"), fmtRate(rxAll));
-  setText($("k-total"), fmtBytes(total));
+  setText($("k-total-up"), fmtBytes(totalUp));
+  setText($("k-total-down"), fmtBytes(totalDown));
+  setText($("k-listeners"), ui.L.size === running ? String(running) : `${running} / ${ui.L.size} running`);
+  $("add-listener").hidden = !(s.manage && s.manage.enabled);
   setText($("k-uptime"), fmtAge(now - s.started));
   setText($("filter-note"), ui.filter ? `${matched} of ${all} pipes match` : "");
 }
@@ -660,7 +747,8 @@ function paintPipe(pr, now) {
   pr.state.title = title;
   setText(pr.tx, fmtRate(meter("pt" + p.id).rate(now)));
   setText(pr.rx, fmtRate(meter("pr" + p.id).rate(now)));
-  setText(pr.total, fmtBytes(p.pfToUpstream + p.pfToClient));
+  setText(pr.totalUp, fmtBytes(p.pfToUpstream));
+  setText(pr.totalDown, fmtBytes(p.pfToClient));
   if (pr.detail.hidden) return;
   setText(pr.cRemote, p.clientRemote);
   setText(pr.pfIn, p.clientLocal);
@@ -703,6 +791,160 @@ function sample() {
 function redrawCharts() {
   for (const lr of ui.L.values()) drawSpark(lr.spark, ui.history.get(lr.id));
   drawTrace();
+}
+
+// ---------- listener actions ----------
+
+const pendingListeners = new Set(); // ids with a start/stop/delete in flight
+const armedDeletes = new Map(); // listener id -> disarm timer
+
+function paintListenerActions(lr, l, manage) {
+  const editable = !!(manage && manage.enabled && l.source === "config");
+  const busy = pendingListeners.has(l.id);
+  lr.toggleBtn.disabled = busy;
+  if (!busy) setText(lr.toggleLabel, l.running ? "Stop" : "Start");
+  lr.toggleBtn.className = l.running ? "act" : "act start";
+  lr.toggleBtn.title = l.running ? "Stop accepting and reset this listener's pipes" : "Start accepting connections";
+  lr.editBtn.hidden = !editable;
+  lr.delBtn.hidden = !editable;
+  lr.editBtn.disabled = busy || l.running;
+  lr.delBtn.disabled = busy || l.running;
+  lr.editBtn.title = l.running ? "Stop the listener before editing it" : "Edit this listener";
+  lr.delBtn.title = l.running ? "Stop the listener before deleting it" : "Delete this listener from the config file";
+  if (l.running && armedDeletes.has(l.id)) disarmDelete(l.id);
+}
+
+function api(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: body ? { ...CSRF, "Content-Type": "application/json" } : CSRF,
+    credentials: "same-origin",
+    body: body ? JSON.stringify(body) : undefined,
+  }).then(async (r) => {
+    if (r.status === 401) { showLogin(); throw new Error("Your session ended. Sign in again."); }
+    if (!r.ok) {
+      let msg = r.statusText;
+      try { msg = (await r.json()).error || msg; } catch (_) { /* not JSON */ }
+      throw new Error(msg);
+    }
+    return r;
+  });
+}
+
+function listenerLabel(l) {
+  return l.name ? `${l.name} [${l.listen}]` : l.listen;
+}
+
+function onStartStop(id) {
+  const lr = ui.L.get(id);
+  if (!lr || pendingListeners.has(id)) return;
+  const l = lr.data;
+  const action = l.running ? "stop" : "start";
+  pendingListeners.add(id);
+  setText(lr.toggleLabel, l.running ? "Stopping" : "Starting");
+  paint();
+  api(`api/listeners/${id}/${action}`)
+    .then(() => toast(`${action === "stop" ? "Stopped" : "Started"} ${listenerLabel(l)}`))
+    .catch((e) => toast(`Could not ${action} ${listenerLabel(l)}: ${e.message}`, true))
+    .finally(() => { pendingListeners.delete(id); paint(); });
+}
+
+function onDeleteListener(id) {
+  const lr = ui.L.get(id);
+  if (!lr || pendingListeners.has(id)) return;
+  if (!armedDeletes.has(id)) {
+    lr.delBtn.classList.add("armed");
+    setText(lr.delLabel, "Confirm delete");
+    armedDeletes.set(id, setTimeout(() => disarmDelete(id), ARM_MS));
+    return;
+  }
+  disarmDelete(id);
+  const label = listenerLabel(lr.data);
+  pendingListeners.add(id);
+  paint();
+  api(`api/listeners/${id}/delete`)
+    .then(() => toast(`Deleted ${label}`))
+    .catch((e) => toast(`Could not delete ${label}: ${e.message}`, true))
+    .finally(() => { pendingListeners.delete(id); paint(); });
+}
+
+function disarmDelete(id) {
+  clearTimeout(armedDeletes.get(id));
+  armedDeletes.delete(id);
+  const lr = ui.L.get(id);
+  if (lr) { lr.delBtn.classList.remove("armed"); setText(lr.delLabel, "Delete"); }
+}
+
+// ---------- add / edit dialog ----------
+
+let editing = null; // listener being edited, or null when adding
+
+const fields = {
+  name: "f-name", listen: "f-listen", target: "f-target",
+  maxConnections: "f-max", totalSpeed: "f-total", perConnSpeed: "f-perconn",
+};
+
+function openEditor(l) {
+  const s = ui.state;
+  if (!s || !s.manage || !s.manage.enabled) return;
+  editing = l || null;
+  const spec = (l && l.spec) || {};
+  setText($("editor-title"), l ? `Edit ${listenerLabel(l)}` : "Add listener");
+  setText($("editor-save"), l ? "Save" : "Add and start");
+  const fences = [["listen hosts", s.manage.allowBindHosts], ["listen ports", s.manage.allowBindPorts],
+    ["target hosts", s.manage.allowTargetHosts], ["target ports", s.manage.allowTargetPorts]]
+    .filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`);
+  setText($("editor-hint"), (fences.length ? `Allowed ${fences.join("; ")}.` : "No restrictions on hosts or ports.") +
+    (l ? " The listener stays stopped until you start it." : " Saved to the config file and started right away."));
+  $("f-name").value = spec.name || "";
+  $("f-listen").value = spec.listen || "";
+  $("f-target").value = spec.target || "";
+  $("f-max").value = spec.maxConnections ? String(spec.maxConnections) : "";
+  $("f-total").value = spec.totalSpeed || "";
+  $("f-perconn").value = spec.perConnSpeed || "";
+  setText($("editor-error"), "");
+  $("editor").showModal();
+  (l ? $("f-name") : $("f-listen")).focus();
+}
+
+$("add-listener").addEventListener("click", () => openEditor(null));
+$("editor-cancel").addEventListener("click", () => $("editor").close());
+$("editor-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const max = $("f-max").value.trim();
+  if (max !== "" && !/^\d+$/.test(max)) { setText($("editor-error"), "Max connections must be a whole number, or empty for unlimited."); return; }
+  const spec = {
+    name: $("f-name").value.trim(),
+    listen: $("f-listen").value.trim(),
+    target: $("f-target").value.trim(),
+    maxConnections: max === "" ? 0 : Number(max),
+    totalSpeed: $("f-total").value.trim(),
+    perConnSpeed: $("f-perconn").value.trim(),
+  };
+  if (!spec.listen || !spec.target) { setText($("editor-error"), "Listen and target are required."); return; }
+  const btn = $("editor-save");
+  btn.disabled = true;
+  setText($("editor-error"), "");
+  const was = editing;
+  const req = was ? api(`api/listeners/${was.id}/edit`, spec) : api("api/listeners", spec);
+  req
+    .then(() => {
+      $("editor").close();
+      toast(was ? `Saved ${spec.name || spec.listen}` : `Added and started ${spec.name || spec.listen}`);
+    })
+    .catch((e) => setText($("editor-error"), e.message))
+    .finally(() => { btn.disabled = false; });
+});
+
+// ---------- toasts ----------
+
+function toast(msg, bad) {
+  const box = $("toasts");
+  const t = el("div", bad ? "toast bad" : "toast", msg);
+  t.setAttribute("role", bad ? "alert" : "status");
+  box.appendChild(t);
+  while (box.children.length > 3) box.firstChild.remove();
+  setTimeout(() => t.remove(), bad ? 7000 : 3500);
 }
 
 // ---------- toolbar ----------

@@ -69,6 +69,36 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 }
 
+func TestConsoleOnlyConfigIsValid(t *testing.T) {
+	s, err := loadConfig(writeConfig(t, "[console]\nlisten = \"20000\"\n"), "")
+	if err != nil || s.console == nil || s.console.addr != "127.0.0.1:20000" || len(s.forwards) != 0 {
+		t.Fatalf("console-only config: %+v %v", s, err)
+	}
+	if s.console.manage == nil {
+		t.Fatal("config mode with a console must allow managing listeners")
+	}
+	fw, _ := parseForward("1@anything:1")
+	if err := s.console.manage.check(fw); err != nil {
+		t.Fatalf("no fences means no restriction: %v", err)
+	}
+	s, err = loadConfig(writeConfig(t, "[[forward]]\nlisten = \"127.0.0.1:2\"\ntarget = \"127.0.0.1:3\"\n"), "")
+	if err != nil || s.console != nil {
+		t.Fatalf("forward-only config: %+v %v", s, err)
+	}
+}
+
+func TestManageNeedsWritableDirectory(t *testing.T) {
+	path := writeConfig(t, "[console]\nlisten = \"20000\"\n")
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	if _, err := loadConfig(path, ""); err == nil || !strings.Contains(err.Error(), "cannot create files") {
+		t.Fatalf("read-only directory: %v", err)
+	}
+}
+
 func TestConfigPasswordFallsBackToEnv(t *testing.T) {
 	path := writeConfig(t, "[console]\nlisten = \"127.0.0.1:1\"\n[[forward]]\nlisten = \"127.0.0.1:2\"\ntarget = \"127.0.0.1:3\"\n")
 	s, err := loadConfig(path, "from-env")
@@ -80,15 +110,17 @@ func TestConfigPasswordFallsBackToEnv(t *testing.T) {
 func TestConfigErrors(t *testing.T) {
 	fwd := "[[forward]]\nlisten = \"127.0.0.1:2\"\ntarget = \"127.0.0.1:3\"\n"
 	cases := map[string]string{
-		"unknown keys":                 fwd + "limit_up = \"1MB\"\n",
-		"at least one [[forward]]":     "[console]\nlisten = \"127.0.0.1:1\"\n",
-		"needs both listen and target": "[[forward]]\nlisten = \"127.0.0.1:2\"\n",
-		"used twice":                   fwd + fwd,
-		"total_speed":                  fwd + "total_speed = \"lots\"\n",
-		"per_connection_max_speed":     fwd + "per_connection_max_speed = \"0B\"\n",
-		"max_connections":              fwd + "max_connections = -1\n",
-		"invalid target address":       "[[forward]]\nlisten = \"127.0.0.1:2\"\ntarget = \"a:b:c\"\n",
-		"[console] needs listen":       fwd + "[console]\npassword = \"x\"\n",
+		"unknown keys":                        fwd + "limit_up = \"1MB\"\n",
+		"nothing to run":                      "# empty\n",
+		"both listen and target are required": "[[forward]]\nlisten = \"127.0.0.1:2\"\n",
+		"used twice":                          fwd + fwd,
+		"total_speed":                         fwd + "total_speed = \"lots\"\n",
+		"per_connection_max_speed":            fwd + "per_connection_max_speed = \"0B\"\n",
+		"max_connections":                     fwd + "max_connections = -1\n",
+		"invalid target address":              "[[forward]]\nlisten = \"127.0.0.1:2\"\ntarget = \"a:b:c\"\n",
+		"[console] needs listen":              fwd + "[console]\npassword = \"x\"\n",
+		"not a valid CIDR":                    "[console]\nlisten = \"1\"\nallow_target_hosts = [\"10.0.0.0/99\"]\n",
+		"allow_bind_ports":                    "[console]\nlisten = \"1\"\nallow_bind_ports = \"9000-80\"\n",
 	}
 	for want, body := range cases {
 		_, err := loadConfig(writeConfig(t, body), "")

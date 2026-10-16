@@ -93,20 +93,83 @@ rate stays smooth. On a Linux test host a listener with
 `per_connection_max_speed = "40MiB/s"` held one iperf3 stream at 40.0 MiB/s,
 and `total_speed = "100MiB/s"` held four streams at 100.0 MiB/s combined.
 
+A config file may also hold only a `[console]` table and no forwards, since
+the console can add them; with neither, pf-simple refuses to start.
+
 The `[console]` table takes `listen` (required) and `password` (optional,
 falling back to `$PF_PASSWORD`; empty means no password). If the file holds a
 password and is readable by every user, pf-simple prints a warning; use
 `chmod 600`. See [`pf-simple.example.toml`](pf-simple.example.toml) for a
 commented example.
 
-To run it as a systemd service, keep the file root-owned with `chmod 600`
-and pass it in with `LoadCredential`, so the unprivileged service user can
-read it while nobody else can:
+To run it as a systemd service without a console, keep the file root-owned
+with `chmod 600` and pass it in with `LoadCredential`, so the unprivileged
+service user can read it while nobody else can:
 
 ```ini
 [Service]
 LoadCredential=pf-simple.toml:/etc/pf-simple.toml
 ExecStart=/usr/local/bin/pf-simple --config %d/pf-simple.toml
+DynamicUser=yes
+Restart=always
+```
+
+With a `[console]`, the console writes listener changes back to the file, so
+it must live somewhere writable instead; see
+[Managing listeners from the console](#managing-listeners-from-the-console).
+
+## Managing listeners from the console
+
+What the console may change depends on how pf-simple was started:
+
+| Action | Command line | Config file (`-c`) |
+| --- | --- | --- |
+| Disconnect a pipe (Stop on a row) | yes | yes |
+| Stop / Start a listener | yes, until restart | yes, saved |
+| Add a listener | no | yes |
+| Edit a listener (every field) | no | yes, while stopped |
+| Delete a listener | no | yes, while stopped |
+
+On the command line, a console alone is refused, because it could not add
+anything. In a config file, `[console]` alone is fine: start it empty and add
+listeners from the browser. Every change is written back to the config file.
+
+```toml
+[console]
+listen = "0.0.0.0:20000"
+password = "change-me"
+# Optional fences for listeners added or edited in the console.
+# An omitted one means no restriction.
+allow_target_hosts = ["10.0.0.6", "10.0.0.0/24", "db.internal"]   # IPs, CIDRs, exact hostnames
+allow_target_ports = "80, 8080, 9030, 3000-3999"
+allow_bind_hosts = ["0.0.0.0", "127.0.0.1"]                       # "0.0.0.0" or "::" allows "all interfaces"
+allow_bind_ports = "18000-19999"
+```
+
+- **Fences.** A hostname is matched by name only and never resolved, so DNS
+  cannot redirect it. Without any fences, anyone with the console password can
+  make the host relay to any address it can reach, so set at least
+  `allow_target_hosts` on a host that is exposed.
+- **Stop** stops accepting, resets every open pipe, and waits for them to
+  close before it reports success. A stopped listener is saved as
+  `enabled = false`.
+- **Edit and Delete** need a stopped listener. Edit keeps the listener's
+  counters; it stays stopped until you start it.
+- **Saving** rewrites the whole file atomically (temporary file, fsync,
+  rename) with mode 600. `[console]` is written back exactly as loaded; a
+  password that came from `$PF_PASSWORD` is never written into the file.
+  Comments are not kept.
+- **Startup.** In config mode a listener whose port is busy shows "failed to
+  start" in the console while the others keep running. On the command line a
+  busy port stops pf-simple, as before.
+- **Writable location.** With a `[console]`, pf-simple checks at startup that
+  it can create files in the config file's directory and refuses to start
+  otherwise. Under systemd, keep the file in a `StateDirectory`:
+
+```ini
+[Service]
+StateDirectory=pf-simple
+ExecStart=/usr/local/bin/pf-simple --config /var/lib/pf-simple/pf-simple.toml
 DynamicUser=yes
 Restart=always
 ```
@@ -169,14 +232,43 @@ state-changing request needs a custom header, WebSocket connections from
 other origins are refused, and a wrong password is answered after a one-second
 delay.
 
-## Data path
+## Data path: zero-copy on Linux
 
-On Linux, each direction is copied with `splice(2)` through a 64KiB kernel
-pipe, so payload bytes never enter user space. The sockets stay non-blocking
-and wait in Go's netpoller, so a half-close (EOF) on one side ends that
-direction while the other keeps flowing, and closing a socket interrupts a
-pending copy. Other platforms (macOS, FreeBSD) have no `splice`, so they use a
-read/write loop with a 64KiB buffer.
+On Linux, pf-simple moves bytes with `splice(2)`, so payload data never
+enters user space:
+
+```
+client socket ──splice──▶ kernel pipe (64 KiB) ──splice──▶ upstream socket
+```
+
+Each direction of each connection owns one kernel pipe. pf-simple asks the
+kernel to move up to 64 KiB from the source socket into the pipe, then from
+the pipe into the destination socket. The data stays in kernel memory the
+whole way, so there is no `read()` into a Go buffer and no `write()` back
+out, and two system calls move each chunk. "Zero-copy" here means no copies
+into or out of user space; the kernel may still copy internally, depending on
+the network driver.
+
+The sockets stay non-blocking. When a socket has no data or no room, the
+goroutine parks in Go's network poller instead of holding a thread, so
+thousands of idle connections cost almost nothing. Closing a socket from
+another goroutine (Stop in the console, the idle timeout, shutdown) wakes it
+immediately.
+
+Go's own `TCPConn.ReadFrom` also splices, but it returns only after its byte
+limit or EOF, so the console would see a slow trickle of traffic only in large
+steps and the idle timer would misfire. pf-simple runs its own splice loop and
+counts every chunk, which keeps the console accurate and the half-close idle
+timeout correct. Speed limits keep this path too: pf-simple waits between
+chunks instead of switching to a buffer.
+
+In numbers, on a Linux test host (see the benchmark below), splice forwarded
+a single localhost stream 20 to 35% faster than a user-space copy, and four
+streams at about the speed of a direct connection. `strace` during a transfer
+shows only `splice` calls carrying data, no `read` or `write`.
+
+macOS and FreeBSD have no socket-to-socket splice, so there pf-simple uses a
+read/write loop with a 64 KiB buffer.
 
 ## Performance test (localhost to localhost)
 

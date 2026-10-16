@@ -39,12 +39,14 @@
   <div id="app" hidden>
     <section class="overview" aria-label="Overview">
       <dl class="kpis">
+        <div class="kpi"><dt>Listeners</dt><dd class="num" id="k-listeners">0</dd></div>
         <div class="kpi"><dt>Active pipes</dt><dd class="num" id="k-active">0</dd></div>
         <div class="kpi"><dt>Accepted</dt><dd class="num" id="k-accepted">0</dd></div>
-        <div class="kpi tx"><dt>To upstream</dt><dd class="num" id="k-tx">0 b/s</dd></div>
-        <div class="kpi rx"><dt>To clients</dt><dd class="num" id="k-rx">0 b/s</dd></div>
-        <div class="kpi"><dt>Transferred</dt><dd class="num" id="k-total">0 B</dd></div>
         <div class="kpi"><dt>Uptime</dt><dd class="num" id="k-uptime">—</dd></div>
+        <div class="kpi tx"><dt><svg class="arrow-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>To upstream</dt><dd class="num" id="k-tx">0 b/s</dd></div>
+        <div class="kpi rx"><dt><svg class="arrow-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3.5 8.5 8 13l4.5-4.5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>To clients</dt><dd class="num" id="k-rx">0 b/s</dd></div>
+        <div class="kpi tx"><dt><svg class="arrow-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>Sent upstream</dt><dd class="num" id="k-total-up">0 B</dd></div>
+        <div class="kpi rx"><dt><svg class="arrow-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3.5 8.5 8 13l4.5-4.5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>Sent to clients</dt><dd class="num" id="k-total-down">0 B</dd></div>
       </dl>
       <figure class="trace">
         <figcaption>
@@ -62,6 +64,7 @@
       </div>
       <span class="toolbar-note" id="filter-note"></span>
       <div class="toolbar-actions">
+        <button class="btn btn-add" type="button" id="add-listener" hidden><span aria-hidden="true">+</span> Add listener</button>
         <button class="btn btn-quiet" type="button" id="expand-all">Expand all</button>
         <button class="btn btn-quiet" type="button" id="collapse-all">Collapse all</button>
       </div>
@@ -70,5 +73,28 @@
     <div id="listeners" class="listeners"></div>
   </div>
 </main>
+
+<dialog id="editor" aria-labelledby="editor-title">
+  <form id="editor-form" method="dialog" class="editor" autocomplete="off" novalidate>
+    <h2 id="editor-title">Add listener</h2>
+    <p class="editor-hint" id="editor-hint"></p>
+    <div class="fields">
+      <label class="field wide"><span>Name <em>optional</em></span><input id="f-name" maxlength="64" placeholder="StreamLoad"></label>
+      <label class="field"><span>Listen</span><input id="f-listen" required placeholder="18000 or 0.0.0.0:18000"></label>
+      <label class="field"><span>Target</span><input id="f-target" required placeholder="10.0.0.6:8080 or 10.0.0.6"></label>
+      <label class="field"><span>Max connections <em>optional</em></span><input id="f-max" type="number" min="0" step="1" inputmode="numeric" placeholder="unlimited"></label>
+      <label class="field"><span>Total speed <em>optional</em></span><input id="f-total" placeholder="unlimited, e.g. 1GiB/s"></label>
+      <label class="field wide"><span>Per-connection max speed <em>optional</em></span><input id="f-perconn" placeholder="unlimited, e.g. 15MiB/s"></label>
+    </div>
+    <p class="editor-note">Speeds apply to each direction. Units: B, KB, MB, GB, KiB, MiB, GiB, or Kbit, Mbit, Gbit, optionally with /s.</p>
+    <p class="editor-error" id="editor-error" role="alert"></p>
+    <div class="editor-actions">
+      <button class="btn btn-quiet" type="button" id="editor-cancel">Cancel</button>
+      <button class="btn btn-primary" type="submit" id="editor-save">Add and start</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
 </body>
 </html>

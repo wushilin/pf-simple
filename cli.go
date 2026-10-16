@@ -20,7 +20,8 @@ Quick start (forwards can be plain arguments or --forward/-f):
 Defaults: a listen port alone binds every interface, a target without a
 port reuses the listen port, and a console port alone binds 127.0.0.1.
 
-Config file (names, max_connections, speed limits):
+Config file (names, max_connections, speed limits, and a console that can
+add, edit and delete listeners):
 
   pf-simple -c /etc/pf-simple.toml
 
@@ -99,7 +100,10 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 
 	forwards = append(forwards, positional...)
 	if len(forwards) == 0 {
-		return settings{}, errors.New("nothing to forward: give at least one listen@target, or -c config.toml")
+		if consoleValue != "" {
+			return settings{}, errors.New("a console alone cannot add listeners on the command line; give at least one listen@target, or use -c config.toml")
+		}
+		return settings{}, errors.New("nothing to run: give at least one listen@target, or -c config.toml")
 	}
 	var s settings
 	seen := make(map[string]bool)

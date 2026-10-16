@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -15,28 +16,53 @@ import (
 type settings struct {
 	forwards []forwarding
 	console  *consoleSettings // nil when the console is off
+	// configPath and consoleRaw let the console rewrite the config file.
+	// consoleRaw is [console] exactly as written.
+	configPath string
+	consoleRaw *consoleTable
 }
 
 type consoleSettings struct {
 	addr     string
 	password string
+	manage   *managePolicy // set in config mode: the console may change listeners
+}
+
+// consoleTable is the [console] table. The tags keep a rewritten file free of
+// keys the user never set.
+type consoleTable struct {
+	Listen   string `toml:"listen"`
+	Password string `toml:"password,omitempty"`
+	// Optional fences for listeners added or edited in the console. An
+	// omitted one means no restriction.
+	AllowTargetHosts []string `toml:"allow_target_hosts,omitempty"`
+	AllowTargetPorts string   `toml:"allow_target_ports,omitempty"`
+	AllowBindHosts   []string `toml:"allow_bind_hosts,omitempty"`
+	AllowBindPorts   string   `toml:"allow_bind_ports,omitempty"`
+}
+
+// listenerSpec is one listener as written in a config file, in the console's
+// state file, or sent by the console's "Add listener" form. Every source goes
+// through buildForwarding, so they share one set of rules.
+type listenerSpec struct {
+	Name           string `toml:"name,omitempty" json:"name"`
+	Listen         string `toml:"listen" json:"listen"`
+	Target         string `toml:"target" json:"target"`
+	MaxConnections int64  `toml:"max_connections,omitzero" json:"maxConnections"`
+	TotalSpeed     string `toml:"total_speed,omitempty" json:"totalSpeed"`
+	PerConnSpeed   string `toml:"per_connection_max_speed,omitempty" json:"perConnSpeed"`
+	// Enabled is false for a listener stopped in the console; absent means
+	// enabled. The form never sends it.
+	Enabled *bool `toml:"enabled,omitempty" json:"-"`
 }
 
 // fileConfig mirrors the TOML file. See pf-simple.example.toml.
 type fileConfig struct {
-	Console *struct {
-		Listen   string `toml:"listen"`
-		Password string `toml:"password"`
-	} `toml:"console"`
-	Forward []struct {
-		Name           string `toml:"name"` // shown in the console and logs
-		Listen         string `toml:"listen"`
-		Target         string `toml:"target"`
-		MaxConnections int64  `toml:"max_connections"`          // 0 = unlimited
-		TotalSpeed     string `toml:"total_speed"`              // shared by all pipes, per direction
-		PerConnSpeed   string `toml:"per_connection_max_speed"` // each pipe, per direction
-	} `toml:"forward"`
+	Console *consoleTable  `toml:"console,omitempty"`
+	Forward []listenerSpec `toml:"forward"`
 }
+
+const maxNameLen = 64
 
 // newForwarding applies the address shorthand: a bare listen port binds to
 // every interface, and a target without a port reuses the listen port.
@@ -51,6 +77,48 @@ func newForwarding(listen, target string) (forwarding, error) {
 		return forwarding{}, err
 	}
 	return forwarding{listen: listen, target: target, stats: newListenerStats(0, listen, target)}, nil
+}
+
+// buildForwarding validates a listenerSpec and returns a ready forwarding.
+// The returned spec is normalized (trimmed name, canonical addresses).
+func buildForwarding(spec listenerSpec) (forwarding, listenerSpec, error) {
+	spec.Name = strings.TrimSpace(spec.Name)
+	spec.TotalSpeed = strings.TrimSpace(spec.TotalSpeed)
+	spec.PerConnSpeed = strings.TrimSpace(spec.PerConnSpeed)
+	if strings.TrimSpace(spec.Listen) == "" || strings.TrimSpace(spec.Target) == "" {
+		return forwarding{}, spec, errors.New("both listen and target are required")
+	}
+	if len(spec.Name) > maxNameLen {
+		return forwarding{}, spec, fmt.Errorf("name is longer than %d characters", maxNameLen)
+	}
+	fw, err := newForwarding(spec.Listen, spec.Target)
+	if err != nil {
+		return forwarding{}, spec, err
+	}
+	spec.Listen, spec.Target = fw.listen, fw.target
+	if spec.MaxConnections < 0 {
+		return forwarding{}, spec, errors.New("max_connections must be 0 (unlimited) or more")
+	}
+	fw.stats.name = spec.Name
+	fw.stats.maxConns = spec.MaxConnections
+	for _, lim := range []struct {
+		key   string
+		value string
+		dst   *float64
+	}{{"total_speed", spec.TotalSpeed, &fw.stats.totalRate}, {"per_connection_max_speed", spec.PerConnSpeed, &fw.stats.perConnRate}} {
+		if lim.value == "" {
+			continue
+		}
+		rate, err := parseRate(lim.value)
+		if err != nil {
+			return forwarding{}, spec, fmt.Errorf("%s: %w", lim.key, err)
+		}
+		*lim.dst = rate
+	}
+	fw.stats.totalUp = newLimiter(fw.stats.totalRate)
+	fw.stats.totalDown = newLimiter(fw.stats.totalRate)
+	fw.stats.spec = spec
+	return fw, spec, nil
 }
 
 // loadConfig reads a TOML config file. Unknown keys are errors so that a typo
@@ -72,11 +140,8 @@ func loadConfig(path, envPassword string) (settings, error) {
 
 	var s settings
 	seen := make(map[string]bool)
-	for i, f := range fc.Forward {
-		if f.Listen == "" || f.Target == "" {
-			return settings{}, fmt.Errorf("config %s: forward #%d needs both listen and target", path, i+1)
-		}
-		fw, err := newForwarding(f.Listen, f.Target)
+	for i, spec := range fc.Forward {
+		fw, _, err := buildForwarding(spec)
 		if err != nil {
 			return settings{}, fmt.Errorf("config %s: forward #%d: %w", path, i+1, err)
 		}
@@ -84,32 +149,12 @@ func loadConfig(path, envPassword string) (settings, error) {
 			return settings{}, fmt.Errorf("config %s: forward #%d: listen address %s is used twice", path, i+1, fw.listen)
 		}
 		seen[fw.listen] = true
-		if f.MaxConnections < 0 {
-			return settings{}, fmt.Errorf("config %s: forward #%d: max_connections must be 0 (unlimited) or more", path, i+1)
-		}
-		fw.stats.name = strings.TrimSpace(f.Name)
-		fw.stats.maxConns = f.MaxConnections
-		for _, lim := range []struct {
-			key   string
-			value string
-			dst   *float64
-		}{{"total_speed", f.TotalSpeed, &fw.stats.totalRate}, {"per_connection_max_speed", f.PerConnSpeed, &fw.stats.perConnRate}} {
-			if lim.value == "" {
-				continue
-			}
-			rate, err := parseRate(lim.value)
-			if err != nil {
-				return settings{}, fmt.Errorf("config %s: forward #%d %s: %w", path, i+1, lim.key, err)
-			}
-			*lim.dst = rate
-		}
-		fw.stats.totalUp = newLimiter(fw.stats.totalRate)
-		fw.stats.totalDown = newLimiter(fw.stats.totalRate)
+		fw.fromFile = true
+		fw.disabled = spec.Enabled != nil && !*spec.Enabled
 		s.forwards = append(s.forwards, fw)
 	}
-	if len(s.forwards) == 0 {
-		return settings{}, fmt.Errorf("config %s: at least one [[forward]] is required", path)
-	}
+	s.configPath = path
+	s.consoleRaw = fc.Console
 
 	if c := fc.Console; c != nil {
 		if c.Listen == "" {
@@ -129,8 +174,34 @@ func loadConfig(path, envPassword string) (settings, error) {
 				fmt.Fprintf(os.Stderr, "warning: %s holds the console password and is readable by every user; consider chmod 600\n", path)
 			}
 		}
+		// In config mode the console manages listeners and writes them back
+		// here, so the file's directory must be writable.
+		policy, err := newManagePolicy(c)
+		if err != nil {
+			return settings{}, fmt.Errorf("config %s: [console]: %w", path, err)
+		}
+		if err := checkWritableDir(path); err != nil {
+			return settings{}, fmt.Errorf("config %s: %w", path, err)
+		}
+		s.console.manage = policy
+	}
+	if len(s.forwards) == 0 && s.console == nil {
+		return settings{}, fmt.Errorf("config %s: nothing to run: add a [[forward]] or a [console]", path)
 	}
 	return s, nil
+}
+
+// checkWritableDir makes sure the console can later replace path atomically,
+// which needs a new file in the same directory.
+func checkWritableDir(path string) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".pf-simple-write-test-*")
+	if err != nil {
+		return fmt.Errorf("pf-simple rewrites this file when listeners change, but cannot create files in %s (%v); keep the file in a directory the service can write, such as a systemd StateDirectory (LoadCredential copies are read-only)", dir, err)
+	}
+	name := f.Name()
+	f.Close()
+	return os.Remove(name)
 }
 
 // errConfigExclusive is returned when --config is combined with other flags.

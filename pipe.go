@@ -165,7 +165,8 @@ func (l *listenerStats) release() { l.active.Add(-1) }
 // listenerStats holds the counters of one --forward mapping.
 type listenerStats struct {
 	id       int
-	name     string // optional label from the config file
+	spec     listenerSpec // as configured; written back to the state file
+	name     string       // optional label from the config file
 	listen   string
 	target   string
 	accepted atomic.Uint64
@@ -175,6 +176,10 @@ type listenerStats struct {
 	// still dialing upstream; it enforces maxConns.
 	active   atomic.Int64
 	maxConns int64 // 0 = unlimited
+	// conns counts handleConnection goroutines so a stop can wait for them;
+	// closing refuses new pipes while a stop is in progress.
+	conns   sync.WaitGroup
+	closing atomic.Bool
 	// totalUp and totalDown are shared by all pipes of this forward, one per
 	// direction; perConnRate (bytes/s) gives each pipe its own limiter per
 	// direction. Zero values mean unlimited.
@@ -207,6 +212,10 @@ func (r *pipeRegistry) add(l *listenerStats, client, upstream net.Conn) *pipe {
 	p.up.total, p.up.perConn, p.up.cancel = l.totalUp, newLimiter(l.perConnRate), p.ended
 	p.down.total, p.down.perConn, p.down.cancel = l.totalDown, newLimiter(l.perConnRate), p.ended
 	r.mu.Lock()
+	if l.closing.Load() {
+		r.mu.Unlock()
+		return nil
+	}
 	r.nextID++
 	p.id = r.nextID
 	r.pipes[p.id] = p
@@ -224,6 +233,24 @@ func (r *pipeRegistry) remove(p *pipe) {
 	p.listener.closedDown.Add(p.down.written.Load())
 	r.mu.Unlock()
 	changes.notify()
+}
+
+// interruptListener resets every open pipe of one listener and refuses new
+// ones. closing is set under the registry lock, so a connection that was
+// still dialing cannot register after the sweep and slip through.
+func (r *pipeRegistry) interruptListener(l *listenerStats) {
+	r.mu.Lock()
+	l.closing.Store(true)
+	var victims []*pipe
+	for _, p := range r.pipes {
+		if p.listener == l {
+			victims = append(victims, p)
+		}
+	}
+	r.mu.Unlock()
+	for _, p := range victims {
+		p.interrupt()
+	}
 }
 
 func (r *pipeRegistry) get(id uint64) *pipe {
@@ -256,17 +283,21 @@ type pipeSnapshot struct {
 const maxSnapshotPipes = 500
 
 type listenerSnapshot struct {
-	ID        int    `json:"id"`
-	Name      string `json:"name"`
-	Rejected  uint64 `json:"rejected"`
-	MaxConns  int64  `json:"maxConns"` // 0 = unlimited
-	PipeCount int    `json:"pipeCount"`
-	Listen    string `json:"listen"`
-	Target    string `json:"target"`
-	Accepted  uint64 `json:"accepted"`
-	Failed    uint64 `json:"failed"`
-	BytesUp   uint64 `json:"bytesUp"` // delivered upstream, closed + live
-	BytesDown uint64 `json:"bytesDown"`
+	ID        int          `json:"id"`
+	Source    string       `json:"source"` // "config" or "console"
+	Running   bool         `json:"running"`
+	Error     string       `json:"error,omitempty"`
+	Spec      listenerSpec `json:"spec"` // as configured, for the edit form
+	Name      string       `json:"name"`
+	Rejected  uint64       `json:"rejected"`
+	MaxConns  int64        `json:"maxConns"` // 0 = unlimited
+	PipeCount int          `json:"pipeCount"`
+	Listen    string       `json:"listen"`
+	Target    string       `json:"target"`
+	Accepted  uint64       `json:"accepted"`
+	Failed    uint64       `json:"failed"`
+	BytesUp   uint64       `json:"bytesUp"` // delivered upstream, closed + live
+	BytesDown uint64       `json:"bytesDown"`
 	// Speed limits in bytes per second, per direction; 0 = unlimited.
 	TotalSpeed   float64        `json:"totalSpeed"`
 	PerConnSpeed float64        `json:"perConnSpeed"`
@@ -278,7 +309,8 @@ func (r *pipeRegistry) snapshot(listeners []*listenerStats) []listenerSnapshot {
 	byID := make(map[*listenerStats]*listenerSnapshot, len(listeners))
 	for i, l := range listeners {
 		out[i] = listenerSnapshot{
-			ID: l.id, Name: l.name, Listen: l.listen, Target: l.target,
+			Spec: l.spec,
+			ID:   l.id, Name: l.name, Listen: l.listen, Target: l.target,
 			Rejected: l.rejected.Load(), MaxConns: l.maxConns,
 			Accepted: l.accepted.Load(), Failed: l.failed.Load(),
 			TotalSpeed: l.totalRate, PerConnSpeed: l.perConnRate,

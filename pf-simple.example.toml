@@ -11,8 +11,17 @@ listen = "127.0.0.1:18222"
 # Leave password out (or empty) to read it from $PF_PASSWORD. If both are
 # empty the console has no password. This file holds a secret: chmod 600.
 password = "change-me"
+# In config mode the console can add, edit, stop, start and delete listeners.
+# Changes are written back to this file (comments are not kept), so the file's
+# directory must be writable by pf-simple. These optional lists fence what the
+# console may create; an omitted one means no restriction.
+# allow_target_hosts = ["10.0.0.6", "10.0.0.0/24", "db.internal"]
+# allow_target_ports = "80, 8080, 9030"
+# allow_bind_hosts = ["0.0.0.0"]
+# allow_bind_ports = "18000-19999"
 
-# One [[forward]] table per listener. listen and target are required.
+# One [[forward]] table per listener. listen and target are required. A file
+# may also have no forwards and only a [console].
 [[forward]]
 name = "HTTP"                 # optional; the console shows "HTTP [0.0.0.0:8080]"
 listen = "0.0.0.0:8080"

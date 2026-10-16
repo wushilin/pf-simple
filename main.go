@@ -24,8 +24,9 @@ const copyChunkSize = 64 << 10
 type forwarding struct {
 	listen   string
 	target   string
-	listener net.Listener
 	stats    *listenerStats
+	fromFile bool // from a config file rather than the command line
+	disabled bool // saved as enabled = false
 }
 
 func parseForward(value string) (forwarding, error) {
@@ -41,65 +42,51 @@ func main() {
 	if err != nil {
 		exitForArgsError(err)
 	}
-	for i := range cfg.forwards {
-		cfg.forwards[i].stats.id = i
+	var policy *managePolicy
+	if cfg.console != nil {
+		policy = cfg.console.manage
 	}
+	mgr := newManager(cfg.forwards, policy, halfCloseIdleTimeout)
+	mgr.configPath, mgr.consoleRaw = cfg.configPath, cfg.consoleRaw
 	var console *consoleServer
 	if cfg.console != nil {
-		console = newConsoleServer(cfg.console.addr, cfg.console.password, cfg.forwards)
+		console = newConsoleServer(cfg.console.addr, cfg.console.password, mgr)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, cfg.forwards, console); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(ctx, mgr, console); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, forwards []forwarding, console *consoleServer) error {
-	closeAll := func(n int) {
-		for j := 0; j < n; j++ {
-			_ = forwards[j].listener.Close()
-		}
+func run(ctx context.Context, mgr *manager, console *consoleServer) error {
+	if err := mgr.startAll(ctx); err != nil {
+		return err
 	}
-	for i := range forwards {
-		ln, err := net.Listen("tcp", forwards[i].listen)
-		if err != nil {
-			closeAll(i)
-			return fmt.Errorf("listen on %s: %w", forwards[i].listen, err)
-		}
-		forwards[i].listener = ln
-		log.Printf("forwarding %s -> %s%s", forwards[i].stats.labelFor(ln.Addr().String()), forwards[i].target, forwards[i].stats.limitsNote())
-	}
-
 	var wg sync.WaitGroup
 	if console != nil {
 		ln, err := net.Listen("tcp", console.addr)
 		if err != nil {
-			closeAll(len(forwards))
+			mgr.shutdown()
 			return fmt.Errorf("console listen on %s: %w", console.addr, err)
 		}
+		mode := "password required"
 		if console.password == "" {
-			log.Printf("console on http://%s (no password)", ln.Addr())
-		} else {
-			log.Printf("console on http://%s (password required)", ln.Addr())
+			mode = "no password"
 		}
+		if console.mgr.policy != nil {
+			mode += ", listener management on"
+		}
+		log.Printf("console on http://%s (%s)", ln.Addr(), mode)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			console.serve(ctx, ln)
 		}()
 	}
-	for i := range forwards {
-		f := forwards[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			acceptConnections(ctx, f.listener, f.stats, halfCloseIdleTimeout)
-		}()
-	}
 	<-ctx.Done()
-	closeAll(len(forwards))
+	mgr.shutdown()
 	wg.Wait()
 	return ctx.Err()
 }
@@ -119,7 +106,11 @@ func acceptConnections(ctx context.Context, ln net.Listener, l *listenerStats, i
 			reject(client)
 			continue
 		}
-		go handleConnection(client, l, idleTimeout)
+		l.conns.Add(1)
+		go func() {
+			defer l.conns.Done()
+			handleConnection(ctx, client, l, idleTimeout)
+		}()
 	}
 }
 
@@ -131,21 +122,32 @@ func reject(c net.Conn) {
 	_ = c.Close()
 }
 
-func handleConnection(client net.Conn, l *listenerStats, idleTimeout time.Duration) {
+// handleConnection forwards one client. ctx is the listener's: stopping the
+// listener cancels a dial that is still in progress.
+func handleConnection(ctx context.Context, client net.Conn, l *listenerStats, idleTimeout time.Duration) {
 	defer l.release()
 	l.accepted.Add(1)
 	changes.notify()
-	upstream, err := net.DialTimeout("tcp", l.target, dialTimeout)
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	upstream, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", l.target)
+	cancel()
 	if err != nil {
-		l.failed.Add(1)
-		changes.notify()
-		log.Printf("connect to %s: %v", l.target, err)
-		_ = client.Close()
+		if ctx.Err() == nil {
+			l.failed.Add(1)
+			changes.notify()
+			log.Printf("connect to %s: %v", l.target, err)
+		}
+		reject(client)
 		return
 	}
 	defer client.Close()
 	defer upstream.Close()
 	p := pipes.add(l, client, upstream)
+	if p == nil { // the listener is stopping
+		reject(client)
+		reject(upstream)
+		return
+	}
 	defer pipes.remove(p)
 	defer p.end()
 

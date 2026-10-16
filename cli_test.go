@@ -82,7 +82,7 @@ func TestQuickStartDefaults(t *testing.T) {
 
 func TestArgErrors(t *testing.T) {
 	cases := map[string][]string{
-		"nothing to forward":   {},
+		"nothing to run":       {},
 		"used twice":           {"8080@a", "8080@b"},
 		"port must be 1-65535": {"70000@a"},
 		"must have the form":   {"8080"},
@@ -94,6 +94,9 @@ func TestArgErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%v: want error containing %q, got %v", args, want, err)
 		}
+	}
+	if _, err := parseArgs([]string{"--console", "20000"}, io.Discard, ""); err == nil || !strings.Contains(err.Error(), "cannot add listeners on the command line") {
+		t.Errorf("console-only command line must be refused: %v", err)
 	}
 	if _, err := parseArgs([]string{"-h"}, io.Discard, ""); !errors.Is(err, flag.ErrHelp) {
 		t.Errorf("-h: %v", err)

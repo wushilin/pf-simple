@@ -25,8 +25,11 @@ import (
 var consoleFiles embed.FS
 
 const (
-	sessionCookie   = "pf_session"
-	sessionLifetime = 12 * time.Hour
+	// sessionCookiePrefix plus the console's port names the session cookie.
+	// Browsers share cookies across ports of one host, so two consoles on the
+	// same machine would otherwise sign each other out.
+	sessionCookiePrefix = "pf_session_"
+	sessionLifetime     = 12 * time.Hour
 	// csrfHeader must accompany every state-changing request. Browsers cannot
 	// add custom headers to cross-site form posts, and SameSite=Strict keeps
 	// the cookie off cross-site requests as a second layer.
@@ -54,11 +57,12 @@ func parseConsole(value, envPassword string) (addr, password string, err error) 
 }
 
 type consoleServer struct {
-	addr      string
-	host      string
-	password  string
-	started   time.Time
-	listeners []*listenerStats
+	addr       string
+	host       string
+	password   string
+	started    time.Time
+	mgr        *manager
+	cookieName string
 
 	ctx context.Context // canceled on shutdown; ends WebSocket sessions
 
@@ -69,7 +73,7 @@ type consoleServer struct {
 	subscribers map[chan struct{}]struct{}
 }
 
-func newConsoleServer(addr, password string, forwards []forwarding) *consoleServer {
+func newConsoleServer(addr, password string, mgr *manager) *consoleServer {
 	host, _ := os.Hostname()
 	s := &consoleServer{
 		addr:        addr,
@@ -80,9 +84,7 @@ func newConsoleServer(addr, password string, forwards []forwarding) *consoleServ
 		sessions:    make(map[string]time.Time),
 		subscribers: make(map[chan struct{}]struct{}),
 	}
-	for _, f := range forwards {
-		s.listeners = append(s.listeners, f.stats)
-	}
+	s.mgr = mgr
 	return s
 }
 
@@ -95,12 +97,16 @@ func (s *consoleServer) handler() http.Handler {
 	mux.HandleFunc("POST /api/logout", s.requireCSRF(s.handleLogout))
 	mux.HandleFunc("GET /api/state", s.requireAuth(s.handleState))
 	mux.HandleFunc("GET /api/ws", s.requireAuth(s.handleWebSocket))
+	mux.HandleFunc("POST /api/listeners", s.requireCSRF(s.requireAuth(s.handleAddListener)))
+	mux.HandleFunc("POST /api/listeners/{id}/{action}", s.requireCSRF(s.requireAuth(s.handleListenerAction)))
 	mux.HandleFunc("POST /api/pipes/{id}/stop", s.requireCSRF(s.requireAuth(s.handleStop)))
 	return securityHeaders(mux)
 }
 
 func (s *consoleServer) serve(ctx context.Context, ln net.Listener) {
 	s.ctx = ctx
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	s.cookieName = sessionCookiePrefix + port
 	go s.broadcast(ctx)
 	srv := &http.Server{
 		Handler:           s.handler(),
@@ -153,7 +159,7 @@ func (s *consoleServer) authorized(r *http.Request) bool {
 	if s.password == "" {
 		return true
 	}
-	cookie, err := r.Cookie(sessionCookie)
+	cookie, err := r.Cookie(s.cookieName)
 	if err != nil {
 		return false
 	}
@@ -210,7 +216,7 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.sessions[token] = now.Add(sessionLifetime)
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
+		Name:     s.cookieName,
 		Value:    token,
 		Path:     "/",
 		MaxAge:   int(sessionLifetime / time.Second),
@@ -222,12 +228,12 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *consoleServer) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie(sessionCookie); err == nil {
+	if cookie, err := r.Cookie(s.cookieName); err == nil {
 		s.mu.Lock()
 		delete(s.sessions, cookie.Value)
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -236,6 +242,7 @@ type consoleState struct {
 	Now       int64              `json:"now"`
 	Started   int64              `json:"started"`
 	Listeners []listenerSnapshot `json:"listeners"`
+	Manage    manageInfo         `json:"manage"`
 }
 
 func (s *consoleServer) handleState(w http.ResponseWriter, r *http.Request) {
@@ -349,8 +356,80 @@ func (s *consoleServer) state() consoleState {
 		Host:      s.host,
 		Now:       time.Now().UnixMilli(),
 		Started:   s.started.UnixMilli(),
-		Listeners: pipes.snapshot(s.listeners),
+		Listeners: s.mgr.snapshot(),
+		Manage:    s.mgr.info(),
 	}
+}
+
+func (s *consoleServer) handleAddListener(w http.ResponseWriter, r *http.Request) {
+	var spec listenerSpec
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&spec); err != nil {
+		writeError(w, http.StatusBadRequest, "bad request: "+err.Error())
+		return
+	}
+	id, err := s.mgr.add(spec)
+	if err != nil {
+		writeError(w, statusFor(err), err.Error())
+		return
+	}
+	log.Printf("console: added listener #%d %s -> %s", id, spec.Listen, spec.Target)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]int{"id": id})
+}
+
+func (s *consoleServer) handleListenerAction(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad listener id")
+		return
+	}
+	switch r.PathValue("action") {
+	case "start":
+		err = s.mgr.start(id)
+	case "stop":
+		err = s.mgr.stop(id)
+	case "delete":
+		err = s.mgr.remove(id)
+	case "edit":
+		var spec listenerSpec
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
+		dec.DisallowUnknownFields()
+		if derr := dec.Decode(&spec); derr != nil {
+			writeError(w, http.StatusBadRequest, "bad request: "+derr.Error())
+			return
+		}
+		err = s.mgr.edit(id, spec)
+	default:
+		writeError(w, http.StatusNotFound, "unknown action")
+		return
+	}
+	if err != nil {
+		writeError(w, statusFor(err), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func statusFor(err error) int {
+	switch {
+	case errors.Is(err, errNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, errReadOnly), errors.Is(err, errNoManaging):
+		return http.StatusForbidden
+	case errors.Is(err, errRunning):
+		return http.StatusConflict
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

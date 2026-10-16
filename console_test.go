@@ -52,7 +52,7 @@ func startConsole(t *testing.T, password, target string) (consoleURL, forwardAdd
 	stats := newListenerStats(0, fln.Addr().String(), target)
 	go acceptConnections(ctx, fln, stats, halfCloseIdleTimeout)
 
-	cs := newConsoleServer("", password, []forwarding{{stats: stats}})
+	cs := newConsoleServer("", password, newManager([]forwarding{{stats: stats}}, nil, halfCloseIdleTimeout))
 	cln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +113,9 @@ func TestConsoleAuth(t *testing.T) {
 	c := r.Cookies()[0]
 	if !c.HttpOnly || c.SameSite != http.SameSiteStrictMode {
 		t.Fatalf("cookie flags: %+v", c)
+	}
+	if !strings.HasPrefix(c.Name, sessionCookiePrefix) || c.Name == sessionCookiePrefix {
+		t.Fatalf("cookie should be named after the console port: %q", c.Name)
 	}
 	cookie := c.Name + "=" + c.Value
 	if r := get(t, base+"/api/state", cookie); r.StatusCode != http.StatusOK {
