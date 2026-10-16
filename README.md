@@ -164,15 +164,55 @@ allow_bind_ports = "18000-19999"
   busy port stops pf-simple, as before.
 - **Writable location.** With a `[console]`, pf-simple checks at startup that
   it can create files in the config file's directory and refuses to start
-  otherwise. Under systemd, keep the file in a `StateDirectory`:
+  otherwise. Under systemd, keep the file in a `StateDirectory` (see
+  [Running under systemd](#running-under-systemd)).
+
+## Running under systemd
 
 ```ini
+# /etc/systemd/system/pf-simple.service
+[Unit]
+Description=pf-simple TCP port forwarder
+After=network-online.target
+Wants=network-online.target
+
 [Service]
+Type=simple
 StateDirectory=pf-simple
 ExecStart=/usr/local/bin/pf-simple --config /var/lib/pf-simple/pf-simple.toml
 DynamicUser=yes
 Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
 ```
+
+`DynamicUser=yes` runs pf-simple as a throwaway unprivileged user, and
+`StateDirectory=pf-simple` gives that user a writable
+`/var/lib/pf-simple/` for the config file, which the console rewrites. Let
+systemd create the directory rather than making it yourself: on a host with
+SELinux enforcing, systemd cannot adopt a directory that already exists
+there. So, in order:
+
+```sh
+systemctl daemon-reload
+systemctl start pf-simple          # fails on the missing config, but creates the directory
+systemctl stop pf-simple
+install -m 0600 pf-simple.toml /var/lib/pf-simple/pf-simple.toml
+chown --reference=/var/lib/private/pf-simple /var/lib/pf-simple/pf-simple.toml
+systemctl enable --now pf-simple
+```
+
+`/var/lib/pf-simple` is a symlink into root-only `/var/lib/private/`, so
+only root and the service can read the file (it holds the console
+password). Root can edit it by hand while the service is stopped. If you
+run without a console, a read-only file passed in with `LoadCredential=`
+works too, as shown in [Configuration file](#configuration-file).
+
+Ports below 1024 need `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the
+`[Service]` section, because the unprivileged user cannot bind them.
 
 ## Web console
 
@@ -202,6 +242,8 @@ What it shows:
 - A filter box that matches addresses, ports and `#id`.
 - **Stop** on each pipe (click twice to confirm) resets it: both sockets close
   with `SO_LINGER 0`, so both peers get a TCP RST.
+- Per-listener **Stop/Start**, and in config mode **Add listener**, **Edit**
+  and **Delete** (see [Managing listeners from the console](#managing-listeners-from-the-console)).
 
 How it stays light:
 
