@@ -20,7 +20,7 @@ func startForwarder(t *testing.T, target string, idleTimeout time.Duration) stri
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); ln.Close() })
-	go acceptConnections(ctx, ln, target, idleTimeout)
+	go acceptConnections(ctx, ln, newListenerStats(0, ln.Addr().String(), target), idleTimeout)
 	return ln.Addr().String()
 }
 

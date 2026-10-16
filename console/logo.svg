@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>pf-simple</title>
+  <g stroke="#1b2540" stroke-width="2.5" stroke-linejoin="round">
+    <rect x="1.5" y="25" width="17" height="14" rx="3.5" fill="#3d6fe0"/>
+    <rect x="13.5" y="21.5" width="6" height="21" rx="2.5" fill="#2a55bd"/>
+    <rect x="45.5" y="25" width="17" height="14" rx="3.5" fill="#14a594"/>
+    <rect x="44.5" y="21.5" width="6" height="21" rx="2.5" fill="#0d8576"/>
+    <circle cx="32" cy="32" r="17.5" fill="#ffd25e"/>
+  </g>
+  <path d="M22.5 22.5q4-4.5 9-5" fill="none" stroke="#fff3c4" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="25.5" cy="30.5" r="3.4" fill="#1b2540"/>
+  <circle cx="38.5" cy="30.5" r="3.4" fill="#1b2540"/>
+  <circle cx="26.7" cy="29.3" r="1.2" fill="#fff"/>
+  <circle cx="39.7" cy="29.3" r="1.2" fill="#fff"/>
+  <ellipse cx="21.5" cy="37" rx="3.2" ry="2.1" fill="#ff8a9b" opacity=".85"/>
+  <ellipse cx="42.5" cy="37" rx="3.2" ry="2.1" fill="#ff8a9b" opacity=".85"/>
+  <path d="M28 37.5q4 4.2 8 0" fill="none" stroke="#1b2540" stroke-width="2.4" stroke-linecap="round"/>
+</svg>

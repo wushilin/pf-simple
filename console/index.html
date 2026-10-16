@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>pf-simple console</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <div class="bar-inner">
+    <div class="brand">
+      <img class="mark" src="logo.svg" alt="" width="28" height="28">
+      <span class="name">pf-simple</span>
+      <span class="host mono" id="host" hidden></span>
+    </div>
+    <div class="bar-right">
+      <span class="status" id="status" data-state="connecting" role="status"><span class="dot"></span><span id="status-text">Connecting</span></span>
+      <button class="btn btn-quiet" id="logout" type="button" hidden>Sign out</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="login" class="login" hidden>
+    <form id="login-form" class="login-card" autocomplete="off">
+      <img class="login-mark" src="logo.svg" alt="" width="72" height="72">
+      <h1>Sign in to the console</h1>
+      <p>Enter the console password set with <code>--console</code> or <code>PF_PASSWORD</code>.</p>
+      <label class="field-label" for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <button class="btn btn-primary" type="submit" id="login-submit">Sign in</button>
+      <p class="login-error" id="login-error" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <section class="overview" aria-label="Overview">
+      <dl class="kpis">
+        <div class="kpi"><dt>Active pipes</dt><dd class="num" id="k-active">0</dd></div>
+        <div class="kpi"><dt>Accepted</dt><dd class="num" id="k-accepted">0</dd></div>
+        <div class="kpi tx"><dt>To upstream</dt><dd class="num" id="k-tx">0 b/s</dd></div>
+        <div class="kpi rx"><dt>To clients</dt><dd class="num" id="k-rx">0 b/s</dd></div>
+        <div class="kpi"><dt>Transferred</dt><dd class="num" id="k-total">0 B</dd></div>
+        <div class="kpi"><dt>Uptime</dt><dd class="num" id="k-uptime">—</dd></div>
+      </dl>
+      <figure class="trace">
+        <figcaption>
+          <span class="trace-title">Throughput, last 2 minutes</span>
+          <span class="legend"><span class="key tx">to upstream</span><span class="key rx">to clients</span></span>
+        </figcaption>
+        <canvas id="trace" height="120" aria-label="Throughput chart"></canvas>
+      </figure>
+    </section>
+
+    <div class="toolbar">
+      <div class="search">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <input id="filter" type="search" placeholder="Filter by address, port or #id" aria-label="Filter pipes">
+      </div>
+      <span class="toolbar-note" id="filter-note"></span>
+      <div class="toolbar-actions">
+        <button class="btn btn-quiet" type="button" id="expand-all">Expand all</button>
+        <button class="btn btn-quiet" type="button" id="collapse-all">Collapse all</button>
+      </div>
+    </div>
+
+    <div id="listeners" class="listeners"></div>
+  </div>
+</main>
+</body>
+</html>

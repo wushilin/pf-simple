@@ -22,32 +22,33 @@ const (
 //
 // Go's own TCPConn.ReadFrom also splices, but it loops until its byte limit or
 // EOF, which would hide small trickles of traffic from the idle timer. This
-// loop reports activity after every chunk it forwards.
-func copyStream(dst, src net.Conn, activity func()) error {
+// loop counts bytes and reports activity after every chunk it forwards.
+func copyStream(dst, src net.Conn, f *flow) error {
 	srcTCP, ok1 := src.(*net.TCPConn)
 	dstTCP, ok2 := dst.(*net.TCPConn)
 	if !ok1 || !ok2 {
-		return copyBuffered(dst, src, activity)
+		return copyBuffered(dst, src, f)
 	}
 	srcRaw, err := srcTCP.SyscallConn()
 	if err != nil {
-		return copyBuffered(dst, src, activity)
+		return copyBuffered(dst, src, f)
 	}
 	dstRaw, err := dstTCP.SyscallConn()
 	if err != nil {
-		return copyBuffered(dst, src, activity)
+		return copyBuffered(dst, src, f)
 	}
 
-	var pipe [2]int
-	if err := syscall.Pipe2(pipe[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK); err != nil {
-		return copyBuffered(dst, src, activity)
+	var kpipe [2]int
+	if err := syscall.Pipe2(kpipe[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK); err != nil {
+		return copyBuffered(dst, src, f)
 	}
-	defer syscall.Close(pipe[0])
-	defer syscall.Close(pipe[1])
+	defer syscall.Close(kpipe[0])
+	defer syscall.Close(kpipe[1])
 	// Best effort: the default is 16 pages, which is larger than 64KiB on
 	// kernels with 64KiB pages.
-	_, _, _ = syscall.Syscall(syscall.SYS_FCNTL, uintptr(pipe[1]), fSetPipeSize, copyChunkSize)
+	_, _, _ = syscall.Syscall(syscall.SYS_FCNTL, uintptr(kpipe[1]), fSetPipeSize, copyChunkSize)
 
+	chunk := f.chunk()
 	spliced := false
 	for {
 		// Socket -> pipe. The pipe is always empty here, so EAGAIN means the
@@ -55,7 +56,7 @@ func copyStream(dst, src net.Conn, activity func()) error {
 		var inPipe int64
 		var serr error
 		err := srcRaw.Read(func(fd uintptr) bool {
-			inPipe, serr = spliceRetry(int(fd), pipe[1], copyChunkSize)
+			inPipe, serr = spliceRetry(int(fd), kpipe[1], chunk)
 			return serr != syscall.EAGAIN
 		})
 		if err == nil {
@@ -63,7 +64,7 @@ func copyStream(dst, src net.Conn, activity func()) error {
 		}
 		if errors.Is(err, syscall.EINVAL) && !spliced {
 			// The kernel refused to splice this socket and nothing was consumed.
-			return copyBuffered(dst, src, activity)
+			return copyBuffered(dst, src, f)
 		}
 		if err != nil {
 			return err
@@ -72,12 +73,13 @@ func copyStream(dst, src net.Conn, activity func()) error {
 			return nil // src reached EOF (peer sent FIN)
 		}
 		spliced = true
+		f.gotRead(inPipe)
 
 		// Pipe -> socket, until the pipe is empty again.
 		for inPipe > 0 {
 			var n int64
 			err := dstRaw.Write(func(fd uintptr) bool {
-				n, serr = spliceRetry(pipe[0], int(fd), int(inPipe))
+				n, serr = spliceRetry(kpipe[0], int(fd), int(inPipe))
 				return serr != syscall.EAGAIN
 			})
 			if err == nil {
@@ -90,8 +92,9 @@ func copyStream(dst, src net.Conn, activity func()) error {
 				return io.ErrShortWrite // no progress; avoid spinning
 			}
 			inPipe -= n
+			f.wrote(n)
+			f.throttle(n)
 		}
-		activity()
 	}
 }
 

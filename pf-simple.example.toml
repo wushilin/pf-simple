@@ -1,0 +1,42 @@
+# pf-simple configuration
+#
+#   pf-simple --config /etc/pf-simple.toml
+#
+# --config cannot be combined with any other flag. Unknown keys are errors,
+# so a typo stops the forwarder at startup instead of being ignored.
+
+# Optional web console. Leave the whole [console] table out to disable it.
+[console]
+listen = "127.0.0.1:18222"
+# Leave password out (or empty) to read it from $PF_PASSWORD. If both are
+# empty the console has no password. This file holds a secret: chmod 600.
+password = "change-me"
+
+# One [[forward]] table per listener. listen and target are required.
+[[forward]]
+name = "HTTP"                 # optional; the console shows "HTTP [0.0.0.0:8080]"
+listen = "0.0.0.0:8080"
+target = "10.0.0.6:8080"
+
+[[forward]]
+name = "Doris MySQL"
+listen = "0.0.0.0:9030"
+target = "10.0.0.6:9030"
+max_connections = 200              # optional; further clients get an immediate reset
+total_speed = "1GiB/s"             # optional; shared by all pipes on this listener
+per_connection_max_speed = "15MiB/s"  # optional; the cap for each pipe
+
+# Speeds are optional and unlimited by default. Both are enforced together:
+# a pipe never exceeds its own cap, and all pipes together never exceed the
+# total. Each applies to each direction separately (client -> target and
+# target -> client), like a full-duplex link.
+#
+# Units: B, KB, MB, GB (1000-based) and KiB, MiB, GiB (1024-based), or bit
+# rates bit, Kbit, Mbit, Gbit (also Kbps, Mbps, Gbps); "/s" is optional.
+# Examples: "512B/s", "14KiB/s", "100Mbit", "1GiB/s".
+
+# Without a name the console shows the listen address, as on the command line.
+[[forward]]
+listen = "[::]:18080"
+target = "10.0.0.17:8080"
+per_connection_max_speed = "14KiB/s"
