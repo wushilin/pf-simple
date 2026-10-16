@@ -1,7 +1,7 @@
 "use strict";
 
 // The server pushes state over a WebSocket only when something changed, at
-// most once per 100ms. Local timers only repaint (ages, decaying rates, the
+// most once per 400ms. Local timers only repaint (ages, decaying rates, the
 // charts); they never talk to the server.
 //
 // Memory stays bounded for a page left open indefinitely: chart history lives

@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	queue "github.com/wushilin/go-named-queue"
 )
 
 func TestParseConsole(t *testing.T) {
@@ -42,6 +44,12 @@ func TestParseConsole(t *testing.T) {
 // startConsole runs a console and a forwarder that feed the same stats.
 func startConsole(t *testing.T, password, target string) (consoleURL, forwardAddr string) {
 	t.Helper()
+	consoleURL, forwardAddr, _ = startConsoleServer(t, password, target)
+	return
+}
+
+func startConsoleServer(t *testing.T, password, target string) (consoleURL, forwardAddr string, cs *consoleServer) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	fln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -52,13 +60,14 @@ func startConsole(t *testing.T, password, target string) (consoleURL, forwardAdd
 	stats := newListenerStats(0, fln.Addr().String(), target)
 	go acceptConnections(ctx, fln, stats, halfCloseIdleTimeout)
 
-	cs := newConsoleServer("", password, newManager([]forwarding{{stats: stats}}, nil, halfCloseIdleTimeout))
+	cs = newConsoleServer("", password, newManager([]forwarding{{stats: stats}}, nil, halfCloseIdleTimeout))
+	cs.pushEvery = 20 * time.Millisecond // keep tests fast
 	cln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	go cs.serve(ctx, cln)
-	return "http://" + cln.Addr().String(), fln.Addr().String()
+	return "http://" + cln.Addr().String(), fln.Addr().String(), cs
 }
 
 func post(t *testing.T, url, cookie, body string, csrf bool) *http.Response {
@@ -301,5 +310,101 @@ func TestConsoleAssetsAreSelfContained(t *testing.T) {
 	}
 	if ct := get(t, base+"/logo.svg", "").Header.Get("Content-Type"); ct != "image/svg+xml" {
 		t.Errorf("logo content type %q", ct)
+	}
+}
+
+// Every tab shares one stream of frames, and a subscriber that never reads
+// does not hold the others back: the queue drops its oldest frames instead.
+func TestConsoleBroadcastSharedAndDropOldest(t *testing.T) {
+	target := startServer(t, func(c *net.TCPConn) { _, _ = io.Copy(io.Discard, c) })
+	base, fwd, cs := startConsoleServer(t, "", target)
+
+	// Two browser tabs get the same stream.
+	_, tabA, code := wsDial(t, base, base)
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake: %d", code)
+	}
+	_, tabB, code := wsDial(t, base, base)
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake: %d", code)
+	}
+	if a, b := wsReadState(t, tabA), wsReadState(t, tabB); len(a.Listeners) != 1 || len(b.Listeners) != 1 {
+		t.Fatalf("initial frames: %+v %+v", a, b)
+	}
+
+	// A stuck subscriber straight on the queue, next to a live one.
+	stuck, err := queue.AcquireReceiver[[]byte](cs.queues, stateQueue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stuck.Close()
+	live, _ := queue.AcquireReceiver[[]byte](cs.queues, stateQueue)
+	defer live.Close()
+
+	client := dial(t, fwd)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = client.Write([]byte("x"))
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+	// With a blocking queue the emitter would stall after stateQueueCapacity
+	// frames and the live subscriber would stop receiving.
+	var lastNow int64
+	for i := 0; i < 3*stateQueueCapacity; i++ {
+		frame := recvWithin(t, live, 5*time.Second)
+		var st consoleState
+		if err := json.Unmarshal(frame, &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Now < lastNow {
+			t.Fatalf("frames out of order: %d after %d", st.Now, lastNow)
+		}
+		lastNow = st.Now
+	}
+	if a, b := wsReadState(t, tabA), wsReadState(t, tabB); a.Now == 0 || b.Now == 0 {
+		t.Fatal("tabs stopped receiving while another subscriber was stuck")
+	}
+
+	// The stuck subscriber's cursor was moved past the evicted frames: its
+	// next frame is within the queue's window of the newest, not the first
+	// frame ever published.
+	var st consoleState
+	if err := json.Unmarshal(recvWithin(t, stuck, 5*time.Second), &st); err != nil {
+		t.Fatal(err)
+	}
+	window := int64(stateQueueCapacity) * cs.pushEvery.Milliseconds()
+	if st.Now < lastNow-window-200 {
+		t.Fatalf("stuck subscriber got a stale frame: %dms behind the live one (window %dms)", lastNow-st.Now, window)
+	}
+}
+
+func recvWithin(t *testing.T, rx *queue.Receiver[[]byte], d time.Duration) []byte {
+	t.Helper()
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		data, err := rx.Recv()
+		ch <- result{data, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		return r.data
+	case <-time.After(d):
+		t.Fatal("no frame received: the emitter is blocked")
+		return nil
 	}
 }

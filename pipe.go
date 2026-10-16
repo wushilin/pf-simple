@@ -10,28 +10,21 @@ import (
 	"time"
 )
 
-// changes wakes the console when anything it shows has changed. Writers only
-// pay for an atomic swap; the channel send happens once per dirty period.
-var changes = &changeSignal{wake: make(chan struct{}, 1)}
+// changes records that something the console shows has changed. The
+// console's emitter checks it on a fixed tick and sends nothing while it is
+// clear. Writers only pay for an atomic load, and a store on the first change.
+var changes changeSignal
 
-type changeSignal struct {
-	dirty atomic.Bool
-	wake  chan struct{}
-}
+type changeSignal struct{ dirty atomic.Bool }
 
 func (c *changeSignal) notify() {
-	// Load first: while already dirty this stays a shared-cache read, so
-	// copy loops on many cores do not bounce the cache line.
-	if c.dirty.Load() {
-		return
-	}
-	if !c.dirty.Swap(true) {
-		select {
-		case c.wake <- struct{}{}:
-		default:
-		}
+	if !c.dirty.Load() {
+		c.dirty.Store(true)
 	}
 }
+
+// take reports whether anything changed since the last call and clears it.
+func (c *changeSignal) take() bool { return c.dirty.Swap(false) }
 
 // flow counts one direction of a pipe. read is what the source socket gave
 // us; written is what reached the destination socket.

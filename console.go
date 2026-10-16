@@ -18,7 +18,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	queue "github.com/wushilin/go-named-queue"
 )
 
 //go:embed console
@@ -35,10 +38,17 @@ const (
 	// the cookie off cross-site requests as a second layer.
 	csrfHeader = "X-PF-Console"
 
-	// pushInterval caps pushes at one per 100ms while traffic flows. When
-	// nothing changes, nothing is sent.
-	pushInterval   = 100 * time.Millisecond
-	wsPingInterval = 30 * time.Second
+	// pushInterval is the emitter's tick: at most one push per 400ms, and
+	// none at all while nothing changes.
+	pushInterval = 400 * time.Millisecond
+
+	// stateQueue is the broadcast queue every console tab subscribes to. Each
+	// push is marshaled once and delivered to all subscribers; it holds at
+	// most stateQueueCapacity frames and drops the oldest when full, so a slow
+	// tab misses stale frames instead of holding the others back.
+	stateQueue         = "console.state"
+	stateQueueCapacity = 8
+	wsPingInterval     = 30 * time.Second
 )
 
 // parseConsole splits "listen-address[@password]". A bare port binds to
@@ -69,21 +79,28 @@ type consoleServer struct {
 	mu       sync.Mutex
 	sessions map[string]time.Time // token -> expiry
 
-	subMu       sync.Mutex
-	subscribers map[chan struct{}]struct{}
+	pushEvery time.Duration // pushInterval; tests shorten it
+	queues    *queue.QueueRegistry
+	frames    *queue.Sender[[]byte]
+	viewers   atomic.Int32 // subscribed tabs; nothing is marshaled while zero
 }
 
 func newConsoleServer(addr, password string, mgr *manager) *consoleServer {
 	host, _ := os.Hostname()
 	s := &consoleServer{
-		addr:        addr,
-		host:        host,
-		password:    password,
-		started:     time.Now(),
-		ctx:         context.Background(),
-		sessions:    make(map[string]time.Time),
-		subscribers: make(map[chan struct{}]struct{}),
+		addr:      addr,
+		host:      host,
+		password:  password,
+		started:   time.Now(),
+		ctx:       context.Background(),
+		sessions:  make(map[string]time.Time),
+		pushEvery: pushInterval,
+		queues:    queue.NewRegistry(),
 	}
+	if err := queue.CreateBroadcastingWithFullAction[[]byte](s.queues, stateQueue, stateQueueCapacity, queue.FullDropOldest); err != nil {
+		panic(err) // a fresh registry cannot already hold the queue
+	}
+	s.frames, _ = queue.AcquireSender[[]byte](s.queues, stateQueue)
 	s.mgr = mgr
 	return s
 }
@@ -265,44 +282,26 @@ func (s *consoleServer) handleStop(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// broadcast wakes every WebSocket session when the registry or any counter
-// changed, at most once per pushInterval. It blocks while nothing changes.
+// broadcast is the stats emitter: every pushEvery it checks whether anything
+// changed and, if so, publishes one frame to the state queue. No change, no
+// event. Nothing is marshaled while no tab is subscribed.
 func (s *consoleServer) broadcast(ctx context.Context) {
+	defer s.queues.Shutdown(stateQueue) // wakes every subscriber with ErrClosed
+	tick := time.NewTicker(s.pushEvery)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-changes.wake:
+		case <-tick.C:
 		}
-		changes.dirty.Store(false) // changes from here on wake the next round
-		s.subMu.Lock()
-		for ch := range s.subscribers {
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
+		if !changes.take() || s.viewers.Load() == 0 {
+			continue
 		}
-		s.subMu.Unlock()
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(pushInterval):
+		if data, err := json.Marshal(s.state()); err == nil {
+			_ = s.frames.Send(data) // never blocks: drop-oldest
 		}
 	}
-}
-
-func (s *consoleServer) subscribe() chan struct{} {
-	ch := make(chan struct{}, 1)
-	s.subMu.Lock()
-	s.subscribers[ch] = struct{}{}
-	s.subMu.Unlock()
-	return ch
-}
-
-func (s *consoleServer) unsubscribe(ch chan struct{}) {
-	s.subMu.Lock()
-	delete(s.subscribers, ch)
-	s.subMu.Unlock()
 }
 
 func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -311,42 +310,62 @@ func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer ws.Close()
-	updates := s.subscribe()
-	defer s.unsubscribe(updates)
+	rx, err := queue.AcquireReceiver[[]byte](s.queues, stateQueue)
+	if err != nil {
+		return // shutting down
+	}
+	s.viewers.Add(1)
+	defer s.viewers.Add(-1)
+	defer rx.Close()
+	done := make(chan struct{})
+	defer close(done)
 
+	// The client's side: answer pings, notice when it goes away.
 	gone := make(chan struct{})
 	go func() {
 		_ = ws.readLoop()
 		close(gone)
 	}()
-	ping := time.NewTicker(wsPingInterval)
-	defer ping.Stop()
-
-	send := func() error {
-		data, err := json.Marshal(s.state())
-		if err != nil {
-			return err
-		}
-		return ws.writeFrame(wsOpText, data)
-	}
-	if send() != nil {
-		return
-	}
-	for {
+	// Recv cannot be cancelled, so a watcher closes the receiver when the
+	// client leaves or the server stops; that wakes Recv with ErrClosed.
+	go func() {
 		select {
 		case <-s.ctx.Done():
 			_ = ws.writeFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
-			return
 		case <-gone:
+		case <-done:
+		}
+		rx.Close()
+	}()
+	go func() {
+		ping := time.NewTicker(wsPingInterval)
+		defer ping.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ping.C:
+				if ws.writeFrame(wsOpPing, nil) != nil {
+					rx.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	// A new subscriber starts at the queue's tail, so send the current state
+	// first; frames published from now on follow.
+	data, err := json.Marshal(s.state())
+	if err != nil || ws.writeFrame(wsOpText, data) != nil {
+		return
+	}
+	for {
+		frame, err := rx.Recv()
+		if err != nil {
+			return // closed by the watcher, the ping loop, or server shutdown
+		}
+		if ws.writeFrame(wsOpText, frame) != nil {
 			return
-		case <-ping.C:
-			if ws.writeFrame(wsOpPing, nil) != nil {
-				return
-			}
-		case <-updates:
-			if send() != nil {
-				return
-			}
 		}
 	}
 }

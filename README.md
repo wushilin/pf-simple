@@ -260,8 +260,14 @@ What it shows:
 How it stays light:
 
 - The server pushes state over a WebSocket only when something changed, at
-  most once every 100 ms. An idle forwarder sends nothing but a ping every
+  most once every 400 ms. An idle forwarder sends nothing but a ping every
   30 seconds. The page never polls.
+- Each push is serialized once and handed to every open tab through a
+  bounded broadcast queue
+  ([go-named-queue](https://github.com/wushilin/go-named-queue)). The queue
+  keeps 8 frames and drops the oldest when full, so a tab on a slow link
+  misses stale frames instead of slowing the others, and nothing is
+  serialized at all while no tab is open.
 - Byte counters are per-pipe atomics. Live pipes sit in one registry whose
   mutex is only taken to add, remove or list them, so the console does not
   slow the copy path (see the benchmark below).
