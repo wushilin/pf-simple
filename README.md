@@ -2,6 +2,18 @@
 
 A small TCP port forwarder that supports multiple mappings.
 
+**Zero copy** on Linux.
+
+## Screenshots
+<img width="424" height="404" alt="image" src="https://github.com/user-attachments/assets/80424dca-3f9d-421a-b118-126656d8ff63" />
+
+<img width="1430" height="720" alt="image" src="https://github.com/user-attachments/assets/fc684662-7f2b-4c89-86be-6d16684d336d" />
+
+<img width="565" height="527" alt="image" src="https://github.com/user-attachments/assets/d133e2c3-79a4-45de-9169-036deaa3db1b" />
+
+
+
+
 ## Quick start
 
 Give each mapping as `listen@target`, either as plain arguments or with
