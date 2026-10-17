@@ -95,7 +95,7 @@ func startFromConfig(t *testing.T, path string) (string, *manager) {
 		t.Fatal(err)
 	}
 	go cs.serve(ctx, ln)
-	return "http://" + ln.Addr().String(), mgr
+	return "http://" + ln.Addr().String() + consolePrefix, mgr
 }
 
 func freePort(t *testing.T) int {

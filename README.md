@@ -239,6 +239,26 @@ The value is `listen-address[@password]`. Without a password after `@`, the
 password comes from `$PF_PASSWORD`; if that is empty too, the console is open
 to anyone who can reach it.
 
+Everything the console serves, the page, its assets and the `api/` endpoints,
+lives under `/pf/`, so open `http://127.0.0.1:18222/pf/`. The bare `/`
+redirects there; nothing else is served. The session cookie is scoped to
+`/pf` as well. This lets a reverse proxy mount the console next to other
+applications by path without rewriting anything:
+
+```nginx
+location /pf/ {
+    proxy_pass http://127.0.0.1:18222;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;     # the live view is a WebSocket
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
+
+The page builds its WebSocket URL from its own location, so it works at
+whatever host and scheme the proxy presents. The `Origin` of the handshake
+must match the `Host` the proxy forwards, hence `Host $host` above.
+
 What it shows:
 
 - A summary strip: active pipes, accepted connections, current throughput in

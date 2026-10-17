@@ -78,7 +78,7 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 		if console.mgr.policy != nil {
 			mode += ", listener management on"
 		}
-		log.Printf("console on http://%s (%s)", ln.Addr(), mode)
+		log.Printf("console on http://%s%s/ (%s)", ln.Addr(), consolePrefix, mode)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

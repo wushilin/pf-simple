@@ -67,7 +67,8 @@ func startConsoleServer(t *testing.T, password, target string) (consoleURL, forw
 		t.Fatal(err)
 	}
 	go cs.serve(ctx, cln)
-	return "http://" + cln.Addr().String(), fln.Addr().String(), cs
+	// The console lives under consolePrefix; callers append "/api/..." to this.
+	return "http://" + cln.Addr().String() + consolePrefix, fln.Addr().String(), cs
 }
 
 func post(t *testing.T, url, cookie, body string, csrf bool) *http.Response {
@@ -120,7 +121,7 @@ func TestConsoleAuth(t *testing.T) {
 		t.Fatalf("login: %d cookies=%v", r.StatusCode, r.Cookies())
 	}
 	c := r.Cookies()[0]
-	if !c.HttpOnly || c.SameSite != http.SameSiteStrictMode {
+	if !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Path != consolePrefix {
 		t.Fatalf("cookie flags: %+v", c)
 	}
 	if !strings.HasPrefix(c.Name, sessionCookiePrefix) || c.Name == sessionCookiePrefix {
@@ -136,6 +137,33 @@ func TestConsoleAuth(t *testing.T) {
 	}
 }
 
+// Everything is served under consolePrefix so a reverse proxy can mount the
+// console by path; the bare root redirects there and nothing else is served.
+func TestConsolePrefixAndRootRedirect(t *testing.T) {
+	base, _ := startConsole(t, "", "127.0.0.1:1")
+	root := strings.TrimSuffix(base, consolePrefix)
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	check := func(path string, wantCode int, wantLocation string) {
+		t.Helper()
+		r, err := noFollow.Get(root + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		if r.StatusCode != wantCode || r.Header.Get("Location") != wantLocation {
+			t.Errorf("GET %s: %d location=%q, want %d %q", path, r.StatusCode, r.Header.Get("Location"), wantCode, wantLocation)
+		}
+	}
+	check("/", http.StatusFound, consolePrefix+"/")
+	check(consolePrefix, http.StatusTemporaryRedirect, consolePrefix+"/") // the mux adds the slash
+	check(consolePrefix+"/", http.StatusOK, "")
+	check(consolePrefix+"/app.js", http.StatusOK, "")
+	check(consolePrefix+"/api/state", http.StatusOK, "")
+	check("/api/state", http.StatusNotFound, "")
+	check("/app.js", http.StatusNotFound, "")
+	check("/other", http.StatusNotFound, "")
+}
+
 func TestConsoleNoPassword(t *testing.T) {
 	base, _ := startConsole(t, "", "127.0.0.1:1")
 	if r := get(t, base+"/api/state", ""); r.StatusCode != http.StatusOK {
@@ -146,15 +174,15 @@ func TestConsoleNoPassword(t *testing.T) {
 // wsDial is a tiny test client for the console's WebSocket.
 func wsDial(t *testing.T, base, origin string) (net.Conn, *bufio.Reader, int) {
 	t.Helper()
-	host := strings.TrimPrefix(base, "http://")
+	host := strings.TrimSuffix(strings.TrimPrefix(base, "http://"), consolePrefix)
 	c, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-	fmt.Fprintf(c, "GET /api/ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
-		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: %s\r\n\r\n", host, origin)
+	fmt.Fprintf(c, "GET %s/api/ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: %s\r\n\r\n", consolePrefix, host, origin)
 	rd := bufio.NewReader(c)
 	resp, err := http.ReadResponse(rd, nil)
 	if err != nil {

@@ -105,18 +105,26 @@ func newConsoleServer(addr, password string, mgr *manager) *consoleServer {
 	return s
 }
 
+// consolePrefix is the path everything the console serves lives under, so a
+// reverse proxy can mount it next to other applications by prefix. The root
+// redirects there.
+const consolePrefix = "/pf"
+
 func (s *consoleServer) handler() http.Handler {
 	static, _ := fs.Sub(consoleFiles, "console")
 	mux := http.NewServeMux()
-	mux.Handle("GET /", http.FileServerFS(static))
-	mux.HandleFunc("GET /api/session", s.handleSession)
-	mux.HandleFunc("POST /api/login", s.requireCSRF(s.handleLogin))
-	mux.HandleFunc("POST /api/logout", s.requireCSRF(s.handleLogout))
-	mux.HandleFunc("GET /api/state", s.requireAuth(s.handleState))
-	mux.HandleFunc("GET /api/ws", s.requireAuth(s.handleWebSocket))
-	mux.HandleFunc("POST /api/listeners", s.requireCSRF(s.requireAuth(s.handleAddListener)))
-	mux.HandleFunc("POST /api/listeners/{id}/{action}", s.requireCSRF(s.requireAuth(s.handleListenerAction)))
-	mux.HandleFunc("POST /api/pipes/{id}/stop", s.requireCSRF(s.requireAuth(s.handleStop)))
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, consolePrefix+"/", http.StatusFound)
+	})
+	mux.Handle("GET "+consolePrefix+"/", http.StripPrefix(consolePrefix+"/", http.FileServerFS(static)))
+	mux.HandleFunc("GET "+consolePrefix+"/api/session", s.handleSession)
+	mux.HandleFunc("POST "+consolePrefix+"/api/login", s.requireCSRF(s.handleLogin))
+	mux.HandleFunc("POST "+consolePrefix+"/api/logout", s.requireCSRF(s.handleLogout))
+	mux.HandleFunc("GET "+consolePrefix+"/api/state", s.requireAuth(s.handleState))
+	mux.HandleFunc("GET "+consolePrefix+"/api/ws", s.requireAuth(s.handleWebSocket))
+	mux.HandleFunc("POST "+consolePrefix+"/api/listeners", s.requireCSRF(s.requireAuth(s.handleAddListener)))
+	mux.HandleFunc("POST "+consolePrefix+"/api/listeners/{id}/{action}", s.requireCSRF(s.requireAuth(s.handleListenerAction)))
+	mux.HandleFunc("POST "+consolePrefix+"/api/pipes/{id}/stop", s.requireCSRF(s.requireAuth(s.handleStop)))
 	return securityHeaders(mux)
 }
 
@@ -235,7 +243,7 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.cookieName,
 		Value:    token,
-		Path:     "/",
+		Path:     consolePrefix,
 		MaxAge:   int(sessionLifetime / time.Second),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
@@ -250,7 +258,7 @@ func (s *consoleServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 		delete(s.sessions, cookie.Value)
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: s.cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName, Value: "", Path: consolePrefix, MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.WriteHeader(http.StatusNoContent)
 }
 
