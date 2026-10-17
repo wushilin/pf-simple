@@ -347,8 +347,8 @@ a single localhost stream 20 to 35% faster than a user-space copy, and four
 streams at about the speed of a direct connection. `strace` during a transfer
 shows only `splice` calls carrying data, no `read` or `write`.
 
-macOS and FreeBSD have no socket-to-socket splice, so there pf-simple uses a
-read/write loop with a 64 KiB buffer.
+macOS, FreeBSD and Windows have no socket-to-socket splice, so there
+pf-simple uses a read/write loop with a 64 KiB buffer.
 
 ## Performance test (localhost to localhost)
 
