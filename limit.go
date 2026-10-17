@@ -10,8 +10,8 @@ import (
 )
 
 // limiter is a token bucket shared by every pipe of one forward in one
-// direction. Callers move a chunk first and then wait off the debt, so the
-// splice path keeps moving bytes in the kernel.
+// direction. Callers reserve capacity and wait before delivering a chunk,
+// keeping the aggregate burst bounded even as new connections arrive.
 type limiter struct {
 	rate  float64 // bytes per second
 	burst float64
@@ -51,10 +51,16 @@ func (l *limiter) reserve(n int64) time.Duration {
 }
 
 // waitAll charges n bytes to every non-nil limiter and sleeps until all of
-// them allow it, returning early when cancel closes.
-func waitAll(n int64, cancel <-chan struct{}, limiters ...*limiter) {
+// them allow it. It returns false when cancel closes, so callers must not
+// forward bytes after a canceled wait.
+func waitAll(n int64, cancel <-chan struct{}, limiters ...*limiter) bool {
+	select {
+	case <-cancel:
+		return false
+	default:
+	}
 	if n <= 0 {
-		return
+		return true
 	}
 	var d time.Duration
 	for _, l := range limiters {
@@ -63,13 +69,15 @@ func waitAll(n int64, cancel <-chan struct{}, limiters ...*limiter) {
 		}
 	}
 	if d <= 0 {
-		return
+		return true
 	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-t.C:
+		return true
 	case <-cancel:
+		return false
 	}
 }
 

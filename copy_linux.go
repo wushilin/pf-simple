@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -74,6 +75,9 @@ func copyStream(dst, src net.Conn, f *flow) error {
 		}
 		spliced = true
 		f.gotRead(inPipe)
+		if !f.throttle(inPipe) {
+			return context.Canceled
+		}
 
 		// Pipe -> socket, until the pipe is empty again.
 		for inPipe > 0 {
@@ -93,7 +97,6 @@ func copyStream(dst, src net.Conn, f *flow) error {
 			}
 			inPipe -= n
 			f.wrote(n)
-			f.throttle(n)
 		}
 	}
 }

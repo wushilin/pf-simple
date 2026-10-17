@@ -66,6 +66,11 @@ func parseConsole(value, envPassword string) (addr, password string, err error) 
 	return addr, password, nil
 }
 
+type consoleSession struct {
+	expires time.Time
+	revoked chan struct{} // closed under consoleServer.mu on logout or expiry
+}
+
 type consoleServer struct {
 	addr       string
 	host       string
@@ -77,7 +82,7 @@ type consoleServer struct {
 	ctx context.Context // canceled on shutdown; ends WebSocket sessions
 
 	mu       sync.Mutex
-	sessions map[string]time.Time // token -> expiry
+	sessions map[string]*consoleSession // token -> session
 
 	pushEvery time.Duration // pushInterval; tests shorten it
 	queues    *queue.QueueRegistry
@@ -93,7 +98,7 @@ func newConsoleServer(addr, password string, mgr *manager) *consoleServer {
 		password:  password,
 		started:   time.Now(),
 		ctx:       context.Background(),
-		sessions:  make(map[string]time.Time),
+		sessions:  make(map[string]*consoleSession),
 		pushEvery: pushInterval,
 		queues:    queue.NewRegistry(),
 	}
@@ -181,24 +186,31 @@ func (s *consoleServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *consoleServer) authorized(r *http.Request) bool {
-	if s.password == "" {
-		return true
-	}
+	return s.password == "" || s.session(r) != nil
+}
+
+// session also rechecks authorization after a WebSocket's HTTP middleware,
+// so a logout racing the upgrade cannot leave an untracked socket open.
+func (s *consoleServer) session(r *http.Request) *consoleSession {
 	cookie, err := r.Cookie(s.cookieName)
 	if err != nil {
-		return false
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	expiry, ok := s.sessions[cookie.Value]
-	if !ok {
-		return false
+	session := s.sessions[cookie.Value]
+	if session != nil && !time.Now().Before(session.expires) {
+		s.revokeLocked(cookie.Value)
+		return nil
 	}
-	if time.Now().After(expiry) {
-		delete(s.sessions, cookie.Value)
-		return false
+	return session
+}
+
+func (s *consoleServer) revokeLocked(token string) {
+	if session := s.sessions[token]; session != nil {
+		close(session.revoked)
+		delete(s.sessions, token)
 	}
-	return true
 }
 
 func (s *consoleServer) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -233,12 +245,12 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	token := hex.EncodeToString(raw[:])
 	now := time.Now()
 	s.mu.Lock()
-	for t, exp := range s.sessions {
-		if now.After(exp) {
-			delete(s.sessions, t)
+	for t, session := range s.sessions {
+		if !now.Before(session.expires) {
+			s.revokeLocked(t)
 		}
 	}
-	s.sessions[token] = now.Add(sessionLifetime)
+	s.sessions[token] = &consoleSession{expires: now.Add(sessionLifetime), revoked: make(chan struct{})}
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.cookieName,
@@ -255,7 +267,7 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (s *consoleServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(s.cookieName); err == nil {
 		s.mu.Lock()
-		delete(s.sessions, cookie.Value)
+		s.revokeLocked(cookie.Value)
 		s.mu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{Name: s.cookieName, Value: "", Path: consolePrefix, MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
@@ -313,6 +325,19 @@ func (s *consoleServer) broadcast(ctx context.Context) {
 }
 
 func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	var revoked <-chan struct{}
+	var expiry <-chan time.Time
+	if s.password != "" {
+		session := s.session(r)
+		if session == nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		revoked = session.revoked
+		timer := time.NewTimer(time.Until(session.expires))
+		defer timer.Stop()
+		expiry = timer.C
+	}
 	ws, err := upgradeWebSocket(w, r)
 	if err != nil {
 		return
@@ -340,6 +365,10 @@ func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 		select {
 		case <-s.ctx.Done():
 			_ = ws.writeFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
+		case <-revoked:
+			_ = ws.Close()
+		case <-expiry:
+			_ = ws.Close()
 		case <-gone:
 		case <-done:
 		}

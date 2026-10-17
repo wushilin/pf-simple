@@ -413,11 +413,20 @@ func (m *manager) start(id int) error {
 	if err != nil {
 		return err
 	}
+	wasRunning, wasEnabled, lastErr := ml.running, ml.enabled, ml.lastErr
 	if err := m.startLocked(ml); err != nil {
 		return fmt.Errorf("cannot listen on %s: %w", ml.stats.listen, err)
 	}
 	ml.enabled = true
-	return m.saveIfConsoleLocked(ml)
+	if err := m.saveIfConsoleLocked(ml); err != nil {
+		if !wasRunning {
+			m.stopLocked(ml, true)
+		}
+		ml.enabled, ml.lastErr = wasEnabled, lastErr
+		changes.notify()
+		return err
+	}
+	return nil
 }
 
 func (m *manager) stop(id int) error {
@@ -427,10 +436,19 @@ func (m *manager) stop(id int) error {
 	if err != nil {
 		return err
 	}
+	// Save the desired state before resetting connections: a failed save
+	// must leave the running listener and its existing pipes untouched.
+	wasEnabled := ml.enabled
+	ml.enabled = false
+	if err := m.saveIfConsoleLocked(ml); err != nil {
+		ml.enabled = wasEnabled
+		return err
+	}
 	m.stopLocked(ml, true)
-	ml.enabled, ml.lastErr = false, ""
+	ml.lastErr = ""
+	changes.notify()
 	log.Printf("stopped %s", ml.stats.labelFor(ml.stats.listen))
-	return m.saveIfConsoleLocked(ml)
+	return nil
 }
 
 func (m *manager) saveIfConsoleLocked(ml *managedListener) error {
@@ -450,15 +468,20 @@ func (m *manager) remove(id int) error {
 	if ml.running {
 		return fmt.Errorf("%w before deleting it", errRunning)
 	}
+	previous := m.list
 	for i, x := range m.list {
 		if x == ml {
 			m.list = append(m.list[:i:i], m.list[i+1:]...)
 			break
 		}
 	}
+	if err := m.saveLocked(); err != nil {
+		m.list = previous
+		return err
+	}
 	log.Printf("deleted %s", ml.stats.labelFor(ml.stats.listen))
 	changes.notify()
-	return m.saveLocked()
+	return nil
 }
 
 // edit replaces a stopped listener's settings. Its counters carry
@@ -490,13 +513,14 @@ func (m *manager) edit(id int, spec listenerSpec) error {
 	next.rejected.Store(old.rejected.Load())
 	next.closedUp.Store(old.closedUp.Load())
 	next.closedDown.Store(old.closedDown.Load())
+	lastErr := ml.lastErr
 	ml.stats, ml.lastErr = next, ""
-	log.Printf("edited %s -> %s", next.labelFor(next.listen), next.target)
-	changes.notify()
 	if err := m.saveLocked(); err != nil {
-		ml.stats = old
+		ml.stats, ml.lastErr = old, lastErr
 		return err
 	}
+	log.Printf("edited %s -> %s", next.labelFor(next.listen), next.target)
+	changes.notify()
 	return nil
 }
 

@@ -70,12 +70,17 @@ func TestBidirectionalIntegrity(t *testing.T) {
 	// same time, so both directions carry data concurrently.
 	gotUp := make(chan [32]byte, 1)
 	target := startServer(t, func(c *net.TCPConn) {
+		writerDone := make(chan struct{})
 		go func() {
+			defer close(writerDone)
 			_, _ = c.Write(payload)
 			_ = c.CloseWrite()
 		}()
 		h := sha256.New()
 		_, _ = io.Copy(h, c)
+		// startServer closes c when this handler returns. Finish sending
+		// before returning, even when the upload completes first.
+		<-writerDone
 		var sum [32]byte
 		copy(sum[:], h.Sum(nil))
 		gotUp <- sum

@@ -200,6 +200,18 @@ func handleConnection(ctx context.Context, client net.Conn, l *listenerStats, id
 				timer.Reset(idleTimeout)
 			}
 		case <-timeout:
+			if p.up.throttling.Load() || p.down.throttling.Load() {
+				timer.Reset(idleTimeout)
+				continue
+			}
+			// Activity and the timer may become ready together. Honor a
+			// completed throttle wait before treating the connection as idle.
+			select {
+			case <-activity:
+				timer.Reset(idleTimeout)
+				continue
+			default:
+			}
 			return // deferred Close interrupts the remaining blocked copy.
 		}
 	}
@@ -216,12 +228,17 @@ func copyBuffered(dst, src net.Conn, f *flow) error {
 		n, err := src.Read(buf)
 		if n > 0 {
 			f.gotRead(int64(n))
+			if !f.throttle(int64(n)) {
+				return context.Canceled
+			}
 			w, werr := dst.Write(buf[:n])
 			f.wrote(int64(w))
 			if werr != nil {
 				return werr
 			}
-			f.throttle(int64(w))
+			if w != n {
+				return io.ErrShortWrite
+			}
 		}
 		if errors.Is(err, io.EOF) {
 			return nil

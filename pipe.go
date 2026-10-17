@@ -29,10 +29,11 @@ func (c *changeSignal) take() bool { return c.dirty.Swap(false) }
 // flow counts one direction of a pipe. read is what the source socket gave
 // us; written is what reached the destination socket.
 type flow struct {
-	read     atomic.Uint64
-	written  atomic.Uint64
-	done     atomic.Bool // the source reached EOF or the copy failed
-	activity func()
+	read       atomic.Uint64
+	written    atomic.Uint64
+	done       atomic.Bool // the source reached EOF or the copy failed
+	throttling atomic.Bool // intentional rate-limit waits are not idle time
+	activity   func()
 	// Speed limits for this direction: the listener's shared total and this
 	// pipe's own cap. Either may be nil; both are enforced.
 	total   *limiter
@@ -52,8 +53,18 @@ func (f *flow) chunk() int {
 }
 
 // throttle waits until n more bytes fit both limits.
-func (f *flow) throttle(n int64) {
-	waitAll(n, f.cancel, f.total, f.perConn)
+func (f *flow) throttle(n int64) bool {
+	if f.total == nil && f.perConn == nil {
+		return waitAll(n, f.cancel)
+	}
+	f.throttling.Store(true)
+	defer func() {
+		if f.activity != nil {
+			f.activity() // start a fresh idle period when the wait ends
+		}
+		f.throttling.Store(false)
+	}()
+	return waitAll(n, f.cancel, f.total, f.perConn)
 }
 
 func (f *flow) gotRead(n int64) {

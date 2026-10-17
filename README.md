@@ -42,8 +42,9 @@ Anything more (names, connection caps, speed limits) goes in a
 The two directions of a connection are copied independently. When one
 direction reaches EOF, the forwarder half-closes the corresponding destination
 socket so the other side can still send a final response. If the connection is
-idle for 30 seconds after that half-close, both sockets are closed. SIGINT and
-SIGTERM stop the listeners.
+idle for 30 seconds after that half-close, both sockets are closed. Intentional
+waits for bandwidth limits do not count as idle time. SIGINT and SIGTERM stop
+the listeners.
 
 ## Configuration file
 
@@ -99,9 +100,9 @@ full-duplex link. Units are `B`, `KB`, `MB`, `GB` (1000-based), `KiB`, `MiB`,
 `Mbps`, `Gbps`); `/s` is optional, so `512B/s`, `14KiB/s`, `100Mbit` and
 `1GiB/s` all work.
 
-Limits keep the splice data path: pf-simple waits between chunks rather than
-copying through a buffer, and uses smaller chunks on limited listeners so the
-rate stays smooth. On a Linux test host a listener with
+Limits keep the splice data path: pf-simple reserves bandwidth before sending
+each chunk. Limited listeners use smaller chunks to keep the rate smooth.
+On a Linux test host a listener with
 `per_connection_max_speed = "40MiB/s"` held one iperf3 stream at 40.0 MiB/s,
 and `total_speed = "100MiB/s"` held four streams at 100.0 MiB/s combined.
 
@@ -307,7 +308,8 @@ Security notes: the console speaks plain HTTP, so the password and session
 cookie cross the network unencrypted. Bind it to `127.0.0.1` and use an SSH
 tunnel (`ssh -L 18222:127.0.0.1:18222 host`), or keep it on a trusted network.
 Sessions use an `HttpOnly`, `SameSite=Strict` cookie that lasts 12 hours and
-are kept in memory, so restarting the forwarder signs everyone out. Every
+are kept in memory, so restarting the forwarder signs everyone out. Logout and
+session expiry also close that session's open WebSocket connections. Every
 state-changing request needs a custom header, WebSocket connections from
 other origins are refused, and a wrong password is answered after a one-second
 delay.

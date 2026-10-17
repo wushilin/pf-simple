@@ -133,15 +133,30 @@ func TestConfigErrors(t *testing.T) {
 // startLimitedForwarder runs a forwarder whose listener has the given limits.
 func startLimitedForwarder(t *testing.T, target string, configure func(*listenerStats)) string {
 	t.Helper()
+	return startLimitedForwarderWithIdle(t, target, halfCloseIdleTimeout, configure)
+}
+
+func startLimitedForwarderWithIdle(t *testing.T, target string, idle time.Duration, configure func(*listenerStats)) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); ln.Close() })
 	l := newListenerStats(0, ln.Addr().String(), target)
 	configure(l)
-	go acceptConnections(ctx, ln, l, halfCloseIdleTimeout)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		acceptConnections(ctx, ln, l, idle)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		ln.Close()
+		<-done
+		pipes.interruptListener(l)
+		l.conns.Wait()
+	})
 	return ln.Addr().String()
 }
 

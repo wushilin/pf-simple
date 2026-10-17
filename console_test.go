@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -175,7 +176,7 @@ func TestConsoleNoPassword(t *testing.T) {
 }
 
 // wsDial is a tiny test client for the console's WebSocket.
-func wsDial(t *testing.T, base, origin string) (net.Conn, *bufio.Reader, int) {
+func wsDial(t *testing.T, base, origin string, cookies ...string) (net.Conn, *bufio.Reader, int) {
 	t.Helper()
 	host := strings.TrimSuffix(strings.TrimPrefix(base, "http://"), consolePrefix)
 	c, err := net.Dial("tcp", host)
@@ -184,8 +185,12 @@ func wsDial(t *testing.T, base, origin string) (net.Conn, *bufio.Reader, int) {
 	}
 	t.Cleanup(func() { c.Close() })
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	cookieHeader := ""
+	if len(cookies) > 0 {
+		cookieHeader = "Cookie: " + cookies[0] + "\r\n"
+	}
 	fmt.Fprintf(c, "GET %s/api/ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
-		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: %s\r\n\r\n", consolePrefix, host, origin)
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: %s\r\n%s\r\n", consolePrefix, host, origin, cookieHeader)
 	rd := bufio.NewReader(c)
 	resp, err := http.ReadResponse(rd, nil)
 	if err != nil {
@@ -437,5 +442,62 @@ func recvWithin(t *testing.T, rx *queue.Receiver[[]byte], d time.Duration) []byt
 	case <-time.After(d):
 		t.Fatal("no frame received: the emitter is blocked")
 		return nil
+	}
+}
+
+func TestConsoleWebSocketSessionRevocation(t *testing.T) {
+	for _, action := range []string{"logout", "expiry"} {
+		t.Run(action, func(t *testing.T) {
+			base, _, cs := startConsoleServer(t, "secret", "127.0.0.1:1")
+			login := func() *http.Cookie {
+				r := post(t, base+"/api/login", "", `{"password":"secret"}`, true)
+				if r.StatusCode != http.StatusNoContent || len(r.Cookies()) != 1 {
+					t.Fatalf("login: %d", r.StatusCode)
+				}
+				return r.Cookies()[0]
+			}
+			cookie := login()
+			other := login()
+			if action == "expiry" {
+				cs.mu.Lock()
+				cs.sessions[cookie.Value].expires = time.Now().Add(500 * time.Millisecond)
+				cs.mu.Unlock()
+			}
+			// Two tabs share the revoked session; a separate login stays valid.
+			var tabs []net.Conn
+			for i := 0; i < 2; i++ {
+				conn, rd, code := wsDial(t, base, base, cookie.String())
+				if code != http.StatusSwitchingProtocols {
+					t.Fatalf("handshake: %d", code)
+				}
+				_ = wsReadState(t, rd)
+				tabs = append(tabs, conn)
+			}
+			_, otherReader, code := wsDial(t, base, base, other.String())
+			if code != http.StatusSwitchingProtocols {
+				t.Fatalf("other handshake: %d", code)
+			}
+			_ = wsReadState(t, otherReader)
+			if action == "logout" {
+				if r := post(t, base+"/api/logout", cookie.String(), "", true); r.StatusCode != http.StatusNoContent {
+					t.Fatalf("logout: %d", r.StatusCode)
+				}
+			}
+			// No traffic or state changes are needed to revoke an idle socket.
+			for _, conn := range tabs {
+				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, err := conn.Read(make([]byte, 1)); err == nil || os.IsTimeout(err) {
+					t.Fatalf("revoked WebSocket stayed open: %v", err)
+				}
+			}
+			if r := get(t, base+"/api/state", cookie.String()); r.StatusCode != http.StatusUnauthorized {
+				r.Body.Close()
+				t.Fatalf("revoked session still authorized: %d", r.StatusCode)
+			} else {
+				r.Body.Close()
+			}
+			changes.notify()
+			_ = wsReadState(t, otherReader)
+		})
 	}
 }
