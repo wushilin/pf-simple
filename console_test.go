@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -143,25 +144,27 @@ func TestConsolePrefixAndRootRedirect(t *testing.T) {
 	base, _ := startConsole(t, "", "127.0.0.1:1")
 	root := strings.TrimSuffix(base, consolePrefix)
 	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	check := func(path string, wantCode int, wantLocation string) {
+	check := func(path string, wantLocation string, wantCodes ...int) {
 		t.Helper()
 		r, err := noFollow.Get(root + path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		r.Body.Close()
-		if r.StatusCode != wantCode || r.Header.Get("Location") != wantLocation {
-			t.Errorf("GET %s: %d location=%q, want %d %q", path, r.StatusCode, r.Header.Get("Location"), wantCode, wantLocation)
+		if !slices.Contains(wantCodes, r.StatusCode) || r.Header.Get("Location") != wantLocation {
+			t.Errorf("GET %s: %d location=%q, want %v %q", path, r.StatusCode, r.Header.Get("Location"), wantCodes, wantLocation)
 		}
 	}
-	check("/", http.StatusFound, consolePrefix+"/")
-	check(consolePrefix, http.StatusTemporaryRedirect, consolePrefix+"/") // the mux adds the slash
-	check(consolePrefix+"/", http.StatusOK, "")
-	check(consolePrefix+"/app.js", http.StatusOK, "")
-	check(consolePrefix+"/api/state", http.StatusOK, "")
-	check("/api/state", http.StatusNotFound, "")
-	check("/app.js", http.StatusNotFound, "")
-	check("/other", http.StatusNotFound, "")
+	check("/", consolePrefix+"/", http.StatusFound)
+	// The mux adds the slash itself; the status it uses changed across Go
+	// releases (301 on 1.22, 307 on newer).
+	check(consolePrefix, consolePrefix+"/", http.StatusMovedPermanently, http.StatusTemporaryRedirect)
+	check(consolePrefix+"/", "", http.StatusOK)
+	check(consolePrefix+"/app.js", "", http.StatusOK)
+	check(consolePrefix+"/api/state", "", http.StatusOK)
+	check("/api/state", "", http.StatusNotFound)
+	check("/app.js", "", http.StatusNotFound)
+	check("/other", "", http.StatusNotFound)
 }
 
 func TestConsoleNoPassword(t *testing.T) {
