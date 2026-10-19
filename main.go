@@ -47,7 +47,10 @@ func main() {
 		policy = cfg.console.manage
 	}
 	mgr := newManager(cfg.forwards, policy, halfCloseIdleTimeout)
-	mgr.configPath, mgr.consoleRaw = cfg.configPath, cfg.consoleRaw
+	mgr.configPath, mgr.consoleRaw, mgr.redirectRaw = cfg.configPath, cfg.consoleRaw, cfg.redirectRaw
+	if cfg.httpRedirect {
+		mgr.addRedirect()
+	}
 	var console *consoleServer
 	if cfg.console != nil {
 		console = newConsoleServer(cfg.console.addr, cfg.console.password, mgr)

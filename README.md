@@ -106,6 +106,26 @@ On a Linux test host a listener with
 `per_connection_max_speed = "40MiB/s"` held one iperf3 stream at 40.0 MiB/s,
 and `total_speed = "100MiB/s"` held four streams at 100.0 MiB/s combined.
 
+### HTTP to HTTPS redirect
+
+A top-level `enable_http_to_https_redirect` key adds a listener on port 80 (every
+interface) that answers each HTTP request with a redirect to the same host,
+path and query on `https://`: 301 for GET/HEAD, 308 for other methods so the
+body is kept. It defaults to `true`; set it to `false` to turn it off:
+
+```toml
+enable_http_to_https_redirect = false
+```
+
+- **Best effort.** It is bound after the forwards, so a `[[forward]]` on port
+  80 keeps the port. If port 80 cannot be bound (in use, or no
+  `CAP_NET_BIND_SERVICE` for an unprivileged service), the listener shows
+  "failed to start" in the console and pf-simple keeps running.
+- **No settings.** In the console it appears as "HTTP to HTTPS redirect". It
+  starts automatically and can be stopped and started, but not edited or
+  deleted; start/stop lasts until a restart.
+- It exists only in config files, not on the command line.
+
 A config file may also hold only a `[console]` table and no forwards, since
 the console can add them; with neither, pf-simple refuses to start.
 

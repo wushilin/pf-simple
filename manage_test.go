@@ -83,7 +83,7 @@ func startFromConfig(t *testing.T, path string) (string, *manager) {
 		t.Fatal(err)
 	}
 	mgr := newManager(cfg.forwards, cfg.console.manage, halfCloseIdleTimeout)
-	mgr.configPath, mgr.consoleRaw = cfg.configPath, cfg.consoleRaw
+	mgr.configPath, mgr.consoleRaw, mgr.redirectRaw = cfg.configPath, cfg.consoleRaw, cfg.redirectRaw
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); mgr.shutdown() })
 	if err := mgr.startAll(ctx); err != nil {
@@ -280,7 +280,7 @@ func startFromConfigOnFreeConsole(t *testing.T, path string, _ int, _ string) (s
 		t.Fatal(err)
 	}
 	mgr := newManager(cfg.forwards, cfg.console.manage, halfCloseIdleTimeout)
-	mgr.configPath, mgr.consoleRaw = cfg.configPath, cfg.consoleRaw
+	mgr.configPath, mgr.consoleRaw, mgr.redirectRaw = cfg.configPath, cfg.consoleRaw, cfg.redirectRaw
 	return "", mgr
 }
 
