@@ -84,10 +84,10 @@ docker run -d -p 8080:8080 -p 18222:18222 \
   wushilin/pf-simple 8080@10.0.0.6 --console :18222@secret
 ```
 
-The image runs as root so the [HTTP to HTTPS redirect](#http-to-https-redirect)
-can bind port 80 on the host network. Add `--user 65532:65532` to run
-unprivileged; the redirect then shows "failed to start" on the host network,
-and a mounted `/data` must be writable by that user.
+The image runs as root so listeners can bind ports below 1024 on the host
+network. Add `--user 65532:65532` to run unprivileged; low ports then fail
+to bind on the host network, and a mounted `/data` must be writable by that
+user.
 
 ## Configuration file
 
@@ -148,33 +148,6 @@ each chunk. Limited listeners use smaller chunks to keep the rate smooth.
 On a Linux test host a listener with
 `per_connection_max_speed = "40MiB/s"` held one iperf3 stream at 40.0 MiB/s,
 and `total_speed = "100MiB/s"` held four streams at 100.0 MiB/s combined.
-
-### HTTP to HTTPS redirect
-
-A top-level `enable_http_to_https_redirect` key adds a listener on port 80 (every
-interface) that answers each HTTP request with a redirect to the same host,
-path and query on `https://`: 301 for GET/HEAD, 308 for other methods so the
-body is kept. It defaults to `true`; set it to `false` to turn it off:
-
-```toml
-enable_http_to_https_redirect = false
-```
-
-- **Best effort.** It is bound after the forwards, so a `[[forward]]` on port
-  80 keeps the port. If port 80 cannot be bound (in use, or no
-  `CAP_NET_BIND_SERVICE` for an unprivileged service), the listener shows
-  "failed to start" in the console and pf-simple keeps running.
-- **No settings.** In the console it appears as "HTTP to HTTPS redirect". It
-  starts automatically and can be stopped and started, but not edited or
-  deleted; start/stop lasts until a restart.
-- **One redirect per connection.** Keep-alive is off, so each connection gets
-  one redirect and is closed. The console's "accepted" count is the number of
-  redirects, and "active" shows connections still open. Redirects are not
-  listed as pipes and carry no byte counts.
-- **Logging.** Each redirect is logged, for example
-  `redirect 203.0.113.9:51234 GET http://example.com/asdf -> https://example.com/asdf (301)`.
-  A busy or scanned port 80 makes the log grow accordingly.
-- It exists only in config files, not on the command line.
 
 A config file may also hold only a `[console]` table and no forwards, since
 the console can add them; with neither, pf-simple refuses to start.

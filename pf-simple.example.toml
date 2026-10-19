@@ -5,12 +5,6 @@
 # --config cannot be combined with any other flag. Unknown keys are errors,
 # so a typo stops the forwarder at startup instead of being ignored.
 
-# Listen on port 80 and redirect every HTTP request to the same host and path
-# on https. Defaults to true. It shows in the console as a listener that can be stopped and started
-# but has no settings. If port 80 cannot be bound, that listener shows
-# "failed to start" and everything else runs.
-enable_http_to_https_redirect = true
-
 # Optional web console. Leave the whole [console] table out to disable it.
 [console]
 listen = "127.0.0.1:18222"

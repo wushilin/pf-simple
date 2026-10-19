@@ -20,10 +20,6 @@ type settings struct {
 	// consoleRaw is [console] exactly as written.
 	configPath string
 	consoleRaw *consoleTable
-	// httpRedirect adds the HTTP-to-HTTPS redirect listener on port 80. redirectRaw is
-	// enable_http_to_https_redirect exactly as written (nil when omitted).
-	httpRedirect bool
-	redirectRaw  *bool
 }
 
 type consoleSettings struct {
@@ -62,10 +58,8 @@ type listenerSpec struct {
 
 // fileConfig mirrors the TOML file. See pf-simple.example.toml.
 type fileConfig struct {
-	// EnableHTTPToHTTPSRedirect defaults to true when omitted.
-	EnableHTTPToHTTPSRedirect *bool          `toml:"enable_http_to_https_redirect,omitempty"`
-	Console                   *consoleTable  `toml:"console,omitempty"`
-	Forward                   []listenerSpec `toml:"forward"`
+	Console *consoleTable  `toml:"console,omitempty"`
+	Forward []listenerSpec `toml:"forward"`
 }
 
 const maxNameLen = 64
@@ -161,8 +155,6 @@ func loadConfig(path, envPassword string) (settings, error) {
 	}
 	s.configPath = path
 	s.consoleRaw = fc.Console
-	s.redirectRaw = fc.EnableHTTPToHTTPSRedirect
-	s.httpRedirect = fc.EnableHTTPToHTTPSRedirect == nil || *fc.EnableHTTPToHTTPSRedirect
 
 	if c := fc.Console; c != nil {
 		if c.Listen == "" {

@@ -8,7 +8,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /pf-simple .
 
-# Runs as root so the redirect listener can bind port 80 with --network host;
+# Runs as root so listeners can bind ports below 1024 with --network host;
 # pass --user to run unprivileged.
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /pf-simple /usr/local/bin/pf-simple
