@@ -180,6 +180,9 @@ func (p *managePolicy) check(fw forwarding) error {
 const (
 	sourceConfig = "config" // in the config file; editable from the console
 	sourceCLI    = "cli"    // from the command line; start and stop only
+	// sourceRedirect is the enable_http_to_https_redirect listener on port
+	// 80: best effort, start and stop only, never saved.
+	sourceRedirect = "redirect"
 )
 
 type managedListener struct {
@@ -200,9 +203,10 @@ type managedListener struct {
 type manager struct {
 	idle   time.Duration
 	policy *managePolicy
-	// configPath and consoleRaw are used to rewrite the config file.
-	configPath string
-	consoleRaw *consoleTable
+	// configPath, consoleRaw and redirectRaw are used to rewrite the config file.
+	configPath  string
+	consoleRaw  *consoleTable
+	redirectRaw *bool
 
 	mu     sync.Mutex
 	ctx    context.Context
@@ -215,6 +219,7 @@ var (
 	errReadOnly   = errors.New("this listener comes from the command line; it can be stopped and started, but not edited or deleted")
 	errNoManaging = errors.New("listeners can only be added, edited or deleted when pf-simple runs from a config file (-c)")
 	errRunning    = errors.New("stop the listener first")
+	errRedirect   = errors.New("the HTTP to HTTPS redirect has no settings; it can be stopped and started, or turned off with enable_http_to_https_redirect = false")
 )
 
 func newManager(forwards []forwarding, policy *managePolicy, idle time.Duration) *manager {
@@ -267,7 +272,7 @@ func (m *manager) startAll(ctx context.Context) error {
 			continue
 		}
 		if err := m.startLocked(ml); err != nil {
-			if m.policy == nil {
+			if m.policy == nil && ml.source != sourceRedirect {
 				m.closeAllLocked()
 				return fmt.Errorf("listen on %s: %w", ml.stats.listen, err)
 			}
@@ -292,6 +297,15 @@ func (m *manager) startLocked(ml *managedListener) error {
 	done := make(chan struct{})
 	ml.ln, ml.stopAccept, ml.acceptDone = ln, cancel, done
 	ml.running, ml.lastErr = true, ""
+	if ml.source == sourceRedirect {
+		go func() {
+			defer close(done)
+			serveHTTPRedirect(actx, ln, ml.stats)
+		}()
+		log.Printf("redirecting http://%s to https", ln.Addr())
+		changes.notify()
+		return nil
+	}
 	go func() {
 		defer close(done)
 		acceptConnections(actx, ln, ml.stats, m.idle)
@@ -366,6 +380,9 @@ func (m *manager) editableLocked(id int) (*managedListener, error) {
 	ml := m.findLocked(id)
 	if ml == nil {
 		return nil, errNotFound
+	}
+	if ml.source == sourceRedirect {
+		return nil, errRedirect
 	}
 	if ml.source != sourceConfig {
 		return nil, errReadOnly
@@ -524,11 +541,11 @@ func (m *manager) edit(id int, spec listenerSpec) error {
 	return nil
 }
 
-// saveLocked rewrites the config file atomically: [console] exactly as
-// loaded, then every config listener in order. It writes a temporary file in
+// saveLocked rewrites the config file atomically: the redirect switch and
+// [console] exactly as loaded, then every config listener in order. It writes a temporary file in
 // the same directory, fsyncs it, and renames it over the old one.
 func (m *manager) saveLocked() error {
-	fc := fileConfig{Console: m.consoleRaw}
+	fc := fileConfig{EnableHTTPToHTTPSRedirect: m.redirectRaw, Console: m.consoleRaw}
 	for _, ml := range m.list {
 		if ml.source != sourceConfig {
 			continue
@@ -634,6 +651,10 @@ func (m *manager) snapshot() []listenerSnapshot {
 	out := pipes.snapshot(stats)
 	for i := range out {
 		out[i].Source, out[i].Error, out[i].Running = extras[i].source, extras[i].err, extras[i].running
+		// Redirect connections are not pipes; show their live count instead.
+		if extras[i].source == sourceRedirect {
+			out[i].PipeCount = int(stats[i].active.Load())
+		}
 	}
 	return out
 }

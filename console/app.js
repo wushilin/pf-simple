@@ -653,13 +653,15 @@ function renderRows(lr) {
   lr.empty.hidden = want.length > 0;
   if (want.length === 0) {
     const none = l.pipeCount === 0;
-    lr.sleepy.hidden = !none;
     const label = l.name ? `${l.name} [${l.listen}]` : l.listen;
-    const idle = l.running ? `No active pipes. Connections to ${label} show up here.` : `${label} is stopped. Start it to accept connections.`;
-    setText(lr.emptyText, none ? idle : `No pipes match “${ui.filter}”.`);
+    const redirect = l.source === "redirect";
+    let idle = l.running ? `No active pipes. Connections to ${label} show up here.` : `${label} is stopped. Start it to accept connections.`;
+    if (redirect && l.running) idle = "Each HTTP request gets a redirect to https and is logged by pf-simple; redirects are not listed as pipes.";
+    lr.sleepy.hidden = !none && !redirect;
+    setText(lr.emptyText, none || redirect ? idle : `No pipes match “${ui.filter}”.`);
   }
   const hidden = visible.length - want.length;
-  const capped = l.pipeCount - l.pipes.length;
+  const capped = l.source === "redirect" ? 0 : l.pipeCount - l.pipes.length;
   const notes = [];
   if (open && hidden > 0) notes.push(`Showing the newest ${want.length} of ${visible.length} pipes. Filter to find the rest.`);
   if (open && capped > 0) notes.push(`${capped} older pipes are not sent to the console.`);
