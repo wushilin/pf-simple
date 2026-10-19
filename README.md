@@ -124,6 +124,13 @@ enable_http_to_https_redirect = false
 - **No settings.** In the console it appears as "HTTP to HTTPS redirect". It
   starts automatically and can be stopped and started, but not edited or
   deleted; start/stop lasts until a restart.
+- **One redirect per connection.** Keep-alive is off, so each connection gets
+  one redirect and is closed. The console's "accepted" count is the number of
+  redirects, and "active" shows connections still open. Redirects are not
+  listed as pipes and carry no byte counts.
+- **Logging.** Each redirect is logged, for example
+  `redirect 203.0.113.9:51234 GET http://example.com/asdf -> https://example.com/asdf (301)`.
+  A busy or scanned port 80 makes the log grow accordingly.
 - It exists only in config files, not on the command line.
 
 A config file may also hold only a `[console]` table and no forwards, since

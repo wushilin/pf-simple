@@ -651,6 +651,10 @@ func (m *manager) snapshot() []listenerSnapshot {
 	out := pipes.snapshot(stats)
 	for i := range out {
 		out[i].Source, out[i].Error, out[i].Running = extras[i].source, extras[i].err, extras[i].running
+		// Redirect connections are not pipes; show their live count instead.
+		if extras[i].source == sourceRedirect {
+			out[i].PipeCount = int(stats[i].active.Load())
+		}
 	}
 	return out
 }

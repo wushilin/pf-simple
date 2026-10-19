@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRedirectToHTTPS(t *testing.T) {
@@ -98,9 +99,20 @@ func TestRedirectListener(t *testing.T) {
 	if resp.StatusCode != 301 || resp.Header.Get("Location") != want {
 		t.Fatalf("got %d %q, want 301 %q", resp.StatusCode, resp.Header.Get("Location"), want)
 	}
-	if snap := snapshotFor(mgr, ml.stats.id); !snap.Running || snap.Source != sourceRedirect {
+	if !resp.Close {
+		t.Error("redirect connections must close after one response")
+	}
+	if snap := snapshotFor(mgr, ml.stats.id); !snap.Running || snap.Source != sourceRedirect || snap.Accepted != 1 {
 		t.Fatalf("snapshot: %+v", snap)
 	}
+	// An open connection counts as active until it closes.
+	conn, err := net.Dial("tcp", ml.stats.listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return snapshotFor(mgr, ml.stats.id).PipeCount == 1 })
+	conn.Close()
+	waitFor(t, func() bool { return snapshotFor(mgr, ml.stats.id).PipeCount == 0 })
 	if err := mgr.stop(ml.stats.id); err != nil {
 		t.Fatal(err)
 	}
@@ -133,5 +145,16 @@ func TestRedirectListenerNotEditable(t *testing.T) {
 	}
 	if err := mgr.edit(0, listenerSpec{Listen: "2000", Target: "x"}); err != errRedirect {
 		t.Errorf("edit: %v", err)
+	}
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

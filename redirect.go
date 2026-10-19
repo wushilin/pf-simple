@@ -25,19 +25,27 @@ func (m *manager) addRedirect() {
 }
 
 // serveHTTPRedirect answers every request on ln with a redirect to the same
-// host and path over https until ctx ends. l counts accepted connections.
+// host and path over https until ctx ends. Each connection carries one
+// redirect and is closed after it, so l's accepted counter counts redirects
+// and l.active is what the console shows as active.
 func serveHTTPRedirect(ctx context.Context, ln net.Listener, l *listenerStats) {
 	srv := &http.Server{
 		Handler:           http.HandlerFunc(redirectToHTTPS),
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       30 * time.Second,
 		ConnState: func(_ net.Conn, state http.ConnState) {
-			if state == http.StateNew {
+			switch state {
+			case http.StateNew:
 				l.accepted.Add(1)
-				changes.notify()
+				l.active.Add(1)
+			case http.StateClosed, http.StateHijacked:
+				l.active.Add(-1)
+			default:
+				return
 			}
+			changes.notify()
 		},
 	}
+	srv.SetKeepAlivesEnabled(false)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -50,8 +58,8 @@ func serveHTTPRedirect(ctx context.Context, ln net.Listener, l *listenerStats) {
 }
 
 // redirectToHTTPS sends the client to https on the default port, keeping the
-// host, path and query. GET and HEAD get 301; other methods get 308 so the
-// method and body are kept.
+// host, path and query, and logs one line per request. GET and HEAD get 301;
+// other methods get 308 so the method and body are kept.
 func redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -59,6 +67,7 @@ func redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
 	}
 	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	if host == "" {
+		log.Printf("redirect %s %s %s: missing Host header (400)", r.RemoteAddr, r.Method, r.URL.RequestURI())
 		http.Error(w, "missing Host header", http.StatusBadRequest)
 		return
 	}
@@ -69,5 +78,7 @@ func redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		code = http.StatusMovedPermanently
 	}
-	http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), code)
+	target := "https://" + host + r.URL.RequestURI()
+	log.Printf("redirect %s %s http://%s%s -> %s (%d)", r.RemoteAddr, r.Method, r.Host, r.URL.RequestURI(), target, code)
+	http.Redirect(w, r, target, code)
 }
