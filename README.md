@@ -46,6 +46,49 @@ idle for 30 seconds after that half-close, both sockets are closed. Intentional
 waits for bandwidth limits do not count as idle time. SIGINT and SIGTERM stop
 the listeners.
 
+## Docker
+
+Images for `linux/amd64` and `linux/arm64` are published for every release
+as `wushilin/pf-simple` on Docker Hub and `ghcr.io/wushilin/pf-simple`.
+Tags are the version (`0.7.0`), the minor line (`0.7`) and `latest`.
+
+Host networking is the simplest fit for a forwarder: listeners bind straight
+on the host, including ones added later in the console, with no `-p` per
+port. The arguments are the same as for the binary:
+
+```sh
+docker run -d --name pf-simple --restart unless-stopped --network host \
+  wushilin/pf-simple 8080@10.0.0.6 9030@db:9030 --console 18222@secret
+```
+
+The console is then on `http://127.0.0.1:18222/pf/` of the host.
+
+With a config file, mount a writable directory at `/data`; the console
+writes listener changes back to the file:
+
+```sh
+mkdir -p pf-data
+cp pf-simple.example.toml pf-data/pf-simple.toml   # edit it first
+chmod 600 pf-data/pf-simple.toml
+docker run -d --name pf-simple --restart unless-stopped --network host \
+  -v "$PWD/pf-data:/data" \
+  wushilin/pf-simple -c /data/pf-simple.toml
+```
+
+Without `--network host`, publish each listen port and make the console
+listen on every interface inside the container (`:18222`, not
+`127.0.0.1:18222`):
+
+```sh
+docker run -d -p 8080:8080 -p 18222:18222 \
+  wushilin/pf-simple 8080@10.0.0.6 --console :18222@secret
+```
+
+The image runs as root so the [HTTP to HTTPS redirect](#http-to-https-redirect)
+can bind port 80 on the host network. Add `--user 65532:65532` to run
+unprivileged; the redirect then shows "failed to start" on the host network,
+and a mounted `/data` must be writable by that user.
+
 ## Configuration file
 
 For anything beyond simple mappings, put the setup in a TOML file:
