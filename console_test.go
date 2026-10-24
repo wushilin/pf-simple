@@ -60,9 +60,10 @@ func startConsoleServer(t *testing.T, password, target string) (consoleURL, forw
 	}
 	t.Cleanup(func() { fln.Close() })
 	stats := newListenerStats(0, fln.Addr().String(), target)
-	go acceptConnections(ctx, fln, stats, halfCloseIdleTimeout)
-
+	// The manager numbers the listener; start accepting only after that, as
+	// main does, since connections read the id.
 	cs = newConsoleServer("", password, newManager([]forwarding{{stats: stats}}, nil, halfCloseIdleTimeout))
+	go acceptConnections(ctx, fln, stats, halfCloseIdleTimeout)
 	cs.pushEvery = 20 * time.Millisecond // keep tests fast
 	cln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
