@@ -26,6 +26,7 @@ add, edit and delete listeners):
   pf-simple -c /etc/pf-simple.toml
 
 --config/-c cannot be combined with any other flag or argument.
+pf-simple --version prints the version.
 
 Flags:
 `

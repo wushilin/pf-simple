@@ -1,0 +1,1247 @@
+{
+ "openapi": "3.0.3",
+ "info": {
+  "title": "pf-simple API",
+  "version": "1",
+  "description": "Manage pf-simple's listeners and watch its connections.\n\n**Authentication.** Send the console password in the `X-API-Token` header (use *Authorize* above), or use a signed-in console session (this page sends it for you). A console without a password needs neither.\n\n**Writes** (POST, PUT, DELETE) also need `X-PF-Console: 1` or `X-API-Token`.\n\nExample: `curl -H 'X-API-Token: secret' http://127.0.0.1:18222/pf/api/listeners`"
+ },
+ "servers": [
+  {
+   "url": "api",
+   "description": "This console"
+  }
+ ],
+ "security": [
+  {
+   "ApiToken": []
+  },
+  {}
+ ],
+ "tags": [
+  {
+   "name": "Listeners"
+  },
+  {
+   "name": "Connections"
+  },
+  {
+   "name": "Flow log"
+  },
+  {
+   "name": "System"
+  }
+ ],
+ "paths": {
+  "/health": {
+   "get": {
+    "tags": [
+     "System"
+    ],
+    "summary": "Liveness check",
+    "description": "Needs no authentication.",
+    "security": [],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "status": {
+           "type": "string",
+           "example": "ok"
+          },
+          "version": {
+           "type": "string",
+           "example": "0.8.0",
+           "description": "pf-simple build version"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/stats": {
+   "get": {
+    "tags": [
+     "System"
+    ],
+    "summary": "Totals across all listeners",
+    "description": "Uptime, listener counts, active connections and byte totals.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Stats"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/policy": {
+   "get": {
+    "tags": [
+     "System"
+    ],
+    "summary": "Listener management policy",
+    "description": "Whether listeners can be added, edited and deleted, and the fences from `[console]`. An empty fence means no restriction.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Policy"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/listeners": {
+   "get": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "List listeners",
+    "description": "Every listener with its counters. Open connections are under `/listeners/{id}/connections`.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Listener"
+         }
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   },
+   "post": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "Add a listener",
+    "description": "Validates the spec, binds it, starts it and saves it to the config file. Only when pf-simple runs from a config file with a `[console]` table.",
+    "responses": {
+     "201": {
+      "description": "Added and started",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "id": {
+           "type": "integer"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Invalid spec, or cannot bind",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, outside the policy, or not editable",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ListenerSpec"
+       },
+       "example": {
+        "name": "web",
+        "listen": "0.0.0.0:18080",
+        "target": "10.0.0.6:8080",
+        "maxConnections": 0,
+        "totalSpeed": "",
+        "perConnSpeed": ""
+       }
+      }
+     }
+    }
+   }
+  },
+  "/listeners/validate": {
+   "post": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "Validate a listener spec",
+    "description": "Runs the same checks as add, or as edit with `?id=`, without changing anything. Returns the spec as it would be saved. It does not try to bind the port.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Validation"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Invalid spec",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such listener",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, outside the policy, or not editable",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ListenerSpec"
+       },
+       "example": {
+        "name": "web",
+        "listen": "0.0.0.0:18080",
+        "target": "10.0.0.6:8080",
+        "maxConnections": 0,
+        "totalSpeed": "",
+        "perConnSpeed": ""
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "description": "Validate as an edit of this listener"
+     }
+    ]
+   }
+  },
+  "/listeners/{id}": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 0
+     },
+     "description": "Listener id"
+    }
+   ],
+   "get": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "Get a listener",
+    "description": "One listener with its counters.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Listener"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such listener",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "Edit a listener",
+    "description": "Replaces a **stopped** listener's settings; its counters carry over and it stays stopped until started. Stop it first, as in the console.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "400": {
+      "description": "Invalid spec",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such listener",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "The listener is running; stop it first",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, outside the policy, or not editable",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ListenerSpec"
+       },
+       "example": {
+        "name": "web",
+        "listen": "0.0.0.0:18080",
+        "target": "10.0.0.6:8080",
+        "maxConnections": 0,
+        "totalSpeed": "",
+        "perConnSpeed": ""
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "Delete a listener",
+    "description": "Removes a **stopped** listener from the config file.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "404": {
+      "description": "No such listener",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "The listener is running; stop it first",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, outside the policy, or not editable",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/listeners/{id}/start": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 0
+     },
+     "description": "Listener id"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "Start a listener",
+    "description": "Binds and starts accepting. With listener management on, saved to the config file.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "400": {
+      "description": "Cannot bind",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such listener",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, outside the policy, or not editable",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/listeners/{id}/stop": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 0
+     },
+     "description": "Listener id"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Listeners"
+    ],
+    "summary": "Stop a listener",
+    "description": "Stops accepting and resets every open connection of this listener. With listener management on, saved to the config file.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "404": {
+      "description": "No such listener",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, outside the policy, or not editable",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/listeners/{id}/connections": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 0
+     },
+     "description": "Listener id"
+    }
+   ],
+   "get": {
+    "tags": [
+     "Connections"
+    ],
+    "summary": "List a listener's open connections",
+    "description": "Oldest first.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Connection"
+         }
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such listener",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/connections": {
+   "get": {
+    "tags": [
+     "Connections"
+    ],
+    "summary": "List open connections",
+    "description": "Every open connection, oldest first.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Connection"
+         }
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "listener",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Only this listener's"
+     }
+    ]
+   }
+  },
+  "/connections/{id}": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 0
+     },
+     "description": "Connection id"
+    }
+   ],
+   "get": {
+    "tags": [
+     "Connections"
+    ],
+    "summary": "Get an open connection",
+    "description": "Live byte counters of one connection.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Connection"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such connection",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "Connections"
+    ],
+    "summary": "Reset a connection",
+    "description": "Resets both legs with a TCP RST.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "404": {
+      "description": "No such connection",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, outside the policy, or not editable",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/flows": {
+   "get": {
+    "tags": [
+     "Flow log"
+    ],
+    "summary": "Flow log snapshot",
+    "description": "Open connections, and the last 2000 closed ones (including refused and failed), as JSON.\n\nThe same URL upgraded to a WebSocket streams the flow log: a first `snapshot` message (`full: true`), then `events` messages (`{type:\"events\", events:[{type:\"open\"|\"close\", flow}]}`) and a fresh `snapshot` every 5 s. Keep the view with the highest `seq` per `id`.",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/FlowSnapshot"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "since",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer",
+       "format": "int64"
+      },
+      "description": "Only closed connections that ended at or after this time (unix ms)"
+     }
+    ]
+   }
+  }
+ },
+ "components": {
+  "securitySchemes": {
+   "ApiToken": {
+    "type": "apiKey",
+    "in": "header",
+    "name": "X-API-Token",
+    "description": "The console password"
+   }
+  },
+  "schemas": {
+   "Error": {
+    "type": "object",
+    "properties": {
+     "error": {
+      "type": "string"
+     }
+    }
+   },
+   "ListenerSpec": {
+    "type": "object",
+    "required": [
+     "listen",
+     "target"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "Optional label, at most 64 characters"
+     },
+     "listen": {
+      "type": "string",
+      "description": "Port, or host:port. A bare port binds every interface"
+     },
+     "target": {
+      "type": "string",
+      "description": "host:port, or host to reuse the listen port"
+     },
+     "maxConnections": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Most simultaneous connections; 0 = unlimited"
+     },
+     "totalSpeed": {
+      "type": "string",
+      "description": "Shared per-direction cap, e.g. 1GiB/s; empty = unlimited"
+     },
+     "perConnSpeed": {
+      "type": "string",
+      "description": "Per-connection per-direction cap, e.g. 15MiB/s; empty = unlimited"
+     }
+    }
+   },
+   "Listener": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer"
+     },
+     "source": {
+      "type": "string",
+      "description": "config (editable) or cli (start/stop only)"
+     },
+     "running": {
+      "type": "boolean"
+     },
+     "error": {
+      "type": "string",
+      "description": "Why the last start failed"
+     },
+     "spec": {
+      "$ref": "#/components/schemas/ListenerSpec"
+     },
+     "name": {
+      "type": "string"
+     },
+     "listen": {
+      "type": "string"
+     },
+     "target": {
+      "type": "string"
+     },
+     "accepted": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Connections accepted"
+     },
+     "failed": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Target dials that failed"
+     },
+     "rejected": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Refused at max_connections"
+     },
+     "maxConns": {
+      "type": "integer",
+      "format": "int64",
+      "description": "0 = unlimited"
+     },
+     "pipeCount": {
+      "type": "integer",
+      "description": "Open connections"
+     },
+     "bytesUp": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Bytes delivered to the target, closed and open connections"
+     },
+     "bytesDown": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Bytes delivered to clients"
+     },
+     "totalSpeed": {
+      "type": "number",
+      "description": "bytes/s per direction; 0 = unlimited"
+     },
+     "perConnSpeed": {
+      "type": "number",
+      "description": "bytes/s per direction; 0 = unlimited"
+     }
+    }
+   },
+   "Connection": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "listenerId": {
+      "type": "integer"
+     },
+     "started": {
+      "type": "integer",
+      "format": "int64",
+      "description": "unix ms"
+     },
+     "clientRemote": {
+      "type": "string"
+     },
+     "clientLocal": {
+      "type": "string"
+     },
+     "upstreamLocal": {
+      "type": "string"
+     },
+     "upstreamRemote": {
+      "type": "string"
+     },
+     "clientToPf": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "pfToUpstream": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "upstreamToPf": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "pfToClient": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "upDone": {
+      "type": "boolean",
+      "description": "The client half-closed"
+     },
+     "downDone": {
+      "type": "boolean",
+      "description": "The target half-closed"
+     },
+     "interrupted": {
+      "type": "boolean",
+      "description": "Being reset"
+     }
+    }
+   },
+   "Flow": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "seq": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Orders views of one connection"
+     },
+     "listenerId": {
+      "type": "integer"
+     },
+     "listener": {
+      "type": "string"
+     },
+     "target": {
+      "type": "string"
+     },
+     "client": {
+      "type": "string"
+     },
+     "local": {
+      "type": "string"
+     },
+     "upstreamLocal": {
+      "type": "string"
+     },
+     "upstreamRemote": {
+      "type": "string"
+     },
+     "started": {
+      "type": "integer",
+      "format": "int64",
+      "description": "unix ms"
+     },
+     "ended": {
+      "type": "integer",
+      "format": "int64",
+      "description": "unix ms; absent while open"
+     },
+     "bytesUp": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "bytesDown": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "result": {
+      "type": "string",
+      "enum": [
+       "closed",
+       "reset",
+       "idle",
+       "failed",
+       "refused"
+      ],
+      "description": "Absent while open"
+     },
+     "reason": {
+      "type": "string"
+     }
+    }
+   },
+   "FlowSnapshot": {
+    "type": "object",
+    "properties": {
+     "type": {
+      "type": "string"
+     },
+     "now": {
+      "type": "integer",
+      "format": "int64",
+      "description": "unix ms"
+     },
+     "full": {
+      "type": "boolean"
+     },
+     "active": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/Flow"
+      }
+     },
+     "truncated": {
+      "type": "boolean",
+      "description": "More than 5000 were open; the newest are listed"
+     },
+     "closed": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/Flow"
+      }
+     }
+    }
+   },
+   "Stats": {
+    "type": "object",
+    "properties": {
+     "version": {
+      "type": "string",
+      "description": "pf-simple build version"
+     },
+     "host": {
+      "type": "string"
+     },
+     "now": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "started": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "uptimeSeconds": {
+      "type": "number"
+     },
+     "listeners": {
+      "type": "integer"
+     },
+     "running": {
+      "type": "integer"
+     },
+     "activeConnections": {
+      "type": "integer"
+     },
+     "accepted": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "failed": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "rejected": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "bytesUp": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "bytesDown": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "management": {
+      "type": "boolean"
+     },
+     "flowHistoryLimit": {
+      "type": "integer"
+     }
+    }
+   },
+   "Policy": {
+    "type": "object",
+    "properties": {
+     "enabled": {
+      "type": "boolean",
+      "description": "Listeners can be added, edited and deleted"
+     },
+     "allowTargetHosts": {
+      "type": "string"
+     },
+     "allowTargetPorts": {
+      "type": "string"
+     },
+     "allowBindHosts": {
+      "type": "string"
+     },
+     "allowBindPorts": {
+      "type": "string"
+     }
+    }
+   },
+   "Validation": {
+    "type": "object",
+    "properties": {
+     "valid": {
+      "type": "boolean"
+     },
+     "spec": {
+      "$ref": "#/components/schemas/ListenerSpec"
+     }
+    }
+   }
+  }
+ }
+}

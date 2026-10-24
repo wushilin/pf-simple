@@ -1,0 +1,5 @@
+/* Fits Swagger UI into the console's API tab. */
+body { margin: 0; background: #fff; }
+.swagger-ui .information-container { padding-top: 8px; }
+.swagger-ui .info { margin: 16px 0; }
+.swagger-ui .wrapper { padding: 0 16px; }

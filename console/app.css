@@ -116,6 +116,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .mark { width: 28px; height: 28px; flex: none; }
 .brand .name { font-weight: 650; font-size: var(--t-lead); letter-spacing: -.01em; }
+.version { font-size: 11.5px; color: var(--fg-3); padding: 1px 6px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); white-space: nowrap; }
 .host {
   font-size: var(--t-small); color: var(--fg-2);
   padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px;
@@ -385,6 +386,54 @@ dialog#editor::backdrop { background: rgba(10, 14, 20, .45); }
 }
 .toast.bad { background: var(--danger); color: var(--on-solid); }
 
+/* ---------- tabs ---------- */
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin: 14px 0 16px; overflow-x: auto; }
+.tab {
+  height: 36px; padding: 0 14px; border: 0; background: none; cursor: pointer; white-space: nowrap;
+  color: var(--fg-2); font-size: var(--t-body); font-weight: 600;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tab:hover { color: var(--fg); }
+.tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--tx); }
+
+/* ---------- flow log ---------- */
+.select {
+  height: 34px; padding: 0 10px; border-radius: 8px; font: inherit; font-size: var(--t-small);
+  border: 1px solid var(--line-strong); background: var(--surface); color: var(--fg);
+}
+.btn[aria-pressed="true"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: var(--warn-soft); }
+.flowlog {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); overflow: hidden; margin-bottom: 40px;
+}
+.f-cols {
+  display: grid; align-items: center; gap: 12px;
+  grid-template-columns: 64px minmax(0, 1.1fr) minmax(0, 1.2fr) minmax(0, 1.2fr) 92px 72px 96px 112px 92px;
+}
+.f-head {
+  padding: 8px 16px; background: var(--surface-2); border-bottom: 1px solid var(--line);
+  font-size: var(--t-label); letter-spacing: .06em; text-transform: uppercase; color: var(--fg-3); font-weight: 600;
+}
+.f-cols .r { text-align: right; }
+.f-row { min-height: var(--row-h); padding: 6px 16px; border-bottom: 1px solid var(--line); }
+.f-row:hover { background: var(--surface-2); }
+.f-row.ended .f-listener, .f-row.ended .f-addr, .f-row.ended .p-total { opacity: .72; }
+.f-listener { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.f-addr { font-family: var(--font-mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.f-addr.dim { color: var(--fg-3); }
+.f-time { font-size: var(--t-small); color: var(--fg-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.state.done { color: var(--fg-2); background: var(--surface-2); }
+#flow-rows > .f-row:last-child { border-bottom: 0; }
+.flowlog .more { padding-left: 16px; border-top: 1px solid var(--line); }
+
+/* ---------- API ---------- */
+.api-note { margin: 0 0 10px; color: var(--fg-2); font-size: var(--t-small); }
+.api-note a { color: var(--tx); }
+.api-frame {
+  display: block; width: 100%; height: calc(100vh - 190px); min-height: 480px; margin-bottom: 24px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: #fff;
+}
+
 /* ---------- narrow screens ---------- */
 @media (max-width: 1360px) {
   .l-head { grid-template-columns: 18px minmax(0, 1fr) 88px 88px 84px 84px auto; }
@@ -432,6 +481,21 @@ dialog#editor::backdrop { background: rgba(10, 14, 20, .45); }
   .p-row > .p-rate.rx { grid-area: r; text-align: left; }
   .p-row > .p-total { grid-area: o; }
   .detail, .more { padding-left: 16px; }
+  .f-head { display: none; }
+  .f-cols {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "i l a" "c c s" "u u o" "t t d";
+    row-gap: 4px; padding-block: 10px;
+  }
+  .f-row > .p-id { grid-area: i; }
+  .f-row > .f-listener { grid-area: l; }
+  .f-row > .p-action { grid-area: a; }
+  .f-row > .f-addr:nth-of-type(3) { grid-area: c; }
+  .f-row > .f-addr:nth-of-type(4) { grid-area: u; }
+  .f-row > .p-statecell { grid-area: s; justify-self: end; }
+  .f-row > .p-total { grid-area: o; }
+  .f-row > .f-time:nth-of-type(5) { grid-area: t; }
+  .f-row > .f-time:nth-of-type(6) { grid-area: d; }
   .legs { grid-template-columns: 1fr; gap: 6px; }
   .link { padding: 4px 6px; }
 }

@@ -7,6 +7,7 @@
 <link rel="icon" href="logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="app.css">
 <script src="app.js" defer></script>
+<script src="flows.js" defer></script>
 </head>
 <body>
 <header class="bar">
@@ -14,6 +15,7 @@
     <div class="brand">
       <img class="mark" src="logo.svg" alt="" width="28" height="28">
       <span class="name">pf-simple</span>
+      <span class="version mono" id="version" hidden></span>
       <span class="host mono" id="host" hidden></span>
     </div>
     <div class="bar-right">
@@ -37,6 +39,13 @@
   </section>
 
   <div id="app" hidden>
+    <nav class="tabs" role="tablist" aria-label="Console sections">
+      <button class="tab" type="button" role="tab" id="tab-btn-listeners" data-tab="listeners" aria-controls="tab-listeners">Listeners</button>
+      <button class="tab" type="button" role="tab" id="tab-btn-flows" data-tab="flows" aria-controls="tab-flows">Flow log</button>
+      <button class="tab" type="button" role="tab" id="tab-btn-api" data-tab="api" aria-controls="tab-api">API</button>
+    </nav>
+
+    <section id="tab-listeners" role="tabpanel" aria-labelledby="tab-btn-listeners">
     <section class="overview" aria-label="Overview">
       <dl class="kpis">
         <div class="kpi"><dt>Listeners</dt><dd class="num" id="k-listeners">0</dd></div>
@@ -71,6 +80,46 @@
     </div>
 
     <div id="listeners" class="listeners"></div>
+    </section>
+
+    <section id="tab-flows" role="tabpanel" aria-labelledby="tab-btn-flows" hidden>
+      <div class="toolbar">
+        <div class="search">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <input id="flow-filter" type="search" placeholder="Filter by address, listener, #id or reason" aria-label="Filter flows">
+        </div>
+        <select id="flow-result" class="select" aria-label="Show">
+          <option value="">All connections</option>
+          <option value="open">Open</option>
+          <option value="ended">Ended</option>
+          <option value="closed">Closed</option>
+          <option value="reset">Reset</option>
+          <option value="idle">Idle timeout</option>
+          <option value="failed">Failed</option>
+          <option value="refused">Refused</option>
+        </select>
+        <span class="status" id="flow-status" data-state="connecting"><span class="dot"></span><span id="flow-status-text">Connecting</span></span>
+        <span class="toolbar-note" id="flow-note"></span>
+        <div class="toolbar-actions">
+          <button class="btn btn-quiet" type="button" id="flow-pause" aria-pressed="false">Pause</button>
+          <button class="btn btn-quiet" type="button" id="flow-clear" title="Hide the connections that ended so far">Clear ended</button>
+        </div>
+      </div>
+      <div class="flowlog">
+        <div class="f-cols f-head">
+          <span>ID</span><span>Listener</span><span>Client</span><span>Upstream</span><span>Started</span>
+          <span class="r">Duration</span><span class="r">Transferred</span><span>Result</span><span></span>
+        </div>
+        <div id="flow-rows"></div>
+        <div class="empty" id="flow-empty"><img src="logo-sleep.svg" alt=""><span id="flow-empty-text">No connections yet. They show up here as soon as they are accepted.</span></div>
+        <div class="more" id="flow-more" hidden></div>
+      </div>
+    </section>
+
+    <section id="tab-api" role="tabpanel" aria-labelledby="tab-btn-api" hidden>
+      <p class="api-note">Every endpoint takes this console session, or the console password in the <code>X-API-Token</code> header. Changes also need <code>X-PF-Console: 1</code> or <code>X-API-Token</code>. <a href="swagger/" target="_blank" rel="noopener">Open in a new window</a> · <a href="openapi.json" target="_blank" rel="noopener">openapi.json</a></p>
+      <iframe id="api-frame" class="api-frame" title="API explorer"></iframe>
+    </section>
   </div>
 </main>
 

@@ -303,7 +303,8 @@ The page builds its WebSocket URL from its own location, so it works at
 whatever host and scheme the proxy presents. The `Origin` of the handshake
 must match the `Host` the proxy forwards, hence `Host $host` above.
 
-What it shows:
+What it shows (the build version sits next to the name in the top bar;
+`pf-simple --version` prints it too):
 
 - A summary strip: active pipes, accepted connections, current throughput in
   each direction, bytes transferred, uptime, and a two-minute throughput chart.
@@ -320,6 +321,17 @@ What it shows:
   with `SO_LINGER 0`, so both peers get a TCP RST.
 - Per-listener **Stop/Start**, and in config mode **Add listener**, **Edit**
   and **Delete** (see [Managing listeners from the console](#managing-listeners-from-the-console)).
+- A **Flow log** tab: every connection from accept to close, newest first,
+  including ones that never became pipes. Each row shows the listener,
+  client, upstream, start time, duration, bytes each way and how it ended:
+  `OPEN`, `CLOSED`, `RESET` (from the console, or its listener stopped),
+  `IDLE TIMEOUT`, `FAILED` (target unreachable) or `REFUSED`
+  (`max_connections`, or the listener was stopping). Hover a result for the
+  reason. Filter by text or result, pause the view, or reset an open
+  connection from its row. The last 2000 ended connections are kept in
+  memory, so the log starts filled when you open it.
+- An **API** tab: Swagger UI over the [REST API](#rest-api), to read the
+  docs and try each call live with the page's session.
 
 How it stays light:
 
@@ -342,7 +354,7 @@ How it stays light:
   still shown).
 - If the connection drops, the page reconnects on its own with backoff.
 
-Everything the page needs (HTML, CSS, JavaScript, logo) is compiled into the
+Everything the page needs (HTML, CSS, JavaScript, logo, Swagger UI) is compiled into the
 binary with `go:embed`. It loads nothing from other sites, and the
 Content-Security-Policy (`default-src 'self'`) makes the browser refuse
 anything external. A test enforces both.
@@ -356,6 +368,63 @@ session expiry also close that session's open WebSocket connections. Every
 state-changing request needs a custom header, WebSocket connections from
 other origins are refused, and a wrong password is answered after a one-second
 delay.
+
+### Flow log
+
+The Flow log tab has its own WebSocket (`/pf/api/flows`), open only while
+the tab is showing. Each connection's open and close events go to a second
+broadcast queue (4096 events, drop-oldest), and nothing is built while no
+page watches. Every 5 seconds the page also gets the authoritative list of
+open connections, which repairs any event a slow page missed. Closed
+connections live in a fixed ring of 2000 slots written with one atomic add,
+so recording one never takes a lock.
+
+### REST API
+
+Everything the console does is also a JSON API under `/pf/api/`, described
+by `/pf/openapi.json` and browsable in the console's API tab (or at
+`/pf/swagger/`).
+
+| Method & path | What it does |
+|---|---|
+| `GET /pf/api/health` | Liveness and build version; needs no authentication |
+| `GET /pf/api/stats` | Totals: uptime, listeners, active connections, bytes |
+| `GET /pf/api/policy` | Whether management is on, and the `allow_*` fences |
+| `GET /pf/api/listeners` | Every listener with its counters |
+| `POST /pf/api/listeners` | Add, start and save a listener |
+| `POST /pf/api/listeners/validate[?id=N]` | Check a spec as add (or edit of N) would, without changing anything |
+| `GET /pf/api/listeners/{id}` | One listener |
+| `PUT /pf/api/listeners/{id}` | Edit a **stopped** listener (409 while running) |
+| `DELETE /pf/api/listeners/{id}` | Delete a **stopped** listener |
+| `POST /pf/api/listeners/{id}/start`, `/stop` | Start or stop it |
+| `GET /pf/api/listeners/{id}/connections` | Its open connections |
+| `GET /pf/api/connections[?listener=N]` | Every open connection, with live byte counters |
+| `GET /pf/api/connections/{id}` | One open connection |
+| `DELETE /pf/api/connections/{id}` | Reset it (TCP RST both ways) |
+| `GET /pf/api/flows[?since=ms]` | Flow log as JSON; upgraded to a WebSocket, the live stream |
+
+Authenticate with the console password in an `X-API-Token` header, or with
+a console session cookie. A request that changes something must also carry
+`X-PF-Console: 1` or `X-API-Token`. A browser cannot add either header to a
+cross-site request, which is what stops cross-site request forgery. A wrong
+token gets its 401 after a one-second delay, the same as a wrong password at
+sign-in.
+
+```sh
+T='X-API-Token: secret'
+curl -H "$T" http://127.0.0.1:18222/pf/api/listeners
+curl -H "$T" -X POST -d '{"name":"web","listen":"18080","target":"10.0.0.6:8080"}' \
+     http://127.0.0.1:18222/pf/api/listeners
+curl -H "$T" -X POST http://127.0.0.1:18222/pf/api/listeners/2/stop
+curl -H "$T" -X PUT -d '{"name":"web","listen":"18080","target":"10.0.0.7:8080"}' \
+     http://127.0.0.1:18222/pf/api/listeners/2
+curl -H "$T" -X POST http://127.0.0.1:18222/pf/api/listeners/2/start
+```
+
+The older routes the console page uses (`POST /pf/api/listeners/{id}/edit`,
+`/delete`, `POST /pf/api/pipes/{id}/stop`, `GET /pf/api/state`) still work.
+Swagger UI 5.17.14 is vendored under `console/swagger/` (Apache-2.0, see its
+`LICENSE`).
 
 ## Data path: zero-copy on Linux
 
