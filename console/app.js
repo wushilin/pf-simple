@@ -11,8 +11,10 @@
 
 const $ = (id) => document.getElementById(id);
 const CSRF = { "X-PF-Console": "1" };
-const RATE_WINDOW_MS = 1500;
+const RATE_WINDOW_MS = 1500; // a busy flow's rate covers at least this long
+const RATE_MAX_SPAN_MS = 60000; // a slow flow's rate covers at most this long
 const RATE_MAX_SAMPLES = 64;
+const PUSH_MS = 400; // the server's pushInterval
 const HISTORY_POINTS = 120; // two minutes at one sample per second
 const MAX_ROWS = 200;
 const ARM_MS = 3000;
@@ -76,22 +78,45 @@ const serverNow = () => Date.now() - ui.skew;
 
 // ---------- bounded data structures ----------
 
+// RateMeter turns pushed byte counters into a rate. The server pushes only
+// when something changed, so a counter seen at t1 stayed the same until the
+// next push that moved it: it is a step function known exactly at its
+// changes. The rate is the bytes between the oldest kept change and the
+// newest, over the time between them, so a slow flow that moves a chunk
+// every few seconds reads right instead of reading zero. Once the next
+// change is overdue the rate decays, and it drops to zero when the flow has
+// been quiet for twice its usual gap.
 class RateMeter {
   constructor() { this.s = []; }
   add(t, v) {
     const s = this.s;
-    if (s.length && v < s[s.length - 1][1]) s.length = 0; // counter restarted
+    const last = s[s.length - 1];
+    if (last && v === last[1]) return; // unchanged: nothing to learn
+    if (last && v < last[1]) s.length = 0; // counter restarted
+    // After a pause the old changes say nothing about the new activity;
+    // the last one before it is still where the new bytes started.
+    if (s.length > 1 && this.late(t) > this.gap()) s.splice(0, s.length - 1);
     s.push([t, v]);
-    while (s.length > RATE_MAX_SAMPLES || (s.length > 2 && t - s[0][0] > RATE_WINDOW_MS)) s.shift();
+    // One change at least RATE_WINDOW_MS before the newest is anchor enough.
+    while (s.length > 2 && (t - s[1][0] >= RATE_WINDOW_MS || s.length > RATE_MAX_SAMPLES)) s.shift();
   }
+  // gap is how long the flow usually takes between changes, plus the push
+  // timing that can delay one.
+  gap() {
+    const s = this.s;
+    return (s[s.length - 1][0] - s[0][0]) / (s.length - 1) + PUSH_MS;
+  }
+  // late is how far past its usual gap the next change is.
+  late(now) { return now - this.s[this.s.length - 1][0] - this.gap(); }
   rate(now) {
     const s = this.s;
-    while (s.length > 1 && now - s[0][0] > RATE_WINDOW_MS) s.shift();
+    while (s.length && now - s[0][0] > RATE_MAX_SPAN_MS) s.shift();
     if (s.length < 2) return 0;
+    const late = this.late(now);
+    if (late > this.gap()) return 0;
     const [t0, v0] = s[0];
     const [t1, v1] = s[s.length - 1];
-    const dt = Math.max(now, t1) - t0; // keeps growing once pushes stop
-    return dt > 0 ? ((v1 - v0) * 1000) / dt : 0;
+    return ((v1 - v0) * 1000) / (t1 - t0 + Math.max(0, late));
   }
 }
 
