@@ -170,6 +170,8 @@ func (l *listenerStats) release() { l.active.Add(-1) }
 
 // listenerStats holds the counters of one --forward mapping.
 type listenerStats struct {
+	// id is set by the manager before the listener first starts and only
+	// changes while it is stopped; connections read it without a lock.
 	id       int
 	spec     listenerSpec // as configured; written back to the state file
 	name     string       // optional label from the config file
