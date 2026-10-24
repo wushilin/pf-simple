@@ -100,7 +100,8 @@ type pipe struct {
 	up          flow // client -> upstream
 	down        flow // upstream -> client
 	interrupted atomic.Bool
-	ended       chan struct{} // closed by end(); shared by both flows' cancel
+	resetReason atomic.Pointer[string] // why it was interrupted, for the flow log
+	ended       chan struct{}          // closed by end(); shared by both flows' cancel
 	endOnce     sync.Once
 }
 
@@ -111,10 +112,11 @@ func (p *pipe) end() { p.endOnce.Do(func() { close(p.ended) }) }
 // FIN, and closing the sockets wakes both copy goroutines. Linger is set on
 // both sockets before either is closed, and the copy goroutines skip their
 // CloseWrite once interrupted, so neither peer sees a FIN before the RST.
-func (p *pipe) interrupt() {
+func (p *pipe) interrupt(reason string) {
 	if !p.interrupted.CompareAndSwap(false, true) {
 		return
 	}
+	p.resetReason.Store(&reason)
 	changes.notify()
 	p.end()
 	legs := []net.Conn{p.client, p.upstream}
@@ -204,15 +206,16 @@ func newListenerStats(id int, listen, target string) *listenerStats {
 // pipeRegistry tracks every live pipe. The mutex is only held to add, remove
 // or list pipes; byte counters are atomics updated without it.
 type pipeRegistry struct {
-	mu     sync.Mutex
-	nextID uint64
-	pipes  map[uint64]*pipe
+	mu    sync.Mutex
+	pipes map[uint64]*pipe
 }
 
 var pipes = &pipeRegistry{pipes: make(map[uint64]*pipe)}
 
-func (r *pipeRegistry) add(l *listenerStats, client, upstream net.Conn) *pipe {
-	p := &pipe{listener: l, started: time.Now(), client: client, upstream: upstream, ended: make(chan struct{})}
+// add registers a pipe under its connection's id; started is when the
+// client was accepted.
+func (r *pipeRegistry) add(id uint64, started time.Time, l *listenerStats, client, upstream net.Conn) *pipe {
+	p := &pipe{id: id, listener: l, started: started, client: client, upstream: upstream, ended: make(chan struct{})}
 	p.up.total, p.up.perConn, p.up.cancel = l.totalUp, newLimiter(l.perConnRate), p.ended
 	p.down.total, p.down.perConn, p.down.cancel = l.totalDown, newLimiter(l.perConnRate), p.ended
 	r.mu.Lock()
@@ -220,8 +223,6 @@ func (r *pipeRegistry) add(l *listenerStats, client, upstream net.Conn) *pipe {
 		r.mu.Unlock()
 		return nil
 	}
-	r.nextID++
-	p.id = r.nextID
 	r.pipes[p.id] = p
 	r.mu.Unlock()
 	changes.notify()
@@ -253,7 +254,7 @@ func (r *pipeRegistry) interruptListener(l *listenerStats) {
 	}
 	r.mu.Unlock()
 	for _, p := range victims {
-		p.interrupt()
+		p.interrupt("listener stopped")
 	}
 }
 
@@ -263,10 +264,27 @@ func (r *pipeRegistry) get(id uint64) *pipe {
 	return r.pipes[id]
 }
 
+// list returns the live pipes oldest first, at most max of them (the newest);
+// truncated says some were left out. max <= 0 means all.
+func (r *pipeRegistry) list(max int) (live []*pipe, truncated bool) {
+	r.mu.Lock()
+	live = make([]*pipe, 0, len(r.pipes))
+	for _, p := range r.pipes {
+		live = append(live, p)
+	}
+	r.mu.Unlock()
+	sort.Slice(live, func(i, j int) bool { return live[i].id < live[j].id })
+	if max > 0 && len(live) > max {
+		return live[len(live)-max:], true
+	}
+	return live, false
+}
+
 // Snapshot types are the console's JSON API.
 
 type pipeSnapshot struct {
 	ID             uint64 `json:"id"`
+	ListenerID     int    `json:"listenerId"`
 	Started        int64  `json:"started"` // unix milliseconds
 	ClientRemote   string `json:"clientRemote"`
 	ClientLocal    string `json:"clientLocal"`
@@ -346,21 +364,7 @@ func (r *pipeRegistry) snapshot(listeners []*listenerStats) []listenerSnapshot {
 		if ls == nil {
 			continue
 		}
-		ls.Pipes = append(ls.Pipes, pipeSnapshot{
-			ID:             p.id,
-			Started:        p.started.UnixMilli(),
-			ClientRemote:   p.client.RemoteAddr().String(),
-			ClientLocal:    p.client.LocalAddr().String(),
-			UpstreamLocal:  p.upstream.LocalAddr().String(),
-			UpstreamRemote: p.upstream.RemoteAddr().String(),
-			ClientToPF:     p.up.read.Load(),
-			PFToUpstream:   p.up.written.Load(),
-			UpstreamToPF:   p.down.read.Load(),
-			PFToClient:     p.down.written.Load(),
-			UpDone:         p.up.done.Load(),
-			DownDone:       p.down.done.Load(),
-			Interrupted:    p.interrupted.Load(),
-		})
+		ls.Pipes = append(ls.Pipes, p.snapshot())
 	}
 	for i := range out {
 		out[i].PipeCount = len(out[i].Pipes)
@@ -369,4 +373,23 @@ func (r *pipeRegistry) snapshot(listeners []*listenerStats) []listenerSnapshot {
 		}
 	}
 	return out
+}
+
+func (p *pipe) snapshot() pipeSnapshot {
+	return pipeSnapshot{
+		ID:             p.id,
+		ListenerID:     p.listener.id,
+		Started:        p.started.UnixMilli(),
+		ClientRemote:   p.client.RemoteAddr().String(),
+		ClientLocal:    p.client.LocalAddr().String(),
+		UpstreamLocal:  p.upstream.LocalAddr().String(),
+		UpstreamRemote: p.upstream.RemoteAddr().String(),
+		ClientToPF:     p.up.read.Load(),
+		PFToUpstream:   p.up.written.Load(),
+		UpstreamToPF:   p.down.read.Load(),
+		PFToClient:     p.down.written.Load(),
+		UpDone:         p.up.done.Load(),
+		DownDone:       p.down.done.Load(),
+		Interrupted:    p.interrupted.Load(),
+	}
 }

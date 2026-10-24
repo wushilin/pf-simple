@@ -319,24 +319,33 @@ func TestConsolePushAndStop(t *testing.T) {
 func TestConsoleAssetsAreSelfContained(t *testing.T) {
 	base, _ := startConsole(t, "", "127.0.0.1:1")
 	urlPattern := regexp.MustCompile(`(?i)(https?:)?//[a-z0-9.-]+\.[a-z]{2,}`)
-	entries, err := fs.ReadDir(consoleFiles, "console")
-	if err != nil || len(entries) == 0 {
+	// The vendored Swagger UI files mention URLs in text (license, docs
+	// links, examples); the CSP still keeps it from loading any of them.
+	vendored := map[string]bool{"swagger/swagger-ui-bundle.js": true, "swagger/swagger-ui.css": true, "swagger/LICENSE": true}
+	var names []string
+	err := fs.WalkDir(consoleFiles, "console", func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			names = append(names, strings.TrimPrefix(path, "console/"))
+		}
+		return err
+	})
+	if err != nil || len(names) == 0 {
 		t.Fatalf("embedded console files: %v", err)
 	}
-	for _, e := range entries {
-		data, err := fs.ReadFile(consoleFiles, "console/"+e.Name())
+	for _, name := range names {
+		data, err := fs.ReadFile(consoleFiles, "console/"+name)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, m := range urlPattern.FindAllString(string(data), -1) {
-			if m != "http://www.w3.org" {
-				t.Errorf("%s references an external URL: %s", e.Name(), m)
+			if m != "http://www.w3.org" && !vendored[name] {
+				t.Errorf("%s references an external URL: %s", name, m)
 			}
 		}
-		r := get(t, base+"/"+e.Name(), "")
+		r := get(t, base+"/"+name, "")
 		r.Body.Close()
 		if r.StatusCode != http.StatusOK {
-			t.Errorf("GET /%s: %d", e.Name(), r.StatusCode)
+			t.Errorf("GET /%s: %d", name, r.StatusCode)
 		}
 	}
 	r := get(t, base+"/", "")

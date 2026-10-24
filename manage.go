@@ -381,15 +381,9 @@ func (m *manager) add(spec listenerSpec) (int, error) {
 	if m.policy == nil {
 		return 0, errNoManaging
 	}
-	fw, _, err := buildForwarding(spec)
+	fw, err := m.checkLocked(spec, nil)
 	if err != nil {
 		return 0, err
-	}
-	if err := m.policy.check(fw); err != nil {
-		return 0, err
-	}
-	if other := m.findListenLocked(fw.listen); other != nil {
-		return 0, fmt.Errorf("%s is already used by %s", fw.listen, other.stats.labelFor(other.stats.listen))
 	}
 	ml := m.appendLocked(fw.stats, sourceConfig, true)
 	if err := m.startLocked(ml); err != nil {
@@ -496,15 +490,9 @@ func (m *manager) edit(id int, spec listenerSpec) error {
 	if ml.running {
 		return fmt.Errorf("%w before editing it", errRunning)
 	}
-	fw, _, err := buildForwarding(spec)
+	fw, err := m.checkLocked(spec, ml)
 	if err != nil {
 		return err
-	}
-	if err := m.policy.check(fw); err != nil {
-		return err
-	}
-	if other := m.findListenLocked(fw.listen); other != nil && other != ml {
-		return fmt.Errorf("%s is already used by %s", fw.listen, other.stats.labelFor(other.stats.listen))
 	}
 	old, next := ml.stats, fw.stats
 	next.id = old.id
@@ -522,6 +510,44 @@ func (m *manager) edit(id int, spec listenerSpec) error {
 	log.Printf("edited %s -> %s", next.labelFor(next.listen), next.target)
 	changes.notify()
 	return nil
+}
+
+// checkLocked builds spec and checks it against the policy and the other
+// listeners; self is the listener being edited, or nil for a new one.
+func (m *manager) checkLocked(spec listenerSpec, self *managedListener) (forwarding, error) {
+	fw, _, err := buildForwarding(spec)
+	if err != nil {
+		return forwarding{}, err
+	}
+	if err := m.policy.check(fw); err != nil {
+		return forwarding{}, err
+	}
+	if other := m.findListenLocked(fw.listen); other != nil && other != self {
+		return forwarding{}, fmt.Errorf("%s is already used by %s", fw.listen, other.stats.labelFor(other.stats.listen))
+	}
+	return fw, nil
+}
+
+// validate runs the checks of add (id < 0) or edit (id >= 0) without
+// changing anything, and returns spec as it would be saved.
+func (m *manager) validate(spec listenerSpec, id int) (listenerSpec, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.policy == nil {
+		return spec, errNoManaging
+	}
+	var self *managedListener
+	if id >= 0 {
+		var err error
+		if self, err = m.editableLocked(id); err != nil {
+			return spec, err
+		}
+	}
+	fw, err := m.checkLocked(spec, self)
+	if err != nil {
+		return spec, err
+	}
+	return fw.stats.spec, nil
 }
 
 // saveLocked rewrites the config file atomically: [console] exactly as

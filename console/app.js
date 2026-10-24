@@ -568,8 +568,18 @@ function forgetPipe(id) {
   ui.meters.delete("pr" + id);
 }
 
+// showVersion labels the brand with the server's build version; the sign-in
+// page shows it too, since api/session needs no session.
+function showVersion(v) {
+  if (!v) return;
+  $("version").hidden = false;
+  setText($("version"), "v" + v);
+  $("version").title = `pf-simple ${v}`;
+}
+
 function applyState(s) {
   ui.skew = Date.now() - s.now;
+  showVersion(s.version);
   ui.state = s;
   if (s.host) { $("host").hidden = false; setText($("host"), s.host); document.title = `${s.host} · pf-simple`; }
   if (!ui.total) ui.total = new Ring(HISTORY_POINTS);
@@ -1009,6 +1019,7 @@ function checkSession() {
     .then((r) => r.json())
     .then((s) => {
       ui.passwordRequired = s.passwordRequired;
+      showVersion(s.version);
       if (!s.authorized) { showLogin(); return false; }
       showApp();
       return true;
@@ -1018,6 +1029,7 @@ function checkSession() {
 
 function showLogin() {
   if (ui.ws) { const ws = ui.ws; ui.ws = null; ws.close(); }
+  flowsStop();
   clearTimeout(ui.reconnectTimer);
   $("app").hidden = true;
   $("logout").hidden = true;
@@ -1030,7 +1042,35 @@ function showApp() {
   $("login").hidden = true;
   $("app").hidden = false;
   $("logout").hidden = !ui.passwordRequired;
+  showTab(currentTab());
 }
+
+// ---------- tabs ----------
+
+const TABS = ["listeners", "flows", "api"];
+
+function currentTab() {
+  const t = location.hash.slice(1);
+  return TABS.includes(t) ? t : "listeners";
+}
+
+function showTab(name) {
+  for (const t of TABS) {
+    $("tab-" + t).hidden = t !== name;
+    $("tab-btn-" + t).setAttribute("aria-selected", String(t === name));
+  }
+  if (name === "flows") flowsStart(); else flowsStop();
+  if (name === "api" && !$("api-frame").getAttribute("src")) $("api-frame").src = "swagger/";
+  if (name === "listeners") redrawCharts(); // canvases have no size while hidden
+}
+
+for (const b of document.querySelectorAll(".tab")) {
+  b.addEventListener("click", () => {
+    history.replaceState(null, "", b.dataset.tab === "listeners" ? location.pathname : "#" + b.dataset.tab);
+    showTab(b.dataset.tab);
+  });
+}
+window.addEventListener("hashchange", () => { if (!$("app").hidden) showTab(currentTab()); });
 
 $("login-form").addEventListener("submit", (ev) => {
   ev.preventDefault();

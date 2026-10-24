@@ -37,6 +37,9 @@ const (
 	// add custom headers to cross-site form posts, and SameSite=Strict keeps
 	// the cookie off cross-site requests as a second layer.
 	csrfHeader = "X-PF-Console"
+	// apiTokenHeader carries the console password for scripts, instead of a
+	// session cookie. Being a custom header, it also satisfies the CSRF check.
+	apiTokenHeader = "X-API-Token"
 
 	// pushInterval is the emitter's tick: at most one push per 400ms, and
 	// none at all while nothing changes.
@@ -130,6 +133,7 @@ func (s *consoleServer) handler() http.Handler {
 	mux.HandleFunc("POST "+consolePrefix+"/api/listeners", s.requireCSRF(s.requireAuth(s.handleAddListener)))
 	mux.HandleFunc("POST "+consolePrefix+"/api/listeners/{id}/{action}", s.requireCSRF(s.requireAuth(s.handleListenerAction)))
 	mux.HandleFunc("POST "+consolePrefix+"/api/pipes/{id}/stop", s.requireCSRF(s.requireAuth(s.handleStop)))
+	s.apiRoutes(mux)
 	return securityHeaders(mux)
 }
 
@@ -157,7 +161,8 @@ func (s *consoleServer) serve(ctx context.Context, ln net.Listener) {
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		// frame-ancestors 'self': the API tab shows Swagger UI in a frame.
+		h.Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cache-Control", "no-store")
@@ -165,10 +170,12 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// requireCSRF accepts a request carrying the console's header or an API
+// token: a cross-site form cannot set either. requireAuth checks the token.
 func (s *consoleServer) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(csrfHeader) != "1" {
-			http.Error(w, "missing "+csrfHeader+" header", http.StatusForbidden)
+		if r.Header.Get(csrfHeader) != "1" && r.Header.Get(apiTokenHeader) == "" {
+			http.Error(w, "missing "+csrfHeader+" or "+apiTokenHeader+" header", http.StatusForbidden)
 			return
 		}
 		next(w, r)
@@ -178,7 +185,10 @@ func (s *consoleServer) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 func (s *consoleServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			if r.Header.Get(apiTokenHeader) != "" {
+				time.Sleep(time.Second) // a wrong token: slow down guessing, as for login
+			}
+			writeError(w, http.StatusUnauthorized, "unauthorized: sign in, or send the console password in "+apiTokenHeader)
 			return
 		}
 		next(w, r)
@@ -186,7 +196,20 @@ func (s *consoleServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *consoleServer) authorized(r *http.Request) bool {
-	return s.password == "" || s.session(r) != nil
+	return s.password == "" || s.tokenOK(r) || s.session(r) != nil
+}
+
+// tokenOK reports whether the request carries the console password in
+// X-API-Token.
+func (s *consoleServer) tokenOK(r *http.Request) bool {
+	token := r.Header.Get(apiTokenHeader)
+	return token != "" && s.passwordMatches(token)
+}
+
+// passwordMatches compares hashes so the time taken does not depend on length.
+func (s *consoleServer) passwordMatches(candidate string) bool {
+	got, want := sha256.Sum256([]byte(candidate)), sha256.Sum256([]byte(s.password))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 // session also rechecks authorization after a WebSocket's HTTP middleware,
@@ -214,9 +237,10 @@ func (s *consoleServer) revokeLocked(token string) {
 }
 
 func (s *consoleServer) handleSession(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]bool{
+	writeJSON(w, map[string]any{
 		"passwordRequired": s.password != "",
 		"authorized":       s.authorized(r),
+		"version":          version,
 	})
 }
 
@@ -229,9 +253,7 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.password != "" {
-		// Compare hashes so the comparison time does not depend on length.
-		got, want := sha256.Sum256([]byte(body.Password)), sha256.Sum256([]byte(s.password))
-		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+		if !s.passwordMatches(body.Password) {
 			time.Sleep(time.Second) // slow down guessing
 			http.Error(w, "wrong password", http.StatusUnauthorized)
 			return
@@ -275,6 +297,7 @@ func (s *consoleServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 type consoleState struct {
+	Version   string             `json:"version"`
 	Host      string             `json:"host"`
 	Now       int64              `json:"now"`
 	Started   int64              `json:"started"`
@@ -289,15 +312,15 @@ func (s *consoleServer) handleState(w http.ResponseWriter, r *http.Request) {
 func (s *consoleServer) handleStop(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
 	if err != nil {
-		http.Error(w, "bad connection id", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "bad connection id")
 		return
 	}
 	p := pipes.get(id)
 	if p == nil {
-		http.Error(w, "no such connection", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "no such connection")
 		return
 	}
-	p.interrupt()
+	p.interrupt("reset from the console")
 	log.Printf("console: reset pipe #%d %s -> %s", id, p.client.RemoteAddr(), p.listener.target)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -324,22 +347,60 @@ func (s *consoleServer) broadcast(ctx context.Context) {
 	}
 }
 
-func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+// openSocket upgrades an authorized request to a WebSocket. quit is closed
+// when the client leaves, its session is revoked or expires, or the console
+// shuts down; the caller then stops writing and returns.
+func (s *consoleServer) openSocket(w http.ResponseWriter, r *http.Request) (ws *wsConn, quit <-chan struct{}, ok bool) {
+	// Recheck the session after the HTTP middleware, so a logout racing the
+	// upgrade cannot leave an untracked socket open. A token never expires.
 	var revoked <-chan struct{}
 	var expiry <-chan time.Time
-	if s.password != "" {
+	var timer *time.Timer
+	if s.password != "" && !s.tokenOK(r) {
 		session := s.session(r)
 		if session == nil {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+			return nil, nil, false
 		}
 		revoked = session.revoked
-		timer := time.NewTimer(time.Until(session.expires))
-		defer timer.Stop()
+		timer = time.NewTimer(time.Until(session.expires))
 		expiry = timer.C
 	}
 	ws, err := upgradeWebSocket(w, r)
 	if err != nil {
+		if timer != nil {
+			timer.Stop()
+		}
+		return nil, nil, false
+	}
+	// The client's side: answer pings, notice when it goes away.
+	gone := make(chan struct{})
+	go func() {
+		_ = ws.readLoop()
+		close(gone)
+	}()
+	q := make(chan struct{})
+	go func() {
+		defer close(q)
+		if timer != nil {
+			defer timer.Stop()
+		}
+		select {
+		case <-s.ctx.Done():
+			_ = ws.writeFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
+		case <-revoked:
+			_ = ws.Close()
+		case <-expiry:
+			_ = ws.Close()
+		case <-gone:
+		}
+	}()
+	return ws, q, true
+}
+
+func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	ws, quit, ok := s.openSocket(w, r)
+	if !ok {
 		return
 	}
 	defer ws.Close()
@@ -353,40 +414,23 @@ func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 	done := make(chan struct{})
 	defer close(done)
 
-	// The client's side: answer pings, notice when it goes away.
-	gone := make(chan struct{})
-	go func() {
-		_ = ws.readLoop()
-		close(gone)
-	}()
 	// Recv cannot be cancelled, so a watcher closes the receiver when the
-	// client leaves or the server stops; that wakes Recv with ErrClosed.
-	go func() {
-		select {
-		case <-s.ctx.Done():
-			_ = ws.writeFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
-		case <-revoked:
-			_ = ws.Close()
-		case <-expiry:
-			_ = ws.Close()
-		case <-gone:
-		case <-done:
-		}
-		rx.Close()
-	}()
+	// client leaves or the server stops; that wakes Recv with ErrClosed. It
+	// also sends the pings.
 	go func() {
 		ping := time.NewTicker(wsPingInterval)
 		defer ping.Stop()
 		for {
 			select {
+			case <-quit:
 			case <-done:
-				return
 			case <-ping.C:
-				if ws.writeFrame(wsOpPing, nil) != nil {
-					rx.Close()
-					return
+				if ws.writeFrame(wsOpPing, nil) == nil {
+					continue
 				}
 			}
+			rx.Close()
+			return
 		}
 	}()
 
@@ -409,6 +453,7 @@ func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 func (s *consoleServer) state() consoleState {
 	return consoleState{
+		Version:   version,
 		Host:      s.host,
 		Now:       time.Now().UnixMilli(),
 		Started:   s.started.UnixMilli(),
@@ -418,11 +463,8 @@ func (s *consoleServer) state() consoleState {
 }
 
 func (s *consoleServer) handleAddListener(w http.ResponseWriter, r *http.Request) {
-	var spec listenerSpec
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&spec); err != nil {
-		writeError(w, http.StatusBadRequest, "bad request: "+err.Error())
+	spec, ok := decodeSpec(w, r)
+	if !ok {
 		return
 	}
 	id, err := s.mgr.add(spec)
@@ -450,11 +492,8 @@ func (s *consoleServer) handleListenerAction(w http.ResponseWriter, r *http.Requ
 	case "delete":
 		err = s.mgr.remove(id)
 	case "edit":
-		var spec listenerSpec
-		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
-		dec.DisallowUnknownFields()
-		if derr := dec.Decode(&spec); derr != nil {
-			writeError(w, http.StatusBadRequest, "bad request: "+derr.Error())
+		spec, ok := decodeSpec(w, r)
+		if !ok {
 			return
 		}
 		err = s.mgr.edit(id, spec)

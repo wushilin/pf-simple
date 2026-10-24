@@ -38,6 +38,11 @@ func parseForward(value string) (forwarding, error) {
 }
 
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println("pf-simple " + version)
+		return
+	}
+	log.Printf("pf-simple %s", version)
 	cfg, err := parseArgs(os.Args[1:], os.Stderr, os.Getenv("PF_PASSWORD"))
 	if err != nil {
 		exitForArgsError(err)
@@ -100,16 +105,18 @@ func acceptConnections(ctx context.Context, ln net.Listener, l *listenerStats, i
 			}
 			return
 		}
+		id, start := connIDs.Add(1), time.Now()
 		if !l.admit() {
 			l.rejected.Add(1)
 			changes.notify()
+			flows.refused(id, l, start, client, flowRefused, fmt.Sprintf("max_connections (%d) reached", l.maxConns))
 			reject(client)
 			continue
 		}
 		l.conns.Add(1)
 		go func() {
 			defer l.conns.Done()
-			handleConnection(ctx, client, l, idleTimeout)
+			handleConnection(ctx, id, start, client, l, idleTimeout)
 		}()
 	}
 }
@@ -124,7 +131,7 @@ func reject(c net.Conn) {
 
 // handleConnection forwards one client. ctx is the listener's: stopping the
 // listener cancels a dial that is still in progress.
-func handleConnection(ctx context.Context, client net.Conn, l *listenerStats, idleTimeout time.Duration) {
+func handleConnection(ctx context.Context, id uint64, start time.Time, client net.Conn, l *listenerStats, idleTimeout time.Duration) {
 	defer l.release()
 	l.accepted.Add(1)
 	changes.notify()
@@ -136,20 +143,31 @@ func handleConnection(ctx context.Context, client net.Conn, l *listenerStats, id
 			l.failed.Add(1)
 			changes.notify()
 			log.Printf("connect to %s: %v", l.target, err)
+			flows.refused(id, l, start, client, flowFailed, err.Error())
+		} else {
+			flows.refused(id, l, start, client, flowRefused, "listener stopped")
 		}
 		reject(client)
 		return
 	}
 	defer client.Close()
 	defer upstream.Close()
-	p := pipes.add(l, client, upstream)
+	p := pipes.add(id, start, l, client, upstream)
 	if p == nil { // the listener is stopping
+		flows.refused(id, l, start, client, flowRefused, "listener stopped")
 		reject(client)
 		reject(upstream)
 		return
 	}
-	defer pipes.remove(p)
+	idle := false
+	// Runs before the deferred Closes, so the flow log sees the pipe's final
+	// counts and both addresses.
+	defer func() {
+		pipes.remove(p)
+		flows.ended(p, idle)
+	}()
 	defer p.end()
+	flows.opened(p)
 
 	// Each copy direction ends independently. CloseWrite propagates its EOF
 	// without preventing the opposite direction from returning a final response.
@@ -212,6 +230,7 @@ func handleConnection(ctx context.Context, client net.Conn, l *listenerStats, id
 				continue
 			default:
 			}
+			idle = true
 			return // deferred Close interrupts the remaining blocked copy.
 		}
 	}
