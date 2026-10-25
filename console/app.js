@@ -345,7 +345,9 @@ function buildListener(l) {
   const refused = el("span", "chip bad");
   const limTotal = el("span", "chip limit");
   const limConn = el("span", "chip limit");
-  chips.append(status, active, accepted, failed, refused, limTotal, limConn);
+  const lowLat = el("span", "chip limit", "low latency");
+  lowLat.title = "low_latency: every read is copied at once, never held to batch";
+  chips.append(status, active, accepted, failed, refused, limTotal, limConn, lowLat, lowLat);
   const line = el("div", "route-line");
   line.append(lname, listen, el("span", "arrow", "→"), target);
   route.append(line, chips);
@@ -743,6 +745,7 @@ function paint() {
     setText(lr.limConn, `max ${fmtBytes(l.perConnSpeed)}/s per pipe`);
     lr.limConn.hidden = !l.perConnSpeed;
     lr.limConn.title = "per_connection_max_speed: the cap for each pipe, in each direction";
+    lr.lowLat.hidden = !l.lowLatency;
     setText(lr.accepted, `${l.accepted} accepted`);
     setText(lr.failed, `${l.failed} failed`);
     lr.failed.hidden = l.failed === 0;
@@ -937,6 +940,7 @@ function openEditor(l) {
   $("f-max").value = spec.maxConnections ? String(spec.maxConnections) : "";
   $("f-total").value = spec.totalSpeed || "";
   $("f-perconn").value = spec.perConnSpeed || "";
+  $("f-lowlat").checked = !!spec.lowLatency;
   setText($("editor-error"), "");
   $("editor").showModal();
   (l ? $("f-name") : $("f-listen")).focus();
@@ -955,6 +959,7 @@ $("editor-form").addEventListener("submit", (ev) => {
     maxConnections: max === "" ? 0 : Number(max),
     totalSpeed: $("f-total").value.trim(),
     perConnSpeed: $("f-perconn").value.trim(),
+    lowLatency: $("f-lowlat").checked,
   };
   if (!spec.listen || !spec.target) { setText($("editor-error"), "Listen and target are required."); return; }
   const btn = $("editor-save");

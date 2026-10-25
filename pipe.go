@@ -39,6 +39,7 @@ type flow struct {
 	total   *limiter
 	perConn *limiter
 	cancel  chan struct{} // closed when the pipe ends; wakes a limited wait
+	linger  bool          // a splice copy may hold short reads for more
 }
 
 // chunk is the most bytes one read or splice may move in this direction.
@@ -149,6 +150,9 @@ func (l *listenerStats) limitsNote() string {
 	if l.maxConns > 0 {
 		parts = append(parts, fmt.Sprintf("max %d connections", l.maxConns))
 	}
+	if l.lowLatency {
+		parts = append(parts, "low latency")
+	}
 	if len(parts) == 0 {
 		return ""
 	}
@@ -195,6 +199,8 @@ type listenerStats struct {
 	totalDown   *limiter
 	totalRate   float64
 	perConnRate float64
+	// lowLatency turns lingering off for this listener's pipes.
+	lowLatency bool
 	// Bytes delivered by pipes that already closed; live pipes are added at
 	// snapshot time.
 	closedUp   atomic.Uint64
@@ -220,6 +226,7 @@ func (r *pipeRegistry) add(id uint64, started time.Time, l *listenerStats, clien
 	p := &pipe{id: id, listener: l, started: started, client: client, upstream: upstream, ended: make(chan struct{})}
 	p.up.total, p.up.perConn, p.up.cancel = l.totalUp, newLimiter(l.perConnRate), p.ended
 	p.down.total, p.down.perConn, p.down.cancel = l.totalDown, newLimiter(l.perConnRate), p.ended
+	p.up.linger, p.down.linger = !l.lowLatency, !l.lowLatency
 	r.mu.Lock()
 	if l.closing.Load() {
 		r.mu.Unlock()
@@ -325,6 +332,7 @@ type listenerSnapshot struct {
 	// Speed limits in bytes per second, per direction; 0 = unlimited.
 	TotalSpeed   float64        `json:"totalSpeed"`
 	PerConnSpeed float64        `json:"perConnSpeed"`
+	LowLatency   bool           `json:"lowLatency"`
 	Pipes        []pipeSnapshot `json:"pipes"`
 }
 
@@ -337,7 +345,7 @@ func (r *pipeRegistry) snapshot(listeners []*listenerStats) []listenerSnapshot {
 			ID:   l.id, Name: l.name, Listen: l.listen, Target: l.target,
 			Rejected: l.rejected.Load(), MaxConns: l.maxConns,
 			Accepted: l.accepted.Load(), Failed: l.failed.Load(),
-			TotalSpeed: l.totalRate, PerConnSpeed: l.perConnRate,
+			TotalSpeed: l.totalRate, PerConnSpeed: l.perConnRate, LowLatency: l.lowLatency,
 			Pipes: []pipeSnapshot{},
 		}
 		byID[l] = &out[i]

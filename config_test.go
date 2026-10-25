@@ -182,6 +182,27 @@ func timeUpload(t *testing.T, addr string, size int) time.Duration {
 	return time.Since(start)
 }
 
+// low_latency reaches the listener and turns lingering off for its pipes.
+func TestLowLatencyTurnsLingerOff(t *testing.T) {
+	for _, low := range []bool{false, true} {
+		fw, spec, err := buildForwarding(listenerSpec{Listen: "127.0.0.1:1", Target: "127.0.0.1:2", LowLatency: low})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if spec.LowLatency != low || fw.stats.lowLatency != low {
+			t.Fatalf("low_latency %v: spec %v, stats %v", low, spec.LowLatency, fw.stats.lowLatency)
+		}
+		a, b := net.Pipe()
+		p := pipes.add(connIDs.Add(1), time.Now(), fw.stats, a, b)
+		if p.up.linger == low || p.down.linger == low {
+			t.Fatalf("low_latency %v: up linger %v, down linger %v", low, p.up.linger, p.down.linger)
+		}
+		pipes.remove(p)
+		a.Close()
+		b.Close()
+	}
+}
+
 func TestPerConnectionSpeedLimit(t *testing.T) {
 	target, got := sinkServer(t)
 	addr := startLimitedForwarder(t, target, func(l *listenerStats) { l.perConnRate = 1 << 20 })

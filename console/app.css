@@ -364,6 +364,10 @@ dialog#editor::backdrop { background: rgba(10, 14, 20, .45); }
 .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
 .field { display: flex; flex-direction: column; gap: 5px; font-size: var(--t-small); font-weight: 600; color: var(--fg-2); min-width: 0; }
 .field.wide { grid-column: 1 / -1; }
+.check { display: flex; align-items: flex-start; gap: 8px; font-size: var(--t-small); font-weight: 600; color: var(--fg-2); cursor: pointer; }
+.check.wide { grid-column: 1 / -1; }
+.check input { margin: 2px 0 0; accent-color: var(--tx); }
+.check em { display: block; font-style: normal; font-weight: 400; color: var(--fg-3); margin-top: 2px; }
 .field em { font-style: normal; font-weight: 400; color: var(--fg-3); }
 .field input {
   height: 36px; padding: 0 10px; border-radius: 8px; font-weight: 400; font-family: var(--font-mono); font-size: 13px;
