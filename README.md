@@ -133,6 +133,7 @@ Each `[[forward]]` takes:
 | `max_connections` | no | Most simultaneous connections. Further clients are refused with an immediate TCP reset and counted as "refused" in the console. Default: unlimited. |
 | `total_speed` | no | Speed limit shared by all connections on this listener. Default: unlimited. |
 | `per_connection_max_speed` | no | Speed limit for each connection. Default: unlimited. |
+| `low_latency` | no | `true` copies every read at once instead of batching busy streams (see [Batching](#batching-busy-streams)). Default: `false`. |
 
 Speed limits exist only in config files, not on the command line. When both
 are set, both are enforced: a connection never exceeds its own cap, and all
@@ -463,6 +464,27 @@ shows only `splice` calls carrying data, no `read` or `write`.
 
 macOS, FreeBSD and Windows have no socket-to-socket splice, so there
 pf-simple uses a read/write loop with a 64 KiB buffer.
+
+### Batching busy streams
+
+A stream that arrives a few packets at a time costs a wakeup and two splices
+per chunk, however small the chunk. So on Linux, when a read comes back short
+in the middle of a stream, pf-simple waits 5 ms, tops the pipe up once, and
+copies what is there. Each direction decides on its own, from its own reads:
+
+- A read that fills the pipe is copied at once. From a network card the pipe
+  holds 16 packets (about 23 KB at MTU 1500), locally 64 KiB; pf-simple
+  measures which every 100 ms.
+- A wait that catches nothing turns waiting off: nothing kept arriving, as
+  with a request waiting for its reply. Every 100 ms it is tried again.
+- Reads more than 5 ms apart are separate messages and never wait.
+
+Over a 1 Gbit/s LAN, 10 connections at 20 Mbit/s each used 4.5 s of CPU in
+12 s without batching and 1.1 s with it, with 7 times fewer system calls; one
+connection still ran at line rate. Request/reply round trips are unchanged
+except for the 100 ms retry, which can hold one message 5 ms. Set
+`low_latency = true` on a listener (or tick Low latency in the console) when
+that matters more than CPU.
 
 ## Performance test (localhost to localhost)
 

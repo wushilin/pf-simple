@@ -54,7 +54,7 @@
           },
           "version": {
            "type": "string",
-           "example": "0.9.1",
+           "example": "0.10.0",
            "description": "pf-simple build version"
           }
          }
@@ -226,7 +226,8 @@
         "target": "10.0.0.6:8080",
         "maxConnections": 0,
         "totalSpeed": "",
-        "perConnSpeed": ""
+        "perConnSpeed": "",
+        "lowLatency": false
        }
       }
      }
@@ -305,7 +306,8 @@
         "target": "10.0.0.6:8080",
         "maxConnections": 0,
         "totalSpeed": "",
-        "perConnSpeed": ""
+        "perConnSpeed": "",
+        "lowLatency": false
        }
       }
      }
@@ -450,7 +452,8 @@
         "target": "10.0.0.6:8080",
         "maxConnections": 0,
         "totalSpeed": "",
-        "perConnSpeed": ""
+        "perConnSpeed": "",
+        "lowLatency": false
        }
       }
      }
@@ -920,6 +923,10 @@
      "perConnSpeed": {
       "type": "string",
       "description": "Per-connection per-direction cap, e.g. 15MiB/s; empty = unlimited"
+     },
+     "lowLatency": {
+      "type": "boolean",
+      "description": "Copy every read at once instead of batching busy streams (Linux); default false"
      }
     }
    },
@@ -993,6 +1000,10 @@
      "perConnSpeed": {
       "type": "number",
       "description": "bytes/s per direction; 0 = unlimited"
+     },
+     "lowLatency": {
+      "type": "boolean",
+      "description": "Every read is copied at once"
      }
     }
    },

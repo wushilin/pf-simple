@@ -51,6 +51,10 @@ type listenerSpec struct {
 	MaxConnections int64  `toml:"max_connections,omitzero" json:"maxConnections"`
 	TotalSpeed     string `toml:"total_speed,omitempty" json:"totalSpeed"`
 	PerConnSpeed   string `toml:"per_connection_max_speed,omitempty" json:"perConnSpeed"`
+	// LowLatency copies every read at once. Otherwise a short read in a
+	// stream may wait up to 5ms for more, so busy streams move in fewer,
+	// larger chunks (Linux only; see copyStream).
+	LowLatency bool `toml:"low_latency,omitempty" json:"lowLatency"`
 	// Enabled is false for a listener stopped in the console; absent means
 	// enabled. The form never sends it.
 	Enabled *bool `toml:"enabled,omitempty" json:"-"`
@@ -101,6 +105,7 @@ func buildForwarding(spec listenerSpec) (forwarding, listenerSpec, error) {
 	}
 	fw.stats.name = spec.Name
 	fw.stats.maxConns = spec.MaxConnections
+	fw.stats.lowLatency = spec.LowLatency
 	for _, lim := range []struct {
 		key   string
 		value string

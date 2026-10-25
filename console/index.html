@@ -134,6 +134,7 @@
       <label class="field"><span>Max connections <em>optional</em></span><input id="f-max" type="number" min="0" step="1" inputmode="numeric" placeholder="unlimited"></label>
       <label class="field"><span>Total speed <em>optional</em></span><input id="f-total" placeholder="unlimited, e.g. 1GiB/s"></label>
       <label class="field wide"><span>Per-connection max speed <em>optional</em></span><input id="f-perconn" placeholder="unlimited, e.g. 15MiB/s"></label>
+      <label class="check wide"><input id="f-lowlat" type="checkbox"><span>Low latency <em>copy every read at once; for latency-sensitive traffic. Otherwise busy streams may wait up to 5 ms to batch, which saves CPU.</em></span></label>
     </div>
     <p class="editor-note">Speeds apply to each direction. Units: B, KB, MB, GB, KiB, MiB, GiB, or Kbit, Mbit, Gbit, optionally with /s.</p>
     <p class="editor-error" id="editor-error" role="alert"></p>

@@ -34,6 +34,7 @@ target = "10.0.0.6:9030"
 max_connections = 200              # optional; further clients get an immediate reset
 total_speed = "1GiB/s"             # optional; shared by all pipes on this listener
 per_connection_max_speed = "15MiB/s"  # optional; the cap for each pipe
+# low_latency = true               # optional; copy every read at once (see below)
 
 # Speeds are optional and unlimited by default. Both are enforced together:
 # a pipe never exceeds its own cap, and all pipes together never exceed the
@@ -43,6 +44,11 @@ per_connection_max_speed = "15MiB/s"  # optional; the cap for each pipe
 # Units: B, KB, MB, GB (1000-based) and KiB, MiB, GiB (1024-based), or bit
 # rates bit, Kbit, Mbit, Gbit (also Kbps, Mbps, Gbps); "/s" is optional.
 # Examples: "512B/s", "14KiB/s", "100Mbit", "1GiB/s".
+
+# low_latency (Linux) trades CPU for latency. By default a short read in a busy
+# stream may wait up to 5ms for more, so the stream moves in fewer, larger
+# chunks with far fewer system calls; request/reply traffic is rarely held.
+# Set low_latency = true for traffic where every millisecond counts.
 
 # Without a name the console shows the listen address, as on the command line.
 [[forward]]
