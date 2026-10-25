@@ -347,7 +347,7 @@ function buildListener(l) {
   const limConn = el("span", "chip limit");
   const lowLat = el("span", "chip limit", "low latency");
   lowLat.title = "low_latency: every read is copied at once, never held to batch";
-  chips.append(status, active, accepted, failed, refused, limTotal, limConn, lowLat, lowLat);
+  chips.append(status, active, accepted, failed, refused, limTotal, limConn, lowLat);
   const line = el("div", "route-line");
   line.append(lname, listen, el("span", "arrow", "→"), target);
   route.append(line, chips);
@@ -400,7 +400,7 @@ function buildListener(l) {
 
   card.append(head, body);
   return {
-    id: l.id, data: l, card, head, lname, listen, target, status, active, accepted, failed, refused, limTotal, limConn,
+    id: l.id, data: l, card, head, lname, listen, target, status, active, accepted, failed, refused, limTotal, limConn, lowLat,
     spark, tx, rx, totalUp, totalDown, toggleBtn, toggleLabel, editBtn, delBtn, delLabel,
     body, thead, empty, sleepy, emptyText, more, shown: [],
   };
