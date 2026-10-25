@@ -11,7 +11,7 @@
 
 const $ = (id) => document.getElementById(id);
 const CSRF = { "X-PF-Console": "1" };
-const RATE_WINDOW_MS = 1500; // a busy flow's rate covers at least this long
+const RATE_WINDOW_MS = 5000; // a busy flow's rate is averaged over at least this long
 const RATE_MAX_SPAN_MS = 60000; // a slow flow's rate covers at most this long
 const RATE_MAX_SAMPLES = 64;
 const PUSH_MS = 400; // the server's pushInterval
@@ -55,6 +55,15 @@ function fmtRate(bytesPerSec) {
   while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
   if (v < 0.5 && i === 0) return "0 b/s";
   return (i === 0 ? v.toFixed(0) : v.toFixed(v < 10 ? 2 : v < 100 ? 1 : 0)) + " " + u[i];
+}
+
+// fmtByteRate formats a configured limit in bytes per second with binary
+// units, as the server's log does: 12.5 B/s, 15 MiB/s.
+function fmtByteRate(v) {
+  const u = ["B/s", "KiB/s", "MiB/s", "GiB/s"];
+  let i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${Math.round(v * 100) / 100} ${u[i]}`;
 }
 
 function fmtAge(ms) {
@@ -739,10 +748,10 @@ function paint() {
     setText(lr.refused, `${l.rejected} refused`);
     lr.refused.hidden = !l.rejected;
     lr.refused.title = "Connections reset because max_connections was reached";
-    setText(lr.limTotal, `max ${fmtBytes(l.totalSpeed)}/s total`);
+    setText(lr.limTotal, `max ${fmtByteRate(l.totalSpeed)} total`);
     lr.limTotal.hidden = !l.totalSpeed;
     lr.limTotal.title = "total_speed: shared by all pipes on this listener, in each direction";
-    setText(lr.limConn, `max ${fmtBytes(l.perConnSpeed)}/s per pipe`);
+    setText(lr.limConn, `max ${fmtByteRate(l.perConnSpeed)} per pipe`);
     lr.limConn.hidden = !l.perConnSpeed;
     lr.limConn.title = "per_connection_max_speed: the cap for each pipe, in each direction";
     lr.lowLat.hidden = !l.lowLatency;
