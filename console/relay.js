@@ -1,10 +1,13 @@
 "use strict";
 
-// The Relay hub tab. Each serve token is a group that opens to show the
-// words registered with it and, for the ones being served right now, their
-// tunnel and its open connections with live speeds. The data arrives with
-// each console push as state.relay, which is absent when the hub is off;
-// the tab's button is hidden then.
+// The Relay hub tab, three levels deep: each serve token is a group; under
+// it are the backends it is serving right now, each shown as its word and
+// the target that word leads to; and under each backend are its open
+// connections with live speeds. A backend is listed from the moment it
+// registers, connections or not, and a token that is serving opens on its
+// own. Words bound to the token that nobody is serving follow in a list of
+// their own. The data arrives with each console push as state.relay, which
+// is absent when the hub is off; the tab's button is hidden then.
 //
 // The server calls a token's holder a tenant (state.relay.tenants, and
 // "tenant" in the API paths); the page calls it a token.
@@ -15,7 +18,7 @@ const RELAY_ORPHANS = "\u0000orphans"; // group for words whose token is gone
 const rl = {
   groups: new Map(), // token name -> group refs
   words: new Map(), // word id -> card refs
-  open: new Set(), // names of the groups that are expanded
+  open: new Map(), // token name -> expanded; absent until it serves or is clicked
   meters: new Map(), // "wu1", "wd1", "su7", "sd7" -> RateMeter
   armed: new Map(), // "action:id" -> disarm timer
   busy: new Set(),
@@ -98,8 +101,12 @@ function relayGroup(name) {
     tx: el("span", "relay-rate tx num"), rx: el("span", "relay-rate rx num"),
     body: el("div", "relay-group-body"),
     note: el("div", "relay-none"),
-    words: el("div"),
+    liveLabel: el("div", "relay-section", "Serving now"),
+    live: el("div"),
+    idleLabel: el("div", "relay-section", "Not served"),
+    idle: el("div"),
   };
+  refs.idleLabel.title = "Words bound to this token that nobody is serving right now";
   facts.append(refs.summary, refs.tx, refs.rx);
   const actions = el("div", "relay-actions");
   if (!orphans) {
@@ -115,35 +122,41 @@ function relayGroup(name) {
         .catch((e) => toast(`Could not delete ${name}: ${e.message}`, true))));
   }
   head.append(toggle, actions);
-  refs.body.append(refs.words, refs.note);
+  refs.body.append(refs.liveLabel, refs.live, refs.idleLabel, refs.idle, refs.note);
   card.append(head, refs.body);
   toggle.addEventListener("click", () => {
-    if (rl.open.has(name)) rl.open.delete(name); else rl.open.add(name);
+    rl.open.set(name, !rl.open.get(name));
     if (ui.state) relayPaint(ui.state.relay);
   });
   return refs;
 }
 
-// ---------- words and their connections ----------
+// ---------- backends (served words) and their connections ----------
 
 function relayCard(w) {
   const card = el("div", "relay-word");
   const head = el("div", "relay-head");
   const chip = el("span", "relay-chip");
+  const route = el("span", "relay-route");
+  const word = el("span", "relay-route-word", w.word);
+  word.title = "The secret word both sides type";
+  const arrow = el("span", "relay-route-arrow", "\u2192");
+  const target = el("span", "relay-route-target");
+  target.title = "The backend: where the serving side sends this word's connections";
+  route.append(word, arrow, target);
   const title = el("span", "relay-word-title");
-  const name = el("span", "relay-name", w.word);
-  name.title = "The secret word both sides type";
+  title.title = "The name the serving side gave this tunnel";
   const actions = el("div", "relay-actions");
   const reset = relayButton("Reset", "End this tunnel and its connections; the serving side registers again on its own");
   const clear = relayButton("Clear binding", "Remove the binding of this word to its token, and end its tunnel", true);
   actions.append(reset, clear);
-  head.append(chip, title, name, actions);
+  head.append(chip, route, title, actions);
 
   const meta = el("div", "relay-meta");
   const refs = {
-    card, chip, title, reset, clear, group: null, sessions: new Map(),
+    card, chip, title, arrow, target, reset, clear, sessions: new Map(),
     owner: relayFact(meta, "Token"),
-    route: relayFact(meta, "Serving"),
+    from: relayFact(meta, "Served from"),
     since: relayFact(meta, ""),
     conns: relayFact(meta, "Connections"),
     tx: relayFact(meta, "To serving side", "tx"),
@@ -196,14 +209,17 @@ function relaySessionRow(p) {
 }
 
 function paintRelayWord(c, w, now) {
-  setText(c.chip, w.live ? "Live" : "Offline");
+  setText(c.chip, w.live ? "Serving" : "Offline");
   c.chip.className = w.live ? "relay-chip live" : "relay-chip";
+  c.card.classList.toggle("idle", !w.live);
   setText(c.title, w.name || "(unnamed)");
+  c.arrow.hidden = c.target.hidden = !w.live;
+  setText(c.target, w.live ? w.target || "(target not given)" : "");
   c.reset.hidden = !w.live;
   c.owner.wrap.hidden = !w.orphan; // inside its token's group otherwise
   setText(c.owner.value, `${w.owner} (deleted)`);
-  c.route.wrap.hidden = !w.live;
-  setText(c.route.value, w.live ? `${w.target} from ${w.serveAddr}` : "");
+  c.from.wrap.hidden = !w.live;
+  setText(c.from.value, w.live ? w.serveAddr : "");
   setText(c.since.wrap.firstChild, w.live ? "Up " : "Last served ");
   setText(c.since.value, w.live ? fmtAge(now - w.since) : fmtClock(w.lastServed));
   for (const f of [c.conns, c.tx, c.rx, c.up, c.down]) f.wrap.hidden = !w.live;
@@ -239,10 +255,9 @@ function paintRelayWord(c, w, now) {
     if (!keep.has(id)) { r.row.remove(); c.sessions.delete(id); }
   }
   c.rows.hidden = sessions.length === 0;
-  c.note.hidden = sessions.length > 0 && w.conns <= sessions.length;
-  setText(c.note, !w.live ? "Nobody is serving this word. Only its token may serve it again."
-    : sessions.length === 0 ? "No open connections. They show up here when someone connects with this word."
-      : `Showing the newest ${sessions.length} of ${w.conns} connections.`);
+  c.note.hidden = !w.live || (sessions.length > 0 && w.conns <= sessions.length);
+  setText(c.note, sessions.length === 0 ? "No open connections. They show up here when someone connects with this word."
+    : `Showing the newest ${sessions.length} of ${w.conns} connections.`);
 }
 
 // ---------- the new-token panel ----------
@@ -309,6 +324,7 @@ function relayPaint(relay) {
   const box = $("relay-groups");
   const seenWords = new Set();
   let anchor = null, liveAll = 0, connsAll = 0;
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many || one + "s"}`;
   for (const name of names) {
     let g = rl.groups.get(name);
     if (!g) { g = relayGroup(name); rl.groups.set(name, g); }
@@ -318,6 +334,7 @@ function relayPaint(relay) {
 
     const words = byGroup.get(name);
     let live = 0, conns = 0, tx = 0, rx = 0;
+    let liveAt = null, idleAt = null; // the last card placed in each list
     for (const w of words) {
       seenWords.add(w.id);
       if (w.live) {
@@ -327,19 +344,33 @@ function relayPaint(relay) {
       }
       let c = rl.words.get(w.id);
       if (!c) { c = relayCard(w); rl.words.set(w.id, c); }
-      if (c.group !== name) { g.words.append(c.card); c.group = name; }
+      // Keep each list in the server's order as words move between them.
+      const list = w.live ? g.live : g.idle;
+      const at = w.live ? liveAt : idleAt;
+      const want = at ? at.nextSibling : list.firstChild;
+      if (want !== c.card) list.insertBefore(c.card, want);
+      if (w.live) liveAt = c.card; else idleAt = c.card;
     }
     liveAll += live; connsAll += conns;
-    const open = rl.open.has(name);
+    const idle = words.length - live;
+    // A token that is serving opens on its own, so a backend shows before
+    // anyone has connected to it; after that the choice is the viewer's.
+    if (live > 0 && !rl.open.has(name)) rl.open.set(name, true);
+    const open = !!rl.open.get(name);
     g.toggle.setAttribute("aria-expanded", String(open));
     g.body.hidden = !open;
-    setText(g.summary, `${words.length} word${words.length === 1 ? "" : "s"} · ${live} live · ${conns} connection${conns === 1 ? "" : "s"}`);
+    setText(g.summary, (live ? `Serving ${plural(live, "backend")}` : "Not serving")
+      + (idle ? ` · ${plural(idle, "word")} not served` : "")
+      + (live ? ` · ${plural(conns, "connection")}` : ""));
     g.tx.hidden = g.rx.hidden = live === 0;
     setText(g.tx, "↑ " + fmtRate(tx));
     setText(g.rx, "↓ " + fmtRate(rx));
     if (g.rotate) g.rotate.hidden = g.del.hidden = !relay.manage;
-    g.note.hidden = words.length > 0;
-    setText(g.note, "No words yet. One appears when pf-client serve registers it with this token.");
+    g.liveLabel.hidden = live === 0;
+    g.idleLabel.hidden = idle === 0;
+    g.note.hidden = live > 0;
+    setText(g.note, words.length ? "Not serving anything right now. A backend appears here as soon as pf-client serve registers it."
+      : "No words yet. One appears when pf-client serve registers it with this token.");
     if (open) for (const w of words) paintRelayWord(rl.words.get(w.id), w, now);
   }
   for (const [id, c] of rl.words) {
@@ -351,11 +382,13 @@ function relayPaint(relay) {
 
   $("tenant-add").hidden = !relay.manage;
   if (!relay.manage) $("tenant-form").hidden = true;
-  setText($("tenant-note"), relay.manage ? "Each token lets one holder run pf-client serve. Open a token to see its words and connections."
+  setText($("tenant-note"), relay.manage ? "Each token lets one holder run pf-client serve. Under a token are the backends it serves, and under each its connections."
     : "Set with --tunnel. Start pf-simple from a config file to manage tokens here.");
   $("relay-empty").hidden = names.length > 0;
   const count = relay.tenants.length;
-  setText($("relay-note"), `${count} token${count === 1 ? "" : "s"} · ${relay.words.length} word${relay.words.length === 1 ? "" : "s"} bound · ${liveAll} live · ${connsAll} open connection${connsAll === 1 ? "" : "s"}`);
+  const idleAll = relay.words.length - liveAll;
+  setText($("relay-note"), `${plural(count, "token")} · ${plural(liveAll, "backend")} serving · ${plural(connsAll, "open connection")}`
+    + (idleAll ? ` · ${plural(idleAll, "word")} not served` : ""));
 }
 
 // Ages and speeds tick between pushes.
