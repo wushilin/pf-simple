@@ -45,9 +45,15 @@ want to use it, with the same word:
           who guesses the word can connect, so prefer a random one. The
           first serve token to register a word owns it until the server's
           admin clears it.
-<target>  host:port, or a port alone for 127.0.0.1
+<target>  host:port, or a port alone for 127.0.0.1;
+          "stdio" or "-" offers this program's own stdin/stdout instead, to
+          one connection, and then exits: a pipe between two machines
+            tar c dir | pf-client serve <server> stdio --name copy
+            pf-client connect <server> <word> stdio | tar x
 <listen>  host:port, or a port alone to listen on 127.0.0.1 only;
-          "-" uses stdin/stdout for one connection (ssh ProxyCommand)
+          "stdio" or "-" carries one connection over stdin/stdout and
+          then exits, silent unless it fails, for ssh:
+            ssh -o ProxyCommand="pf-client connect <server> <word> stdio" user@host
 
 Flags:
   -c, --config <file>    read everything from a TOML file instead of the
@@ -64,8 +70,9 @@ Flags:
 Without -k, a certificate that does not verify is shown with its fingerprint
 and you are asked whether to trust it for this run.
 
-Both commands run until interrupted and recover on their own, so they can
-be started once and left. "serve" registers again whenever it loses the
+With stdio a command carries one connection and exits. Otherwise both
+commands run until interrupted and recover on their own, so they can be
+started once and left. "serve" registers again whenever it loses the
 server, pausing 1s, 2s, 4s ... up to 30s between attempts, and starting over
 from 1s once it has been up for a minute. "connect" keeps listening whether
 or not the tunnel is up, and says in its log when that changes. Only a
@@ -89,7 +96,7 @@ type options struct {
 	server     string
 	word       string
 	generated  bool   // the word was made up here, so it must be shown
-	endpoint   string // serve: the target; connect: the listen address or "-"
+	endpoint   string // serve: the target; connect: the listen address; "-" for stdio
 	name       string
 	serveToken string
 	insecure   bool
@@ -205,10 +212,14 @@ func parse(args []string, envToken string, out io.Writer) (*options, error) {
 			}
 			o.generated = true
 		}
-		if o.endpoint, err = hostPort(o.endpoint, "target"); err != nil {
+		if isStdio(o.endpoint) {
+			o.endpoint = "-"
+		} else if o.endpoint, err = hostPort(o.endpoint, "target"); err != nil {
 			return nil, err
 		}
-	} else if o.endpoint != "-" {
+	} else if isStdio(o.endpoint) {
+		o.endpoint = "-"
+	} else {
 		if o.endpoint, err = hostPort(o.endpoint, "listen address"); err != nil {
 			return nil, err
 		}
@@ -270,7 +281,7 @@ func run(args []string) error {
 		}
 		return err
 	}
-	stdio := o.command == "connect" && o.endpoint == "-"
+	stdio := o.endpoint == "-"
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -287,16 +298,34 @@ func run(args []string) error {
 
 	if o.command == "serve" {
 		if o.generated {
-			log.Printf("word: %s   (connect with: pf-client connect %s %s <listen>)", o.word, o.server, o.word)
+			listen := "<listen>"
+			if stdio {
+				listen = "stdio"
+			}
+			log.Printf("word: %s   (connect with: pf-client connect %s %s %s)", o.word, o.server, o.word, listen)
+		}
+		if stdio {
+			// Stdin can be read once: one connection, and its end is ours.
+			err := client.ServeOne(ctx, tunnel.Stdio{In: os.Stdin, Out: os.Stdout})
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
 		}
 		return client.Serve(ctx, o.endpoint)
 	}
 	if stdio {
-		// One connection for one caller, such as ssh: fail at once.
+		// One connection for one caller, such as ssh: fail at once. Stderr
+		// is the caller's terminal, so say nothing unless it goes wrong.
+		client.Logf = func(string, ...any) {}
 		if err := client.Check(ctx); err != nil {
 			return err
 		}
-		return client.ConnectOne(ctx, tunnel.Stdio{In: os.Stdin, Out: os.Stdout})
+		err := client.ConnectOne(ctx, tunnel.Stdio{In: os.Stdin, Out: os.Stdout})
+		if ctx.Err() != nil { // stopped by the caller: not a failure
+			return nil
+		}
+		return err
 	}
 	// Listen whether or not the tunnel is up yet, and keep listening when
 	// it goes away: each connection is carried if it can be at that moment.
@@ -335,6 +364,9 @@ func trust(ctx context.Context, server string, insecure, mayAsk bool) (*tls.Conf
 	}
 	return nil, errors.New("certificate not trusted")
 }
+
+// isStdio reports whether an endpoint names stdin/stdout.
+func isStdio(s string) bool { return s == "-" || strings.EqualFold(s, "stdio") }
 
 func isPort(s string) bool {
 	n, err := strconv.Atoi(s)

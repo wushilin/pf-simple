@@ -16,6 +16,7 @@ server = "https://relay.example.com/"
 word = "k3f9-x2mq-7hpa"
 
 # serve: what to forward to. host:port, or a port alone for 127.0.0.1.
+# "stdio" or "-" offers pf-client's own stdin/stdout to one connection.
 target = "192.168.44.132:22"
 # serve: what the tunnel is called in the server's console.
 name = "Office SSH"
@@ -24,7 +25,7 @@ name = "Office SSH"
 serve_token = "change-me-to-the-token-from-the-console"
 
 # connect: where to listen. host:port, or a port alone for 127.0.0.1 only;
-# "-" carries one connection over stdin/stdout.
+# "stdio" or "-" carries one connection over stdin/stdout (ssh ProxyCommand).
 listen = "2222"
 
 # Skip the check of the server's certificate (like -k).

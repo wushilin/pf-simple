@@ -244,6 +244,65 @@ var (
 // start, is retried with a growing pause. The connections that were open
 // end with a lost relay, and the connecting side opens new ones.
 func (c *Client) Serve(ctx context.Context, target string) error {
+	return c.serve(ctx, target, func(id string) { c.serveConn(ctx, id, target) })
+}
+
+// StdioTarget is the target a serving side names when it offers its own
+// stdin/stdout instead of a TCP port.
+const StdioTarget = "stdio"
+
+// ServeOne offers local, such as stdin/stdout, as the tunnel's only
+// connection: it registers and waits like Serve, carries the first
+// connection that arrives, and returns when that one ends, with nil if it
+// ended cleanly. local can be read once, so nothing is retried after the
+// connection has started, and others arriving meanwhile are refused.
+func (c *Client) ServeOne(ctx context.Context, local localConn) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var taken atomic.Bool
+	done := make(chan error, 1)
+	open := func(id string) {
+		h := c.header(id)
+		if !taken.CompareAndSwap(false, true) {
+			c.Logf("connection %s refused: this side carries one connection, and has one", short(id))
+			h.Set(HeaderError, "the serving side carries a single connection and already has one")
+			_ = c.get(ctx, "accept", h)
+			return
+		}
+		ws, err := c.dial(ctx, "accept", h)
+		if err != nil {
+			// Nothing was read from local yet, so the next one may have it.
+			c.Logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
+			taken.Store(false)
+			return
+		}
+		c.Logf("connection %s open: tunnel -> stdin/stdout", short(id))
+		started := time.Now()
+		stream := NewStream(ws)
+		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
+		defer stop()
+		e := bridge(ctx, stream, local, partyServeStdio)
+		c.logEnd(short(id), started, e, true)
+		if e.err != nil {
+			done <- &endError{e.reason, e.err}
+			return
+		}
+		done <- nil
+	}
+	failed := make(chan error, 1)
+	go func() { failed <- c.serve(ctx, StdioTarget, open) }()
+	select {
+	case err := <-done:
+		return err
+	case err := <-failed: // refused outright, or ctx ended while waiting
+		_ = local.Close()
+		return err
+	}
+}
+
+// serve keeps a control channel registered and calls open, on its own
+// goroutine, for each connection the relay asks for.
+func (c *Client) serve(ctx context.Context, target string, open func(id string)) error {
 	h := c.header("")
 	h.Set(HeaderTarget, target)
 	h.Set(HeaderServe, c.ServeToken)
@@ -271,7 +330,7 @@ func (c *Client) Serve(ctx context.Context, target string) error {
 			}
 			served, attempt = true, 0
 			started := time.Now()
-			err = c.control(ctx, ws, target)
+			err = c.control(ctx, ws, open)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -319,7 +378,7 @@ func (c *Client) Watch(ctx context.Context) {
 }
 
 // control runs one control channel until it fails.
-func (c *Client) control(ctx context.Context, ws *Conn, target string) error {
+func (c *Client) control(ctx context.Context, ws *Conn, open func(id string)) error {
 	defer ws.Close()
 	ws.SetTimeouts(ControlSilence, WriteTimeout)
 	stop := make(chan struct{})
@@ -350,7 +409,7 @@ func (c *Client) control(ctx context.Context, ws *Conn, target string) error {
 		}
 		var msg ControlMessage
 		if op == OpText && json.Unmarshal(payload, &msg) == nil && msg.Open != "" {
-			go c.serveConn(ctx, msg.Open, target)
+			go open(msg.Open)
 		}
 	}
 }
@@ -473,6 +532,8 @@ type party struct {
 var (
 	partyConnect = party{self: "pf-client connect", local: "the application", far: "the target"}
 	partyServe   = party{self: "pf-client serve", local: "the target", far: "the application"}
+	// With stdin/stdout on the serving side, that is the target.
+	partyServeStdio = party{self: "pf-client serve", local: "stdin/stdout", far: "the application"}
 )
 
 // linkReason words a failure of the stream to the server. A *RemoteError is
@@ -611,10 +672,21 @@ func (c *Client) Connect(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// ConnectOne carries a single connection, and logs how it went.
+// ConnectOne carries a single connection, and logs how it went. An error
+// it returns reads as the reason the connection ended, naming the hop.
 func (c *Client) ConnectOne(ctx context.Context, local localConn) error {
 	return c.carry(ctx, local, "stdin/stdout")
 }
+
+// endError is a connection that ended badly: it reads as the reason, and
+// unwraps to the underlying error.
+type endError struct {
+	reason string
+	err    error
+}
+
+func (e *endError) Error() string { return e.reason }
+func (e *endError) Unwrap() error { return e.err }
 
 func (c *Client) carry(ctx context.Context, local localConn, from string) error {
 	ws, err := c.dial(ctx, "connect", c.header(""))
@@ -631,7 +703,10 @@ func (c *Client) carry(ctx context.Context, local localConn, from string) error 
 	defer stop()
 	e := bridge(ctx, stream, local, partyConnect)
 	c.logEnd(id, started, e, false)
-	return e.err
+	if e.err != nil {
+		return &endError{e.reason, e.err}
+	}
+	return nil
 }
 
 // Stdio is standard input and output as one connection, for use as an ssh
