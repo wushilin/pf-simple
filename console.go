@@ -80,6 +80,7 @@ type consoleServer struct {
 	password   string
 	started    time.Time
 	mgr        *manager
+	tunnels    *tunnelHub // nil unless tunnels are on
 	cookieName string
 
 	ctx context.Context // canceled on shutdown; ends WebSocket sessions
@@ -134,6 +135,9 @@ func (s *consoleServer) handler() http.Handler {
 	mux.HandleFunc("POST "+consolePrefix+"/api/listeners/{id}/{action}", s.requireCSRF(s.requireAuth(s.handleListenerAction)))
 	mux.HandleFunc("POST "+consolePrefix+"/api/pipes/{id}/stop", s.requireCSRF(s.requireAuth(s.handleStop)))
 	s.apiRoutes(mux)
+	if s.tunnels != nil {
+		s.tunnels.routes(mux)
+	}
 	return securityHeaders(mux)
 }
 
@@ -149,6 +153,9 @@ func (s *consoleServer) serve(ctx context.Context, ln net.Listener) {
 	}
 	go func() {
 		<-ctx.Done()
+		if s.tunnels != nil {
+			s.tunnels.closeAll()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
@@ -303,6 +310,7 @@ type consoleState struct {
 	Started   int64              `json:"started"`
 	Listeners []listenerSnapshot `json:"listeners"`
 	Manage    manageInfo         `json:"manage"`
+	Relay     *relayState        `json:"relay,omitempty"` // absent when tunnels are off
 }
 
 func (s *consoleServer) handleState(w http.ResponseWriter, r *http.Request) {
@@ -376,7 +384,7 @@ func (s *consoleServer) openSocket(w http.ResponseWriter, r *http.Request) (ws *
 	// The client's side: answer pings, notice when it goes away.
 	gone := make(chan struct{})
 	go func() {
-		_ = ws.readLoop()
+		_ = ws.ReadLoop()
 		close(gone)
 	}()
 	q := make(chan struct{})
@@ -387,7 +395,7 @@ func (s *consoleServer) openSocket(w http.ResponseWriter, r *http.Request) (ws *
 		}
 		select {
 		case <-s.ctx.Done():
-			_ = ws.writeFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
+			_ = ws.WriteFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
 		case <-revoked:
 			_ = ws.Close()
 		case <-expiry:
@@ -425,7 +433,7 @@ func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 			case <-quit:
 			case <-done:
 			case <-ping.C:
-				if ws.writeFrame(wsOpPing, nil) == nil {
+				if ws.WriteFrame(wsOpPing, nil) == nil {
 					continue
 				}
 			}
@@ -437,7 +445,7 @@ func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 	// A new subscriber starts at the queue's tail, so send the current state
 	// first; frames published from now on follow.
 	data, err := json.Marshal(s.state())
-	if err != nil || ws.writeFrame(wsOpText, data) != nil {
+	if err != nil || ws.WriteFrame(wsOpText, data) != nil {
 		return
 	}
 	for {
@@ -445,14 +453,20 @@ func (s *consoleServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 		if err != nil {
 			return // closed by the watcher, the ping loop, or server shutdown
 		}
-		if ws.writeFrame(wsOpText, frame) != nil {
+		if ws.WriteFrame(wsOpText, frame) != nil {
 			return
 		}
 	}
 }
 
 func (s *consoleServer) state() consoleState {
+	var relay *relayState
+	if s.tunnels != nil {
+		snap := s.tunnels.snapshot()
+		relay = &snap
+	}
 	return consoleState{
+		Relay:     relay,
 		Version:   version,
 		Host:      s.host,
 		Now:       time.Now().UnixMilli(),

@@ -20,6 +20,15 @@ password = "change-me"
 # allow_bind_hosts = ["0.0.0.0"]
 # allow_bind_ports = "18000-19999"
 
+# Optional relay hub for ad-hoc tunnels between two pf-client processes
+# ("pf-client serve" on one machine, "pf-client connect" on another). It is
+# served on the console's own listener, so it needs [console], and pf-client
+# only speaks https: put a TLS reverse proxy in front. The table alone turns
+# the hub on. Serve tokens, one per holder, are added in the console's Relay
+# hub tab, which writes each here as a [[tunnel.tenant]] with its name and
+# the token's SHA-256; the token itself is shown once and never stored.
+# [tunnel]
+
 # One [[forward]] table per listener. listen and target are required. A file
 # may also have no forwards and only a [console].
 [[forward]]

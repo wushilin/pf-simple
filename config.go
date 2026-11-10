@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/wushilin/pf-simple/internal/tunnel"
 )
 
 // settings is what pf-simple runs with, whether it came from flags or from a
@@ -20,6 +24,28 @@ type settings struct {
 	// consoleRaw is [console] exactly as written.
 	configPath string
 	consoleRaw *consoleTable
+	tunnel     *tunnelSettings // nil when tunnels are off
+	tunnelRaw  *tunnelTable
+}
+
+type tunnelSettings struct {
+	tenants []tenantSpec // who may run "pf-client serve" here
+}
+
+// tunnelTable is the [tunnel] table; its presence turns the relay hub on,
+// unless it says enabled = false. Enabled is always written back, so the
+// table survives a rewrite with nothing else in it.
+type tunnelTable struct {
+	Enabled *bool        `toml:"enabled"`
+	Tenants []tenantSpec `toml:"tenant,omitempty"`
+}
+
+// tenantSpec is one [[tunnel.tenant]]: a name and the SHA-256 of its serve
+// token. The console creates them and shows the token once; the file never
+// holds it.
+type tenantSpec struct {
+	Name        string `toml:"name"`
+	TokenSHA256 string `toml:"token_sha256"`
 }
 
 type consoleSettings struct {
@@ -63,6 +89,7 @@ type listenerSpec struct {
 // fileConfig mirrors the TOML file. See pf-simple.example.toml.
 type fileConfig struct {
 	Console *consoleTable  `toml:"console,omitempty"`
+	Tunnel  *tunnelTable   `toml:"tunnel,omitempty"`
 	Forward []listenerSpec `toml:"forward"`
 }
 
@@ -190,10 +217,48 @@ func loadConfig(path, envPassword string) (settings, error) {
 		}
 		s.console.manage = policy
 	}
+	if t := fc.Tunnel; t != nil {
+		if s.console == nil {
+			return settings{}, fmt.Errorf("config %s: [tunnel] needs a [console]: tunnels are served on the console's address", path)
+		}
+		if err := checkTenants(t.Tenants); err != nil {
+			return settings{}, fmt.Errorf("config %s: [tunnel]: %w", path, err)
+		}
+		if t.Enabled == nil {
+			on := true
+			t.Enabled = &on
+		}
+		if *t.Enabled {
+			s.tunnel = &tunnelSettings{tenants: t.Tenants}
+		}
+		s.tunnelRaw = t
+	}
 	if len(s.forwards) == 0 && s.console == nil {
 		return settings{}, fmt.Errorf("config %s: nothing to run: add a [[forward]] or a [console]", path)
 	}
 	return s, nil
+}
+
+// cliTenants turns --tunnel tokens into tenants named cli-1, cli-2, ...
+func cliTenants(tokens []string) ([]tenantSpec, error) {
+	specs := make([]tenantSpec, len(tokens))
+	for i, token := range tokens {
+		if err := tunnel.CheckSecret("serve token", token); err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256([]byte(token))
+		specs[i] = tenantSpec{Name: fmt.Sprintf("cli-%d", i+1), TokenSHA256: hex.EncodeToString(sum[:])}
+	}
+	return specs, checkTenants(specs)
+}
+
+// relayStatePath is where the hub keeps its reserved words: next to the
+// config file, which pf-simple already rewrites there.
+func relayStatePath(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	return strings.TrimSuffix(configPath, filepath.Ext(configPath)) + ".relay.json"
 }
 
 // checkWritableDir makes sure the console can later replace path atomically,
