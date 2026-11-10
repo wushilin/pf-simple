@@ -25,6 +25,11 @@ add, edit and delete listeners):
 
   pf-simple -c /etc/pf-simple.toml
 
+Relay hub for ad-hoc tunnels between two pf-client processes (needs a
+console; see pf-client -h):
+
+  pf-simple --console 18222@secret --tunnel <serve-token>
+
 --config/-c cannot be combined with any other flag or argument.
 pf-simple --version prints the version.
 
@@ -50,6 +55,8 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 	fs.Var(&forwards, "forward", "mapping `listen@target` (repeatable)")
 	fs.Var(&forwards, "f", "short for --forward `listen@target`")
 	fs.StringVar(&consoleValue, "console", "", "web console `listen[@password]`; password defaults to $PF_PASSWORD")
+	var serveTokens forwardsFlag
+	fs.Var(&serveTokens, "tunnel", "relay ad-hoc tunnels between pf-client processes; the value is a `serve-token` (32+ characters) for 'pf-client serve' (repeatable: tenants cli-1, cli-2, ...); needs --console. With -c, tenants are managed in the console instead")
 	fs.StringVar(&configPath, "config", "", "TOML config `file`; excludes every other flag")
 	fs.StringVar(&configShort, "c", "", "short for --config `file`")
 	fs.Usage = func() {
@@ -100,7 +107,18 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 	}
 
 	forwards = append(forwards, positional...)
-	if len(forwards) == 0 {
+	tunnelOn := len(serveTokens) > 0
+	var tenants []tenantSpec
+	if tunnelOn {
+		var err error
+		if tenants, err = cliTenants(serveTokens); err != nil {
+			return settings{}, fmt.Errorf("--tunnel: %w", err)
+		}
+	}
+	if tunnelOn && consoleValue == "" {
+		return settings{}, errors.New("--tunnel needs --console: tunnels are served on the console's address")
+	}
+	if len(forwards) == 0 && !tunnelOn {
 		if consoleValue != "" {
 			return settings{}, errors.New("a console alone cannot add listeners on the command line; give at least one listen@target, or use -c config.toml")
 		}
@@ -125,6 +143,9 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 			return settings{}, err
 		}
 		s.console = &consoleSettings{addr: addr, password: password}
+	}
+	if tunnelOn {
+		s.tunnel = &tunnelSettings{tenants: tenants}
 	}
 	return s, nil
 }

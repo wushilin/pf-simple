@@ -223,7 +223,7 @@ func (s *consoleServer) handleFlows(w http.ResponseWriter, r *http.Request) {
 
 	first := flows.snapshot(0, true)
 	data, err := json.Marshal(first)
-	if err != nil || ws.writeFrame(wsOpText, data) != nil {
+	if err != nil || ws.WriteFrame(wsOpText, data) != nil {
 		return
 	}
 	done := make(chan struct{})
@@ -242,7 +242,7 @@ func (s *consoleServer) handleFlows(w http.ResponseWriter, r *http.Request) {
 			case <-quit:
 			case <-done:
 			case <-ping.C:
-				if ws.writeFrame(wsOpPing, nil) == nil {
+				if ws.WriteFrame(wsOpPing, nil) == nil {
 					continue
 				}
 			case <-snap.C:
@@ -250,7 +250,7 @@ func (s *consoleServer) handleFlows(w http.ResponseWriter, r *http.Request) {
 				// closing while it was built is listed by one of them.
 				s := flows.snapshot(last-1000, false)
 				last = s.Now
-				if data, err := json.Marshal(s); err == nil && ws.writeFrame(wsOpText, data) == nil {
+				if data, err := json.Marshal(s); err == nil && ws.WriteFrame(wsOpText, data) == nil {
 					continue
 				}
 			}
@@ -277,7 +277,7 @@ func (s *consoleServer) handleFlows(w http.ResponseWriter, r *http.Request) {
 			msg.Write(more)
 		}
 		msg.WriteString("]}")
-		if ws.writeFrame(wsOpText, msg.Bytes()) != nil {
+		if ws.WriteFrame(wsOpText, msg.Bytes()) != nil {
 			return
 		}
 	}

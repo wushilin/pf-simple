@@ -203,6 +203,7 @@ type manager struct {
 	// configPath and consoleRaw are used to rewrite the config file.
 	configPath string
 	consoleRaw *consoleTable
+	tunnelRaw  *tunnelTable
 
 	mu     sync.Mutex
 	ctx    context.Context
@@ -235,6 +236,15 @@ func (m *manager) appendLocked(stats *listenerStats, source string, enabled bool
 	ml := &managedListener{stats: stats, source: source, enabled: enabled}
 	m.list = append(m.list, ml)
 	return ml
+}
+
+// allocID hands out a listener id for something the manager does not own: a
+// tunnel, so its connections are told apart in the flow log.
+func (m *manager) allocID() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextID++
+	return m.nextID - 1
 }
 
 func (m *manager) findLocked(id int) *managedListener {
@@ -550,11 +560,28 @@ func (m *manager) validate(spec listenerSpec, id int) (listenerSpec, error) {
 	return fw.stats.spec, nil
 }
 
+// saveTenants writes the relay hub's tenants into the config file. On
+// failure the file and the manager's copy stay as they were.
+func (m *manager) saveTenants(tenants []tenantSpec) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tunnelRaw == nil || m.configPath == "" {
+		return errNoManaging
+	}
+	old := m.tunnelRaw.Tenants
+	m.tunnelRaw.Tenants = tenants
+	if err := m.saveLocked(); err != nil {
+		m.tunnelRaw.Tenants = old
+		return err
+	}
+	return nil
+}
+
 // saveLocked rewrites the config file atomically: [console] exactly as
 // loaded, then every config listener in order. It writes a temporary file in
 // the same directory, fsyncs it, and renames it over the old one.
 func (m *manager) saveLocked() error {
-	fc := fileConfig{Console: m.consoleRaw}
+	fc := fileConfig{Console: m.consoleRaw, Tunnel: m.tunnelRaw}
 	for _, ml := range m.list {
 		if ml.source != sourceConfig {
 			continue

@@ -188,7 +188,7 @@ What the console may change depends on how pf-simple was started:
 | Delete a listener | no | yes, while stopped |
 
 On the command line, a console alone is refused, because it could not add
-anything. In a config file, `[console]` alone is fine: start it empty and add
+anything (unless `--tunnel` turns the relay hub on). In a config file, `[console]` alone is fine: start it empty and add
 listeners from the browser. Every change is written back to the config file.
 
 ```toml
@@ -223,6 +223,172 @@ allow_bind_ports = "18000-19999"
   it can create files in the config file's directory and refuses to start
   otherwise. Under systemd, keep the file in a `StateDirectory` (see
   [Running under systemd](#running-under-systemd)).
+
+## Relay hub: ad-hoc tunnels with pf-client
+
+Two machines that cannot reach each other, but can both reach a pf-simple
+server over HTTPS, can meet there. One runs `pf-client serve` next to the
+service; the other runs `pf-client connect` and gets the service on a local
+port:
+
+```sh
+# on the machine that can reach the target (here its own sshd)
+pf-client serve https://relay.example.com/ 22 --name "Office SSH" \
+    --serve-token "$PF_SERVE_TOKEN"
+# ... word: k3f9-x2mq-7hpa   (connect with: pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa <listen>)
+
+# on the machine that wants to use it
+pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa 2222
+ssh -p 2222 user@127.0.0.1
+```
+
+`serve` made up the word and printed it; give your own as
+`serve <server> <word> <target>` to keep the same one across restarts. A
+wrong word gets `access denied`; the right one gets
+`connected; listening on 127.0.0.1:2222`.
+
+Two secrets are involved:
+
+| Secret | Who has it | What it is for |
+| --- | --- | --- |
+| Serve token | One holder: whoever may run `serve` with it | Permission to register tunnels on this server. Without one, anyone who can reach the server could relay through it. |
+| Word | Both sides of one tunnel | Names the tunnel. `connect` needs nothing else. |
+
+A word is three groups of four letters or digits, like `k3f9-x2mq-7hpa`,
+and case does not matter. A generated word (from `serve` without one, or
+`pf-client word`) is random, 59 bits, and leaves out `0`, `o`, `1`, `i` and
+`l`, so it is easy to read out. Prefer a generated word to an invented one:
+anyone who guesses a word can connect to its tunnel. A serve token is 32 to
+128 printable characters; the console generates them.
+
+Every tunnel also has a name, which `serve` must give (`--name "Office
+SSH"`). It is how the tunnel appears in the console and the flow log.
+
+The hub is multi-tenant: every holder gets their own named serve token.
+The first token to register a word owns it for good: no other token can
+serve that word until an admin clears the binding in the console. Nothing
+caps how many tunnels or connections a token has.
+
+Turn the hub on with a `[tunnel]` table in the config file, then add tokens
+in the console's **Relay hub** tab:
+
+```toml
+[tunnel]
+```
+
+**Add token** generates a 40-character serve token and shows it once. The
+config file gets only its SHA-256, so a leaked config file does not let
+anyone serve, and a lost token is replaced with **New token** rather than
+recovered:
+
+```toml
+[[tunnel.tenant]]
+name = "alice-laptop"
+token_sha256 = "5f2b…"     # written by the console
+```
+
+**New token** ends that holder's tunnels and keeps their words; **Delete**
+ends them and frees the words. `enabled = false` in `[tunnel]` turns the hub
+off without losing the tokens.
+
+Without a config file, `--tunnel <serve-token>` (repeatable) turns the hub
+on with fixed tokens named `cli-1`, `cli-2`, ...; they cannot be changed in
+the console:
+
+```sh
+pf-simple --console 18222@secret --tunnel "$PF_SERVE_TOKEN"
+```
+
+The hub is served on the console's own listener, under `/pf/api/tunnel/`;
+there is no separate port. `pf-client` only speaks
+`https://`, so put a TLS reverse proxy in front, as for the
+[console](#web-console) (the WebSocket `Upgrade` headers are needed here
+too). With a config file, the bindings of words to tokens are kept next to
+it as `<name>.relay.json` (mode 600; the words in it are secrets). Started
+from the command line, they last until a restart.
+
+`pf-client` arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `<server>` | The pf-simple server: `https://host[:port]/`. The `/pf/api/tunnel` path is added for you. |
+| `<word>` | The tunnel's word, the same on both sides. `serve` may leave it out. |
+| `<target>` (serve) | `host:port`, or a port alone for `127.0.0.1`. |
+| `<listen>` (connect) | `host:port`, or a port alone to listen on `127.0.0.1` only. `-` carries one connection over stdin/stdout, for `ssh -o ProxyCommand='pf-client connect https://relay.example.com/ <word> -'`. |
+| `-n`, `--name` | The tunnel's name in the console. `serve` needs it. |
+| `-s`, `--serve-token` | Your serve token, for `serve`. Defaults to `$PF_SERVE_TOKEN`. |
+| `-k`, `--insecure` | Do not verify the server's certificate. |
+| `-c`, `--config` | Read everything from a TOML file instead; cannot be combined with other arguments. |
+
+With `-c`, the parameters come from a file, and one file can serve both
+commands (see [`pf-client.example.toml`](pf-client.example.toml)):
+
+```toml
+server = "https://relay.example.com/"
+word = "k3f9-x2mq-7hpa"
+target = "192.168.44.132:22"     # for: pf-client serve -c client.toml
+name = "Office SSH"
+serve_token = "..."              # or $PF_SERVE_TOKEN; chmod 600 the file
+listen = "2222"                  # for: pf-client connect -c client.toml
+```
+
+Without `-k`, a certificate that does not verify (self-signed, private CA)
+is shown with its subject and SHA-256 fingerprint, and `pf-client` asks
+whether to trust it; a yes pins that exact certificate for the run. When it
+cannot ask (no terminal, or `-` mode), it refuses.
+
+How it behaves:
+
+- Both commands are meant to be started once and left. `serve` registers
+  again whenever it loses the server, pausing 1s, 2s, 4s ... up to 30s
+  between attempts and starting over from 1s once it has been up for a
+  minute. `connect` keeps listening whether or not the tunnel is up and logs
+  when that changes. Only a mistake stops them: a malformed argument, or
+  the server refusing the very first `serve` (a wrong serve token, or a
+  word that belongs to another token).
+- Whatever breaks, at any point of the chain, every party lets go: the side
+  that sees the break at once, the far side after the 30 second idle rule.
+  A link that goes silent without closing is noticed after 30 seconds
+  without a keepalive (one is sent every 10). Each client logs the end of
+  every connection with its lifetime, the bytes each way, and the hop that
+  broke, named the same at both ends:
+
+  ```
+  connection 61578a5b closed after 2h3m10s: app->target 86 B, target->app 3.0 MiB; the target reset its connection to pf-client serve
+  ```
+
+- Each forwarded TCP connection is one WebSocket from each side, joined at
+  the hub, with its own connection id: both clients log it and the console
+  shows it. Bytes travel
+  in frames of up to 64 KiB; a half-close (FIN) travels too, with the same
+  30 second idle rule as any other pipe.
+- Nothing is resumed or replayed. If any link breaks, that connection is
+  closed on both ends, exactly as a broken TCP connection would be, and
+  whatever was using it connects again. No byte is ever delivered twice or
+  skipped.
+- `serve` reconnects on its own when it loses the server. The tunnel's open
+  connections end with the lost link; `connect` keeps listening and new
+  connections work as soon as `serve` is back.
+- The hub sees the bytes it relays, and this path is not zero-copy. Use it
+  for protocols that bring their own encryption, such as ssh.
+- Guessing is slow by design. A wrong word or serve token is answered
+  `access denied` after a one-second delay, and a source address refused 30
+  times within a minute gets no further answers, right or wrong, until the
+  minute has passed (429). Behind a reverse proxy on the same host or
+  private network the address is the one the proxy reports in
+  `X-Forwarded-For`, so the proxy must set it; a client that reaches
+  pf-simple directly is counted by its own address.
+- A token may have up to 256 words bound to it. Past that, the word it
+  served longest ago and is not serving now is released, so a `serve` that
+  makes up a new word at every start cannot fill the hub. A server holds up
+  to 10,000 tokens.
+
+In the **Relay hub** tab each token is a group that opens to show its
+words and, for live tunnels, the target, current speed each way, totals and
+open connections. **Stop** resets one connection, **Reset** ends a tunnel
+and its connections (the serving side comes back on its own), and **Clear
+binding** frees a word for whichever token registers it next. The tab shows
+the words in full, so treat console access as access to every tunnel.
 
 ## Running under systemd
 
@@ -331,6 +497,8 @@ What it shows (the build version sits next to the name in the top bar;
   reason. Filter by text or result, pause the view, or reset an open
   connection from its row. The last 2000 ended connections are kept in
   memory, so the log starts filled when you open it.
+- A **Relay hub** tab, when the hub is on (see
+  [Relay hub](#relay-hub-ad-hoc-tunnels-with-pf-client)).
 - An **API** tab: Swagger UI over the [REST API](#rest-api), to read the
   docs and try each call live with the page's session.
 
@@ -403,6 +571,10 @@ by `/pf/openapi.json` and browsable in the console's API tab (or at
 | `GET /pf/api/connections/{id}` | One open connection |
 | `DELETE /pf/api/connections/{id}` | Reset it (TCP RST both ways) |
 | `GET /pf/api/flows[?since=ms]` | Flow log as JSON; upgraded to a WebSocket, the live stream |
+| `GET /pf/api/relay` | The relay hub's tokens (`tenants`), words, tunnels and their connections |
+| `POST /pf/api/relay/{id}/reset`, `/clear` | End a word's tunnel, or also clear its binding to a token |
+| `POST /pf/api/relay/tenants` | Add a named token (`{"name": "..."}`); answers with the serve token, once |
+| `POST /pf/api/relay/tenants/{name}/rotate`, `/delete` | Replace a serve token, or delete it |
 
 Authenticate with the console password in an `X-API-Token` header, or with
 a console session cookie. A request that changes something must also carry

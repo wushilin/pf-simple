@@ -616,7 +616,12 @@ function showVersion(v) {
 function applyState(s) {
   ui.skew = Date.now() - s.now;
   showVersion(s.version);
+  const hadRelay = !!(ui.state && ui.state.relay);
   ui.state = s;
+  relayFeed(s.relay, s.now);
+  relayPaint(s.relay);
+  // A link to #relay can only be honored once the first push says the hub is on.
+  if (s.relay && !hadRelay && location.hash === "#relay" && !$("app").hidden) showTab("relay");
   if (s.host) { $("host").hidden = false; setText($("host"), s.host); document.title = `${s.host} · pf-simple`; }
   if (!ui.total) ui.total = new Ring(HISTORY_POINTS);
 
@@ -1086,10 +1091,11 @@ function showApp() {
 
 // ---------- tabs ----------
 
-const TABS = ["listeners", "flows", "api"];
+const TABS = ["listeners", "flows", "relay", "api"];
 
 function currentTab() {
   const t = location.hash.slice(1);
+  if (t === "relay" && !(ui.state && ui.state.relay)) return "listeners"; // the hub is off
   return TABS.includes(t) ? t : "listeners";
 }
 
@@ -1101,6 +1107,7 @@ function showTab(name) {
   if (name === "flows") flowsStart(); else flowsStop();
   if (name === "api" && !$("api-frame").getAttribute("src")) $("api-frame").src = "swagger/";
   if (name === "listeners") redrawCharts(); // canvases have no size while hidden
+  if (name === "relay" && ui.state) relayPaint(ui.state.relay);
 }
 
 for (const b of document.querySelectorAll(".tab")) {

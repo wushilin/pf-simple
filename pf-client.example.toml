@@ -1,0 +1,31 @@
+# pf-client configuration
+#
+#   pf-client serve -c client.toml       offer the target
+#   pf-client connect -c client.toml     reach it on the listen address
+#
+# -c cannot be combined with other arguments. Unknown keys are errors. One
+# file may hold both target and listen; each command uses its own.
+
+# The pf-simple server. https only.
+server = "https://relay.example.com/"
+
+# The tunnel's secret, the same on both sides: three groups of four letters
+# or digits; case does not matter. "pf-client word" prints a random one.
+# serve may leave it out: it then makes one up at every start and prints it,
+# which leaves the old one bound on the server, so set it here to keep it.
+word = "k3f9-x2mq-7hpa"
+
+# serve: what to forward to. host:port, or a port alone for 127.0.0.1.
+target = "192.168.44.132:22"
+# serve: what the tunnel is called in the server's console.
+name = "Office SSH"
+# serve: your serve token, from the server's admin. Without it,
+# $PF_SERVE_TOKEN is used. This file then holds a secret: chmod 600.
+serve_token = "change-me-to-the-token-from-the-console"
+
+# connect: where to listen. host:port, or a port alone for 127.0.0.1 only;
+# "-" carries one connection over stdin/stdout.
+listen = "2222"
+
+# Skip the check of the server's certificate (like -k).
+# insecure = false

@@ -6,12 +6,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /pf-simple .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /pf-simple . \
+ && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /pf-client ./cmd/pf-client
 
 # Runs as root so listeners can bind ports below 1024 with --network host;
 # pass --user to run unprivileged.
 FROM gcr.io/distroless/static-debian12
-COPY --from=build /pf-simple /usr/local/bin/pf-simple
+COPY --from=build /pf-simple /pf-client /usr/local/bin/
 WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/pf-simple"]
 CMD ["-h"]

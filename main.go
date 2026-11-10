@@ -52,10 +52,16 @@ func main() {
 		policy = cfg.console.manage
 	}
 	mgr := newManager(cfg.forwards, policy, halfCloseIdleTimeout)
-	mgr.configPath, mgr.consoleRaw = cfg.configPath, cfg.consoleRaw
+	mgr.configPath, mgr.consoleRaw, mgr.tunnelRaw = cfg.configPath, cfg.consoleRaw, cfg.tunnelRaw
 	var console *consoleServer
 	if cfg.console != nil {
 		console = newConsoleServer(cfg.console.addr, cfg.console.password, mgr)
+		if cfg.tunnel != nil {
+			console.tunnels = newTunnelHub(cfg.tunnel.tenants, halfCloseIdleTimeout, mgr.allocID, relayStatePath(cfg.configPath))
+			if cfg.configPath != "" {
+				console.tunnels.persist = mgr.saveTenants
+			}
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -82,6 +88,9 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 		}
 		if console.mgr.policy != nil {
 			mode += ", listener management on"
+		}
+		if console.tunnels != nil {
+			mode += ", tunnels on"
 		}
 		log.Printf("console on http://%s%s/ (%s)", ln.Addr(), consolePrefix, mode)
 		wg.Add(1)
@@ -150,6 +159,12 @@ func handleConnection(ctx context.Context, id uint64, start time.Time, client ne
 		reject(client)
 		return
 	}
+	servePipe(id, start, client, upstream, l, idleTimeout)
+}
+
+// servePipe copies between two connected legs until both directions end, and
+// closes them. Listeners hand it two TCP connections, tunnels two WebSockets.
+func servePipe(id uint64, start time.Time, client, upstream net.Conn, l *listenerStats, idleTimeout time.Duration) {
 	defer client.Close()
 	defer upstream.Close()
 	p := pipes.add(id, start, l, client, upstream)
@@ -187,6 +202,15 @@ func handleConnection(ctx context.Context, id uint64, start time.Time, client ne
 		if p.interrupted.Load() {
 			done <- struct{}{}
 			return // the pipe is being reset; a FIN would race the RST
+		}
+		select {
+		case <-p.ended:
+			// The pipe is over and its legs are being closed, which is
+			// what ended this copy: a half-close now would tell the peer
+			// that the other side finished cleanly.
+			done <- struct{}{}
+			return
+		default:
 		}
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()

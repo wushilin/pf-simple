@@ -28,6 +28,9 @@
    "name": "Flow log"
   },
   {
+   "name": "Relay hub"
+  },
+  {
    "name": "System"
   }
  ],
@@ -871,6 +874,470 @@
       "description": "Only closed connections that ended at or after this time (unix ms)"
      }
     ]
+   }
+  },
+  "/relay": {
+   "get": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Words and tunnels of the relay hub",
+    "description": "The tenants, every word bound to one of them and, for the words being served by `pf-client serve`, the tunnel with its open connections. In a session, `client` is the connecting side and `upstream` the serving side. The words are secrets.",
+    "responses": {
+     "200": {
+      "description": "The hub's state",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "words": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "type": "integer"
+             },
+             "word": {
+              "type": "string",
+              "description": "The tunnel's secret word: three groups of four letters or digits"
+             },
+             "owner": {
+              "type": "string",
+              "description": "The tenant the word is bound to"
+             },
+             "lastServed": {
+              "type": "integer",
+              "description": "Unix milliseconds"
+             },
+             "live": {
+              "type": "boolean"
+             },
+             "serveAddr": {
+              "type": "string"
+             },
+             "target": {
+              "type": "string"
+             },
+             "since": {
+              "type": "integer"
+             },
+             "accepted": {
+              "type": "integer"
+             },
+             "failed": {
+              "type": "integer"
+             },
+             "bytesUp": {
+              "type": "integer"
+             },
+             "bytesDown": {
+              "type": "integer"
+             },
+             "conns": {
+              "type": "integer"
+             },
+             "sessions": {
+              "type": "array",
+              "items": {
+               "type": "object"
+              }
+             },
+             "orphan": {
+              "type": "boolean",
+              "description": "That tenant no longer exists"
+             },
+             "name": {
+              "type": "string",
+              "description": "What the serving side called the tunnel (pf-client serve --name)"
+             }
+            }
+           }
+          },
+          "manage": {
+           "type": "boolean",
+           "description": "Whether tenants can be changed: only when pf-simple runs from a config file"
+          },
+          "tenants": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "name": {
+              "type": "string"
+             },
+             "words": {
+              "type": "integer"
+             },
+             "live": {
+              "type": "integer"
+             }
+            }
+           },
+           "description": "The serve tokens by name; the console calls these Tokens"
+          }
+         }
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "The relay hub is off",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/{id}/reset": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "description": "Word id, from GET /relay"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Reset a tunnel",
+    "description": "Ends the word's tunnel and resets its connections. The serving side registers again on its own; the word stays bound to its tenant.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "404": {
+      "description": "No such word, or the relay hub is off",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/{id}/clear": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "description": "Word id, from GET /relay"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Clear a word's binding",
+    "description": "Removes the binding of the word to its tenant and ends its tunnel. Whichever tenant registers the word next owns it.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "404": {
+      "description": "No such word, or the relay hub is off",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/tenants": {
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Add a serve token",
+    "description": "Creates a named serve token and saves it to the config file, which holds only the token's SHA-256.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "1 to 32 letters, digits, '-', '_' or '.'"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The tenant and its new serve token. The token is not stored; this response is the only time it is available.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "name": {
+           "type": "string"
+          },
+          "token": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Bad name",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "A tenant with this name exists",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "The relay hub is off",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, or tenants are fixed because pf-simple was started with --tunnel",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/tenants/{name}/rotate": {
+   "parameters": [
+    {
+     "name": "name",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "string"
+     },
+     "description": "Tenant name"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Replace a tenant's serve token",
+    "description": "Generates a new serve token. The old one stops working and the tenant's tunnels end; its words stay bound to it.",
+    "responses": {
+     "200": {
+      "description": "The tenant and its new serve token. The token is not stored; this response is the only time it is available.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "name": {
+           "type": "string"
+          },
+          "token": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such tenant, or the relay hub is off",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, or tenants are fixed because pf-simple was started with --tunnel",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/tenants/{name}/delete": {
+   "parameters": [
+    {
+     "name": "name",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "string"
+     },
+     "description": "Tenant name"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Delete a tenant",
+    "description": "Removes the tenant, ends its tunnels and frees its words.",
+    "responses": {
+     "204": {
+      "description": "Done"
+     },
+     "404": {
+      "description": "No such tenant, or the relay hub is off",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, or tenants are fixed because pf-simple was started with --tunnel",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
    }
   }
  },

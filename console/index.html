@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="app.css">
 <script src="app.js" defer></script>
 <script src="flows.js" defer></script>
+<script src="relay.js" defer></script>
 </head>
 <body>
 <header class="bar">
@@ -42,6 +43,7 @@
     <nav class="tabs" role="tablist" aria-label="Console sections">
       <button class="tab" type="button" role="tab" id="tab-btn-listeners" data-tab="listeners" aria-controls="tab-listeners">Listeners</button>
       <button class="tab" type="button" role="tab" id="tab-btn-flows" data-tab="flows" aria-controls="tab-flows">Flow log</button>
+      <button class="tab" type="button" role="tab" id="tab-btn-relay" data-tab="relay" aria-controls="tab-relay" hidden>Relay hub</button>
       <button class="tab" type="button" role="tab" id="tab-btn-api" data-tab="api" aria-controls="tab-api">API</button>
     </nav>
 
@@ -114,6 +116,35 @@
         <div class="empty" id="flow-empty"><img src="logo-sleep.svg" alt=""><span id="flow-empty-text">No connections yet. They show up here as soon as they are accepted.</span></div>
         <div class="more" id="flow-more" hidden></div>
       </div>
+    </section>
+
+    <section id="tab-relay" role="tabpanel" aria-labelledby="tab-btn-relay" hidden>
+      <div class="toolbar">
+        <span class="toolbar-note" id="relay-note"></span>
+      </div>
+      <div class="relay-word" id="relay-tenants">
+        <div class="relay-head">
+          <span class="relay-title">Tokens</span>
+          <span class="toolbar-note" id="tenant-note"></span>
+          <div class="relay-actions"><button class="act" type="button" id="tenant-add">Add token</button></div>
+        </div>
+        <form class="tenant-form" id="tenant-form" autocomplete="off" hidden>
+          <input id="tenant-name" maxlength="32" required placeholder="Name for the token, e.g. alice-laptop" aria-label="Token name">
+          <button class="btn btn-primary" type="submit" id="tenant-create">Create and show token</button>
+          <button class="btn btn-quiet" type="button" id="tenant-cancel">Cancel</button>
+          <span class="tenant-error" id="tenant-error" role="alert"></span>
+        </form>
+        <div class="tenant-token" id="tenant-token" hidden>
+          <p id="tenant-token-text"></p>
+          <code id="tenant-token-value" title="Click to select"></code>
+          <div class="relay-actions">
+            <button class="act" type="button" id="tenant-token-copy">Copy</button>
+            <button class="act" type="button" id="tenant-token-done">I have saved it</button>
+          </div>
+        </div>
+      </div>
+      <div id="relay-groups"></div>
+      <div class="empty relay-empty" id="relay-empty"><img src="logo-sleep.svg" alt=""><span>No tokens yet, so nobody can serve. Add one to get a serve token for <code>pf-client serve</code>.</span></div>
     </section>
 
     <section id="tab-api" role="tabpanel" aria-labelledby="tab-btn-api" hidden>
