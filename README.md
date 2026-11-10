@@ -383,9 +383,13 @@ How it behaves:
   makes up a new word at every start cannot fill the hub. A server holds up
   to 10,000 tokens.
 
-In the **Relay hub** tab each token is a group that opens to show its
-words and, for live tunnels, the target, current speed each way, totals and
-open connections. **Stop** resets one connection, **Reset** ends a tunnel
+The **Relay hub** tab has three levels. Each token is a group; under it are
+the backends it is serving now, each shown as `word → target` with where it
+is served from, its speed each way and totals; and under each backend are
+its open connections. A backend is listed from the moment `serve` registers
+it, before anyone connects, and a token that is serving opens on its own.
+Words bound to the token that nobody is serving are listed after them.
+**Stop** resets one connection, **Reset** ends a tunnel
 and its connections (the serving side comes back on its own), and **Clear
 binding** frees a word for whichever token registers it next. The tab shows
 the words in full, so treat console access as access to every tunnel.

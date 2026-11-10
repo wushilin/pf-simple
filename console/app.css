@@ -512,8 +512,14 @@ dialog#editor::backdrop { background: rgba(10, 14, 20, .45); }
 /* ---------- relay hub ---------- */
 .relay-word { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 12px; overflow: hidden; }
 .relay-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 16px 8px; }
-.relay-word-title { font-size: var(--t-lead); font-weight: 600; overflow-wrap: anywhere; }
-.relay-name { flex: 1 1 200px; min-width: 0; font-family: var(--font-mono); font-size: var(--t-body); color: var(--fg-2); overflow-wrap: anywhere; }
+.relay-route { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-family: var(--font-mono); font-size: var(--t-body); font-weight: 600; overflow-wrap: anywhere; }
+.relay-route-word, .relay-route-target { min-width: 0; }
+.relay-route-arrow { color: var(--fg-3); font-weight: 400; }
+.relay-word-title { flex: 1 1 120px; min-width: 0; color: var(--fg-2); font-size: var(--t-body); overflow-wrap: anywhere; }
+.relay-word.idle .relay-route { font-weight: 500; color: var(--fg-2); }
+.relay-word.idle .relay-head { padding-block: 8px 4px; }
+.relay-word.idle .relay-meta { padding-bottom: 8px; }
+.relay-section { padding: 10px 4px 0; color: var(--fg-3); font-size: var(--t-label); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
 .relay-chip { flex: none; padding: 2px 8px; border-radius: 999px; font-size: var(--t-label); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; background: var(--warn-soft); color: var(--warn); }
 .relay-chip.live { background: var(--rx-soft); color: var(--rx); }
 .relay-actions { display: flex; gap: 6px; margin-left: auto; }
