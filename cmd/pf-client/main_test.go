@@ -41,6 +41,14 @@ func TestParse(t *testing.T) {
 	if o := ok("connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "-", "-k"); o.endpoint != "-" || !o.insecure {
 		t.Fatalf("connect over stdio = %+v", o)
 	}
+	for _, spelling := range []string{"stdio", "STDIO", "StdIO"} {
+		if o := ok("connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", spelling); o.endpoint != "-" {
+			t.Fatalf("connect %s = %+v", spelling, o)
+		}
+	}
+	if o := ok("serve", "https://relay.example.com/", "Stdio", "--name", "x", "-s", token); o.endpoint != "-" || !o.generated {
+		t.Fatalf("serve stdio = %+v", o)
+	}
 
 	fails("needs a name", "serve", "https://relay.example.com/", "22", "-s", token)
 	fails("serve token", "serve", "https://relay.example.com/", "22", "--name", "x")

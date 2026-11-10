@@ -227,20 +227,102 @@ allow_bind_ports = "18000-19999"
 ## Relay hub: ad-hoc tunnels with pf-client
 
 Two machines that cannot reach each other, but can both reach a pf-simple
-server over HTTPS, can meet there. One runs `pf-client serve` next to the
-service; the other runs `pf-client connect` and gets the service on a local
-port:
+server over HTTPS, can meet there. One runs `pf-client serve`, the other
+`pf-client connect`, and the server joins them when they give the same
+word. Both dial out; neither opens an inbound port.
+
+<img alt="Machine A runs pf-client connect, machine B runs pf-client serve, and both dial out over HTTPS to a pf-simple server that joins them by a shared word; used for SSH, sending files and chat" src="https://raw.githubusercontent.com/wushilin/pf-simple/main/docs/relay-hub.svg" width="1000" />
+
+In the examples the server is `https://relay.example.com/`, machine B is
+the one that serves and machine A the one that connects. `serve` needs a
+serve token from the server's admin, here in `$PF_SERVE_TOKEN`.
+
+### Use case: a port on another machine
+
+B can reach a service (its own sshd here; `192.168.1.20:5432` would work
+the same). A gets it on a local port.
 
 ```sh
-# on the machine that can reach the target (here its own sshd)
-pf-client serve https://relay.example.com/ 22 --name "Office SSH" \
-    --serve-token "$PF_SERVE_TOKEN"
+# machine B
+pf-client serve https://relay.example.com/ 22 --name "Office SSH"
 # ... word: k3f9-x2mq-7hpa   (connect with: pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa <listen>)
 
-# on the machine that wants to use it
+# machine A
 pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa 2222
 ssh -p 2222 user@127.0.0.1
 ```
+
+Both commands stay up and recover by themselves, and the port takes any
+number of connections, so this suits a tunnel you leave running.
+
+### Use case: SSH without a local port
+
+With `stdio` as the listen address, `connect` carries one connection over
+its stdin/stdout and exits, which is what ssh's `ProxyCommand` wants. B runs
+the same `serve` as above; A needs nothing running beforehand:
+
+```sh
+# machine A
+ssh -o ProxyCommand="pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa stdio" user@office
+```
+
+For everyday use, put it in `~/.ssh/config`, and `ssh office`, `scp` and
+`rsync` all go through the tunnel:
+
+```
+Host office
+    User user
+    ProxyCommand pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa stdio
+```
+
+ssh starts one pf-client per connection. In this mode pf-client prints
+nothing unless the connection fails, and it cannot ask about an untrusted
+certificate, so the server needs a valid one (or `-k`). The host name after
+`user@` only names the entry in `known_hosts`; the tunnel decides where the
+connection goes.
+
+### Use case: send files
+
+`serve` takes `stdio` as its target too. Then there is no service at all:
+what one side writes to pf-client, the other reads from it, like a pipe
+between two shells.
+
+```sh
+# machine B: send a directory
+tar c mydir | pf-client serve https://relay.example.com/ stdio --name copy
+# ... word: k3f9-x2mq-7hpa   (connect with: pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa stdio)
+
+# machine A: receive it
+pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa stdio | tar x
+```
+
+A single file is `serve ... stdio < file` and `connect ... stdio > file`.
+It works the other way round as well, since the stream is two-way:
+`serve ... stdio | tar x` on B receives what `tar c mydir | pf-client
+connect ... stdio` sends from A. The word and the log go to stderr, so only
+the data is on stdout. Both sides exit when the stream ends, with status 0
+if it ended cleanly and 1 if a link broke, so check the status before
+trusting the copy.
+
+### Use case: chat
+
+The same pipe with a terminal on each side: every line typed on one
+appears on the other. Ctrl-D ends your side; the chat is over when both
+have.
+
+```sh
+# machine B
+pf-client serve https://relay.example.com/ stdio --name chat
+# machine A
+pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa stdio
+```
+
+A stdio `serve` is one stream between two people. It waits (registering
+again if it loses the server) until the first connection arrives, carries
+that one and exits; another that arrives meanwhile is refused. Stdin cannot
+be read twice, so nothing is retried once the connection has started.
+
+### Words, tokens and the server
 
 `serve` made up the word and printed it; give your own as
 `serve <server> <word> <target>` to keep the same one across restarts. A
@@ -313,8 +395,8 @@ from the command line, they last until a restart.
 | --- | --- |
 | `<server>` | The pf-simple server: `https://host[:port]/`. The `/pf/api/tunnel` path is added for you. |
 | `<word>` | The tunnel's word, the same on both sides. `serve` may leave it out. |
-| `<target>` (serve) | `host:port`, or a port alone for `127.0.0.1`. |
-| `<listen>` (connect) | `host:port`, or a port alone to listen on `127.0.0.1` only. `-` carries one connection over stdin/stdout, for `ssh -o ProxyCommand='pf-client connect https://relay.example.com/ <word> -'`. |
+| `<target>` (serve) | `host:port`, or a port alone for `127.0.0.1`. `stdio` (any case) or `-` offers pf-client's own stdin/stdout instead: it waits for one connection, carries it, and exits when it ends (exit status 1 if it broke). Further connections meanwhile are refused. |
+| `<listen>` (connect) | `host:port`, or a port alone to listen on `127.0.0.1` only. `stdio` (any case) or `-` carries one connection over stdin/stdout and then exits, for `ssh -o ProxyCommand='pf-client connect https://relay.example.com/ <word> stdio' user@host`; nothing listens locally, and it is silent unless the connection fails. |
 | `-n`, `--name` | The tunnel's name in the console. `serve` needs it. |
 | `-s`, `--serve-token` | Your serve token, for `serve`. Defaults to `$PF_SERVE_TOKEN`. |
 | `-k`, `--insecure` | Do not verify the server's certificate. |

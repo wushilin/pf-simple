@@ -67,7 +67,9 @@ func (f *relayFixture) client(t *testing.T, word, serveToken string) *tunnel.Cli
 		t.Fatal(err)
 	}
 	c.ServeToken, c.Name = serveToken, "Test tunnel"
-	c.Logf = func(string, ...any) {}
+	if os.Getenv("PF_TEST_LOG") == "" {
+		c.Logf = func(string, ...any) {}
+	}
 	return c
 }
 
@@ -174,6 +176,164 @@ func TestRelayEndToEnd(t *testing.T) {
 	waitFor(t, "the session to end", func() bool { return f.hub.snapshot().Words[0].Conns == 0 })
 	if w := f.hub.snapshot().Words[0]; w.BytesUp != uint64(len(payload)+5) || w.BytesDown != uint64(len(payload)+5) {
 		t.Fatalf("bytes up/down = %d/%d, want %d", w.BytesUp, w.BytesDown, len(payload)+5)
+	}
+}
+
+// A connection over stdin/stdout (ssh ProxyCommand) carries every byte and
+// ends cleanly when the input does.
+func TestRelayStdio(t *testing.T) {
+	f := newRelayFixture(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.serveAndConnect(t, ctx, echoTarget(t))
+
+	payload := make([]byte, 1<<20)
+	_, _ = rand.Read(payload)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- f.client(t, testWord, "").ConnectOne(ctx, tunnel.Stdio{In: inR, Out: outW}) }()
+	go func() {
+		_, _ = inW.Write(payload)
+		_ = inW.Close() // end of input: a half-close, the echo still comes back
+	}()
+	got, err := io.ReadAll(outR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echoed %d bytes, want %d", len(got), len(payload))
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("ConnectOne = %v, want a clean end", err)
+	}
+}
+
+// A serving side on stdin/stdout carries one connection, refuses a second
+// while it lasts, and ends with it.
+func TestRelayServeStdio(t *testing.T) {
+	f := newRelayFixture(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sent := make([]byte, 1<<20) // what the serving side pipes in
+	_, _ = rand.Read(sent)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	served := make(chan error, 1)
+	go func() {
+		served <- f.client(t, testWord, testServeToken).ServeOne(ctx, tunnel.Stdio{In: inR, Out: outW})
+	}()
+	connector := f.client(t, testWord, "")
+	waitFor(t, "the word to be served", func() bool { return connector.Check(ctx) == nil })
+	if w := f.hub.snapshot().Words[0]; w.Target != tunnel.StdioTarget {
+		t.Fatalf("target = %q", w.Target)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = connector.Connect(ctx, ln) }()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	hello := make([]byte, 5)
+	if _, err := io.ReadFull(outR, hello); err != nil || string(hello) != "hello" {
+		t.Fatalf("served side read %q, %v", hello, err)
+	}
+
+	// A second connection gets nothing: the one stream is taken.
+	second, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	_ = second.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if n, err := second.Read(make([]byte, 1)); n != 0 || err == nil {
+		t.Fatalf("second connection read %d bytes, err %v; want it closed", n, err)
+	}
+
+	// The first is unharmed: the piped input arrives whole, then its end.
+	go func() {
+		_, _ = inW.Write(sent)
+		_ = inW.Close()
+	}()
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, sent) {
+		t.Fatalf("received %d bytes, want %d", len(got), len(sent))
+	}
+	_ = conn.(*net.TCPConn).CloseWrite()
+	if _, err := io.ReadAll(outR); err != nil {
+		t.Fatalf("served side's output ended with %v", err)
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("ServeOne = %v, want a clean end", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeOne did not return")
+	}
+	// It left with its connection: nobody serves the word any more.
+	waitFor(t, "the word to stop being served", func() bool { return connector.Check(ctx) != nil })
+}
+
+// A stdio serving side whose connection breaks reports it and stops. The
+// break is on the far leg, so it arrives when the hub's drain time is up.
+func TestRelayServeStdioBroken(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out the 30s drain")
+	}
+	f := newRelayFixture(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	outR, outW := io.Pipe()
+	go func() { _, _ = io.Copy(io.Discard, outR) }() // after the first byte, below
+	served := make(chan error, 1)
+	go func() {
+		served <- f.client(t, testWord, testServeToken).ServeOne(ctx, tunnel.Stdio{In: inR, Out: outW})
+	}()
+	connector := f.client(t, testWord, "")
+	waitFor(t, "the word to be served", func() bool { return connector.Check(ctx) == nil })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = connector.Connect(ctx, ln) }()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// Break it only once it has reached the serving side: one that never
+	// got that far leaves the serving side waiting, with its input unread.
+	waitFor(t, "the byte to cross", func() bool { return f.hub.snapshot().Words[0].BytesUp+f.hub.snapshot().Words[0].BytesDown > 0 })
+	time.Sleep(200 * time.Millisecond)
+	_ = conn.(*net.TCPConn).SetLinger(0) // a reset, not a clean close
+	_ = conn.Close()
+	select {
+	case err := <-served:
+		if err == nil {
+			t.Fatal("ServeOne = nil after a reset connection, want the reason")
+		}
+		if want := "the application reset its connection to pf-client connect"; err.Error() != want {
+			t.Fatalf("ServeOne = %q, want %q", err, want)
+		}
+	case <-time.After(halfCloseIdleTimeout + 10*time.Second):
+		t.Fatal("ServeOne did not return")
 	}
 }
 
