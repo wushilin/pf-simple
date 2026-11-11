@@ -571,6 +571,26 @@ func (m *manager) saveTunnelSettings(enabled, anonymous bool) error {
 	return m.saveTunnel(func(t *tunnelTable) { t.Enabled, t.AnonymousServe = &enabled, anonymous })
 }
 
+// saveConsoleTLS writes the console's TLS settings into [console]. On
+// failure nothing has changed.
+func (m *manager) saveConsoleTLS(mode, dir string, names []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.configPath == "" || m.consoleRaw == nil {
+		return errNoManaging
+	}
+	old := *m.consoleRaw
+	m.consoleRaw.TLS, m.consoleRaw.TLSDir, m.consoleRaw.TLSNames = mode, dir, names
+	if mode == tlsOff {
+		m.consoleRaw.TLS = "" // as a file that never mentioned it
+	}
+	if err := m.saveLocked(); err != nil {
+		*m.consoleRaw = old
+		return err
+	}
+	return nil
+}
+
 // saveTunnel changes [tunnel] and rewrites the config file, adding the
 // table if the file had none. On failure nothing has changed.
 func (m *manager) saveTunnel(change func(*tunnelTable)) error {

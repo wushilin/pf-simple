@@ -121,6 +121,24 @@
     <section id="tab-relay" role="tabpanel" aria-labelledby="tab-btn-relay" hidden>
       <h2 class="relay-card-title">Settings</h2>
       <div class="relay-word relay-settings">
+        <div class="relay-setting tls-setting" id="tls-row" hidden>
+          <span class="relay-setting-text">
+            <b>HTTPS on this listener</b>
+            <span id="tls-note"></span>
+            <form class="tls-form" id="tls-form" autocomplete="off">
+              <select id="tls-mode" aria-label="HTTPS mode">
+                <option value="off">Off: plain http, for a TLS proxy in front</option>
+                <option value="self_signed">Self-signed: pf-simple is its own CA</option>
+                <option value="directory">Directory: your own certificate</option>
+              </select>
+              <input id="tls-dir" maxlength="1024" placeholder="certs" aria-label="Certificate directory" title="Where the certificates are. A relative path is next to the config file; empty means certs.">
+              <input id="tls-names" maxlength="2000" placeholder="Extra names: relay.example.com, 203.0.113.5" aria-label="Extra names for the certificate" title="Host names and addresses clients use to reach this server, to put in the self-signed certificate, separated by commas">
+              <button class="btn btn-primary" type="submit" id="tls-apply">Apply</button>
+              <span class="tenant-error" id="tls-error" role="alert"></span>
+            </form>
+            <span id="tls-cert"></span>
+          </span>
+        </div>
         <label class="relay-setting" for="relay-enabled">
           <input class="switch" type="checkbox" role="switch" id="relay-enabled">
           <span class="relay-setting-text">

@@ -876,6 +876,214 @@
     ]
    }
   },
+  "/tls": {
+   "get": {
+    "tags": [
+     "System"
+    ],
+    "summary": "TLS of the console's listener",
+    "description": "Whether pf-simple serves https itself, where its certificates are, and the certificate in use.",
+    "responses": {
+     "200": {
+      "description": "The listener's TLS settings and certificate",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "manage": {
+           "type": "boolean",
+           "description": "Whether the settings can be changed here: only when pf-simple runs from a config file"
+          },
+          "mode": {
+           "type": "string",
+           "enum": [
+            "off",
+            "self_signed",
+            "directory"
+           ]
+          },
+          "dir": {
+           "type": "string",
+           "description": "tls_dir as configured; empty means certs"
+          },
+          "path": {
+           "type": "string",
+           "description": "Where that directory is"
+          },
+          "names": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           },
+           "description": "Extra names for a self-signed certificate"
+          },
+          "certNames": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           },
+           "description": "Names and addresses of the certificate being served"
+          },
+          "notAfter": {
+           "type": "integer",
+           "description": "Its expiry, unix milliseconds"
+          },
+          "fingerprint": {
+           "type": "string",
+           "description": "Its SHA-256 fingerprint, as pf-client shows it"
+          },
+          "issuer": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   },
+   "post": {
+    "tags": [
+     "System"
+    ],
+    "summary": "Change the TLS of the console's listener",
+    "description": "`self_signed` makes pf-simple its own CA: it keeps `ca.pem`, `ca.key`, `server.pem` and `server.key` in the directory and renews the certificates on its own, never replacing the keys. `directory` serves your `server.pem` and `server.key` from the directory and reads them again when they change. `off` is plain http. The certificate is prepared first, so a mode that cannot work changes nothing. The listener stays up: this response still arrives the way the request came, and connections made afterwards get the new mode. Saved in `[console]` as `tls`, `tls_dir` and `tls_names`.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "mode"
+        ],
+        "properties": {
+         "mode": {
+          "type": "string",
+          "enum": [
+           "off",
+           "self_signed",
+           "directory"
+          ]
+         },
+         "dir": {
+          "type": "string",
+          "description": "Where the certificates are; relative to the config file; empty means certs"
+         },
+         "names": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Extra host names and addresses for a self-signed certificate"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The listener's TLS settings and certificate",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "manage": {
+           "type": "boolean",
+           "description": "Whether the settings can be changed here: only when pf-simple runs from a config file"
+          },
+          "mode": {
+           "type": "string",
+           "enum": [
+            "off",
+            "self_signed",
+            "directory"
+           ]
+          },
+          "dir": {
+           "type": "string",
+           "description": "tls_dir as configured; empty means certs"
+          },
+          "path": {
+           "type": "string",
+           "description": "Where that directory is"
+          },
+          "names": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           },
+           "description": "Extra names for a self-signed certificate"
+          },
+          "certNames": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           },
+           "description": "Names and addresses of the certificate being served"
+          },
+          "notAfter": {
+           "type": "integer",
+           "description": "Its expiry, unix milliseconds"
+          },
+          "fingerprint": {
+           "type": "string",
+           "description": "Its SHA-256 fingerprint, as pf-client shows it"
+          },
+          "issuer": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Unknown mode, bad name, or the certificate could not be made or read",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, or the settings are fixed because pf-simple was started from the command line",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/relay": {
    "get": {
     "tags": [

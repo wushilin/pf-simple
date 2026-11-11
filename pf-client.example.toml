@@ -33,5 +33,9 @@ serve_token = "change-me-to-the-token-from-the-console"
 # "stdio" or "-" carries one connection over stdin/stdout (ssh ProxyCommand).
 listen = "2222"
 
+# Trust the server's certificate if this CA issued it: the ca.pem of a
+# pf-simple that serves https itself. A relative path is next to this file.
+# ca = "ca.pem"
+
 # Skip the check of the server's certificate (like -k).
 # insecure = false

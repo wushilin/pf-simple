@@ -30,6 +30,11 @@ console; see pf-client -h):
 
   pf-simple --console 18222@secret --tunnel <serve-token>
 
+The console speaks plain http, for a TLS reverse proxy in front. To have it
+serve https itself, as its own certificate authority (see ./certs/ca.pem):
+
+  pf-simple --console 0.0.0.0:18222@secret --console-tls --tunnel <serve-token>
+
 With -c, the console's Relay hub tab turns the hub on and off instead.
 
 --config/-c cannot be combined with any other flag or argument.
@@ -57,6 +62,8 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 	fs.Var(&forwards, "forward", "mapping `listen@target` (repeatable)")
 	fs.Var(&forwards, "f", "short for --forward `listen@target`")
 	fs.StringVar(&consoleValue, "console", "", "web console `listen[@password]`; password defaults to $PF_PASSWORD")
+	var consoleTLS bool
+	fs.BoolVar(&consoleTLS, "console-tls", false, "serve the console (and the relay hub) over https, with a certificate from pf-simple's own CA, kept in ./certs and renewed on its own; needs --console. With -c, use tls / tls_dir / tls_names in [console], or the console's Relay hub tab")
 	var serveTokens forwardsFlag
 	fs.Var(&serveTokens, "tunnel", "relay ad-hoc tunnels between pf-client processes; the value is a `serve-token` (32+ characters) for 'pf-client serve' (repeatable: tenants cli-1, cli-2, ...); needs --console. With -c, tenants are managed in the console instead")
 	fs.StringVar(&configPath, "config", "", "TOML config `file`; excludes every other flag")
@@ -120,6 +127,9 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 	if tunnelOn && consoleValue == "" {
 		return settings{}, errors.New("--tunnel needs --console: tunnels are served on the console's address")
 	}
+	if consoleTLS && consoleValue == "" {
+		return settings{}, errors.New("--console-tls needs --console")
+	}
 	if len(forwards) == 0 && !tunnelOn {
 		if consoleValue != "" {
 			return settings{}, errors.New("a console alone cannot add listeners on the command line; give at least one listen@target, or use -c config.toml")
@@ -144,7 +154,10 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 		if err != nil {
 			return settings{}, err
 		}
-		s.console = &consoleSettings{addr: addr, password: password}
+		s.console = &consoleSettings{addr: addr, password: password, tlsMode: tlsOff}
+		if consoleTLS {
+			s.console.tlsMode = tlsSelfSigned
+		}
 	}
 	if tunnelOn {
 		s.tunnel = &tunnelSettings{enabled: true, tenants: tenants}

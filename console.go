@@ -80,7 +80,8 @@ type consoleServer struct {
 	password   string
 	started    time.Time
 	mgr        *manager
-	tunnels    *tunnelHub // nil unless tunnels are on
+	tunnels    *tunnelHub  // nil unless tunnels are on
+	tls        *tlsManager // the listener's own TLS; nil in tests that need none
 	cookieName string
 
 	ctx context.Context // canceled on shutdown; ends WebSocket sessions
@@ -310,7 +311,8 @@ type consoleState struct {
 	Started   int64              `json:"started"`
 	Listeners []listenerSnapshot `json:"listeners"`
 	Manage    manageInfo         `json:"manage"`
-	Relay     *relayState        `json:"relay,omitempty"` // absent when tunnels are off
+	Relay     *relayState        `json:"relay,omitempty"` // absent on a server without a hub
+	TLS       *tlsState          `json:"tls,omitempty"`
 }
 
 func (s *consoleServer) handleState(w http.ResponseWriter, r *http.Request) {
@@ -465,7 +467,13 @@ func (s *consoleServer) state() consoleState {
 		snap := s.tunnels.snapshot()
 		relay = &snap
 	}
+	var tlsView *tlsState
+	if s.tls != nil {
+		snap := s.tls.snapshot()
+		tlsView = &snap
+	}
 	return consoleState{
+		TLS:       tlsView,
 		Relay:     relay,
 		Version:   version,
 		Host:      s.host,

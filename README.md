@@ -419,9 +419,59 @@ The hub is served on the console's own listener, under `/pf/api/tunnel/`;
 there is no separate port. Tunnels are https only, at both ends:
 `pf-client` refuses an `http://` server, and the hub refuses a tunnel
 request that did not arrive over TLS, so the word and the tokens never
-travel in the clear. Put a TLS reverse proxy in front, as for the
-[console](#web-console); it must pass the WebSocket `Upgrade` headers and
-set `X-Forwarded-Proto: https`, which is how the hub knows. With a config file, the bindings of words to tokens are kept next to
+travel in the clear. There are two ways to give it TLS:
+
+- **pf-simple's own**, with nothing else to run. See
+  [HTTPS without a proxy](#https-without-a-proxy) below.
+- **A TLS reverse proxy in front**, as for the [console](#web-console). It
+  must pass the WebSocket `Upgrade` headers and set
+  `X-Forwarded-Proto: https`, which is how the hub knows.
+
+### HTTPS without a proxy
+
+The console's listener can serve https itself. It is off unless you turn it
+on, in the **Relay hub** tab's Settings card or in `[console]`:
+
+```toml
+[console]
+listen = "0.0.0.0:18222"
+tls = "self_signed"            # or "directory"; leave out for plain http
+tls_dir = "certs"              # where the files are; this is the default
+tls_names = ["relay.example.com"]
+```
+
+| `tls` | What pf-simple does |
+| --- | --- |
+| `"self_signed"` | It is its own certificate authority. In `tls_dir` it makes `ca.key`, `ca.pem`, `server.key` and `server.pem`, and renews both certificates on its own, at start and while running (the server's every eight months, the CA's every eight years). Only the certificates are ever replaced, never the keys, so whoever trusts `ca.pem` keeps trusting the server through every renewal. |
+| `"directory"` | It serves your `server.pem` (certificate, then its chain) with `server.key` from `tls_dir`, and reads them again when they change, within half a minute. Replace the files by hand or let whatever renews them do it; no restart. A replacement that cannot be read is logged and the old certificate stays in use. |
+
+`tls_dir` is relative to the config file unless it is absolute. A
+self-signed certificate always names `localhost`, the machine's host name
+and its IPv4 addresses; put the names clients really use, and any fixed
+IPv6 address, in `tls_names`. It is issued again (same key) when that list
+grows.
+
+Clients trust a self-signed server through its CA. Copy `ca.pem` to them
+once:
+
+```sh
+pf-client serve   https://relay.example.com:18222/ 22 --name "Office SSH" --ca ca.pem
+pf-client connect https://relay.example.com:18222/ k3f9-x2mq-7hpa stdio --ca ca.pem
+```
+
+With `--ca` (or `ca = "ca.pem"` in the client's config file) nothing is
+asked and nothing is skipped: the certificate must come from that CA and
+name the host in the URL. Without it, pf-client shows the fingerprint and
+asks, or `-k` skips the check. A browser warns about the console until
+`ca.pem` is imported as a trusted authority.
+
+Changing the mode in the console switches the listener in place: the
+certificate is prepared first, so a directory without a usable certificate
+changes nothing, connections that are open stay as they are, and the page
+moves itself to the new `http://` or `https://` address. Behind a reverse
+proxy leave it off, or the proxy can no longer reach pf-simple. From the
+command line, `--console-tls` is the self-signed mode with `./certs`.
+ With a config file, the bindings of words to tokens are kept next to
 it as `<name>.relay.json` (mode 600; the words in it are secrets). Started
 from the command line, they last until a restart.
 
@@ -436,6 +486,7 @@ from the command line, they last until a restart.
 | `-n`, `--name` | The tunnel's name in the console. `serve` needs it. |
 | `-s`, `--serve-token` | Your serve token, for `serve`. Defaults to `$PF_SERVE_TOKEN`. Without one the registration is anonymous, which works only where the server allows it. |
 | `-t`, `--client-token` | A second secret on top of the word. Given to `serve`, `connect` needs the same one. Defaults to `$PF_CLIENT_TOKEN`. |
+| `--ca` | Trust the server's certificate if this CA issued it: a PEM file, such as `ca.pem` of a pf-simple that [serves https itself](#https-without-a-proxy). |
 | `-k`, `--insecure` | Do not verify the server's certificate. |
 | `-c`, `--config` | Read everything from a TOML file instead; cannot be combined with other arguments. |
 

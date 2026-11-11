@@ -11,6 +11,21 @@ listen = "127.0.0.1:18222"
 # Leave password out (or empty) to read it from $PF_PASSWORD. If both are
 # empty the console has no password. This file holds a secret: chmod 600.
 password = "change-me"
+# The console speaks plain http, for a TLS reverse proxy in front. It can
+# serve https itself instead, which the relay hub needs when there is no
+# proxy. The files are in tls_dir, "certs" next to this file by default:
+#   tls = "self_signed"   pf-simple is its own CA: it makes ca.pem, ca.key,
+#                         server.pem and server.key there and renews the
+#                         certificates on its own, never the keys. Clients
+#                         trust ca.pem (pf-client --ca ca.pem).
+#   tls = "directory"     your own server.pem (certificate and chain) and
+#                         server.key, read again whenever they change.
+# tls_names adds the names clients use to a self-signed certificate; it
+# always has localhost, the host name and the machine's IPv4 addresses.
+# The console's Relay hub tab changes these too, without a restart.
+# tls = "self_signed"
+# tls_dir = "certs"
+# tls_names = ["relay.example.com"]
 # In config mode the console can add, edit, stop, start and delete listeners.
 # Changes are written back to this file (comments are not kept), so the file's
 # directory must be writable by pf-simple. These optional lists fence what the

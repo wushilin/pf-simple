@@ -63,6 +63,10 @@ func TestParse(t *testing.T) {
 	if o := ok("connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "stdio", "-t", "hunter22"); o.clientToken != "hunter22" {
 		t.Fatalf("connect with a client token = %+v", o)
 	}
+	if o := ok("connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "stdio", "--ca", "/etc/pf/ca.crt"); o.ca != "/etc/pf/ca.crt" {
+		t.Fatalf("connect with a CA = %+v", o)
+	}
+	fails("contradict", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "--ca=/x/ca.crt", "-k")
 	fails("at least 8", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "-t", "short")
 	fails("without spaces", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "-t", "has a space")
 	fails("three groups", "connect", "https://relay.example.com/", "asdf123", "2222")

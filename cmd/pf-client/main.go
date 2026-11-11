@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -59,7 +61,7 @@ Flags:
   -c, --config <file>    read everything from a TOML file instead of the
                          command line; keys: server, word, target (serve),
                          listen (connect), name, serve_token, client_token,
-                         insecure
+                         ca, insecure
   -n, --name <name>      what the tunnel is called in the server's console,
                          e.g. "Office SSH"; "serve" needs it
   -s, --serve-token <t>  your serve token, from the server's admin: permission
@@ -71,6 +73,9 @@ Flags:
                          characters; defaults to $PF_CLIENT_TOKEN. Given to
                          "serve", whoever connects must give the same one to
                          "connect"; a wrong or missing one is "access denied"
+  --ca <file>            trust the server's certificate if this CA issued it:
+                         a PEM file, such as certs/ca.crt of a pf-simple that
+                         serves https itself. No question is asked then
   -k, --insecure         do not verify the server's certificate
   --version              print the version
 
@@ -107,6 +112,7 @@ type options struct {
 	name        string
 	serveToken  string
 	clientToken string
+	ca          string // PEM file of a CA to trust for the server
 	insecure    bool
 }
 
@@ -121,6 +127,7 @@ type fileConfig struct {
 	Name        string `toml:"name"`
 	ServeToken  string `toml:"serve_token"`
 	ClientToken string `toml:"client_token"`
+	CA          string `toml:"ca"`
 	Insecure    bool   `toml:"insecure"`
 }
 
@@ -159,6 +166,9 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 		case "-t", "--client-token":
 			flags = append(flags, name)
 			err = value(&o.clientToken)
+		case "--ca":
+			flags = append(flags, name)
+			err = value(&o.ca)
 		case "-n", "--name":
 			flags = append(flags, name)
 			err = value(&o.name)
@@ -236,6 +246,9 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 			return nil, err
 		}
 	}
+	if o.ca != "" && o.insecure {
+		return nil, errors.New("--ca and -k contradict each other: trust the CA, or skip the check")
+	}
 	if o.clientToken != "" {
 		if err := tunnel.CheckClientToken(o.clientToken); err != nil {
 			return nil, err
@@ -269,6 +282,9 @@ func (o *options) load(path string) error {
 	}
 	if fc.ClientToken != "" {
 		o.clientToken = fc.ClientToken
+	}
+	if o.ca = fc.CA; o.ca != "" && !filepath.IsAbs(o.ca) {
+		o.ca = filepath.Join(filepath.Dir(path), o.ca) // relative to the config file
 	}
 	if fc.ServeToken != "" || fc.ClientToken != "" {
 		if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o004 != 0 {
@@ -308,7 +324,7 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	tlsConfig, err := trust(ctx, o.server, o.insecure, !stdio)
+	tlsConfig, err := trust(ctx, o.server, o.ca, o.insecure, !stdio)
 	if err != nil {
 		return err
 	}
@@ -375,9 +391,22 @@ func run(args []string) error {
 
 // trust decides how the server's certificate is checked: normally, not at
 // all (-k), or pinned to one the user accepted by fingerprint.
-func trust(ctx context.Context, server string, insecure, mayAsk bool) (*tls.Config, error) {
+func trust(ctx context.Context, server, ca string, insecure, mayAsk bool) (*tls.Config, error) {
 	if insecure {
 		return &tls.Config{InsecureSkipVerify: true}, nil
+	}
+	if ca != "" {
+		// Only this CA: the certificate must chain to it and name the
+		// host in the server URL.
+		pem, err := os.ReadFile(ca)
+		if err != nil {
+			return nil, fmt.Errorf("--ca: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("--ca: %s holds no PEM certificate", ca)
+		}
+		return &tls.Config{RootCAs: pool}, nil
 	}
 	cert, verifyErr, err := tunnel.ProbeCert(ctx, server)
 	if err != nil {
@@ -388,7 +417,7 @@ func trust(ctx context.Context, server string, insecure, mayAsk bool) (*tls.Conf
 	}
 	info, _ := os.Stdin.Stat()
 	if !mayAsk || info == nil || info.Mode()&os.ModeCharDevice == 0 {
-		return nil, fmt.Errorf("the server's certificate is not trusted (%v); use -k to skip the check", verifyErr)
+		return nil, fmt.Errorf("the server's certificate is not trusted (%v); give its CA with --ca, or use -k to skip the check", verifyErr)
 	}
 	fmt.Fprintf(os.Stderr, "The server's certificate is not trusted: %v\n  subject:     %s\n  issuer:      %s\n  valid until: %s\n  SHA-256:     %s\nDo you trust this certificate for this run? [y/N] ",
 		verifyErr, cert.Subject, cert.Issuer, cert.NotAfter.Format("2006-01-02"), tunnel.Fingerprint(cert))
