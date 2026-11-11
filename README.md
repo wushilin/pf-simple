@@ -613,7 +613,7 @@ How it behaves:
 The **Relay hub** tab has three levels. Each token is a group; under it are
 the backends it is serving now, each shown as `word → target` with where it
 is served from, its speed each way and totals; and under each backend are
-its connections, each with a state: **Active** (green), **Half closed**
+its connections, each with when it was opened, its age and a state: **Active** (green), **Half closed**
 (yellow: one side has finished sending) or **Closed** (red). A closed
 connection stays listed for 30 seconds in the page that saw it close, then
 goes. A backend is listed from the moment `serve` registers

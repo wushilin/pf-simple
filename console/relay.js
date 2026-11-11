@@ -178,7 +178,7 @@ function relayCard(w) {
   };
   const rows = el("div", "relay-rows");
   const cols = el("div", "r-cols r-head");
-  for (const [text, cls] of [["Connection", ""], ["State", ""], ["Connecting side", ""], ["Serving side", ""], ["Age", "r"], ["To serving", "r"], ["To connecting", "r"], ["", ""]]) {
+  for (const [text, cls] of [["Connection", ""], ["State", ""], ["Connecting side", ""], ["Serving side", ""], ["Opened", "r"], ["Age", "r"], ["To serving", "r"], ["To connecting", "r"], ["", ""]]) {
     cols.append(el("span", cls, text));
   }
   refs.rows = rows;
@@ -208,12 +208,12 @@ function relaySessionRow(p) {
   const refs = {
     row,
     id: el("span", "mono"), state: el("span", "r-state"), client: el("span", "mono"), serve: el("span", "mono"),
-    age: el("span", "r num"), up: relaySpeed("tx"), down: relaySpeed("rx"),
+    opened: el("span", "r num"), age: el("span", "r num"), up: relaySpeed("tx"), down: relaySpeed("rx"),
     stop: relayButton("Stop", "Reset this connection", true),
   };
   const last = el("span", "r");
   last.append(refs.stop);
-  row.append(refs.id, refs.state, refs.client, refs.serve, refs.age, refs.up.cell, refs.down.cell, last);
+  row.append(refs.id, refs.state, refs.client, refs.serve, refs.opened, refs.age, refs.up.cell, refs.down.cell, last);
   refs.stop.addEventListener("click", () => relayArmed("stop:" + p.id, refs.stop, "Stop", () =>
     api(`api/pipes/${p.id}/stop`).catch((e) => toast(`Could not stop #${p.id}: ${e.message}`, true))));
   return refs;
@@ -267,6 +267,8 @@ function paintRelayWord(c, w, now) {
     r.id.title = `Connection ${p.connId}, #${p.id} in the flow log`;
     setText(r.client, p.clientRemote);
     setText(r.serve, p.upstreamRemote);
+    setText(r.opened, fmtClock(p.started));
+    r.opened.title = "Opened " + new Date(p.started).toLocaleString();
     setText(r.age, fmtAge(now - p.started));
     setText(r.up.rate, fmtRate(relayMeter("su" + p.id).rate(now)));
     setText(r.up.total, fmtBytes(p.pfToUpstream));
