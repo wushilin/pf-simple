@@ -506,7 +506,10 @@ How it behaves:
 The **Relay hub** tab has three levels. Each token is a group; under it are
 the backends it is serving now, each shown as `word → target` with where it
 is served from, its speed each way and totals; and under each backend are
-its open connections. A backend is listed from the moment `serve` registers
+its connections, each with a state: **Active** (green), **Half closed**
+(yellow: one side has finished sending) or **Closed** (red). A closed
+connection stays listed for 30 seconds in the page that saw it close, then
+goes. A backend is listed from the moment `serve` registers
 it, before anyone connects, and a token that is serving opens on its own.
 Words bound to the token that nobody is serving are listed after them.
 **Stop** resets one connection, **Reset** ends a tunnel
@@ -621,7 +624,7 @@ What it shows (the build version sits next to the name in the top bar;
   reason. Filter by text or result, pause the view, or reset an open
   connection from its row. The last 2000 ended connections are kept in
   memory, so the log starts filled when you open it.
-- A **Relay hub** tab, when the hub is on (see
+- A **Relay hub** tab, to turn the hub on and off and watch it (see
   [Relay hub](#relay-hub-ad-hoc-tunnels-with-pf-client)).
 - An **API** tab: Swagger UI over the [REST API](#rest-api), to read the
   docs and try each call live with the page's session.

@@ -3,7 +3,10 @@
 // The Relay hub tab, three levels deep: each serve token is a group; under
 // it are the backends it is serving right now, each shown as its word and
 // the target that word leads to; and under each backend are its open
-// connections with live speeds. A backend is listed from the moment it
+// connections with live speeds and a state: active (green), half closed
+// (yellow, one side has finished sending) or closed (red). The server only
+// reports open connections, so a closed one is a row this page keeps for
+// 30 seconds after it left the push. A backend is listed from the moment it
 // registers, connections or not, and a token that is serving opens on its
 // own. Words bound to the token that nobody is serving follow in a list of
 // their own. Above all that is a Settings card with the hub's two switches:
@@ -15,6 +18,7 @@
 // "tenant" in the API paths); the page calls it a token.
 
 const RELAY_ROWS = 200; // most connections drawn per word
+const RELAY_LINGER = 30000; // a closed connection stays listed this long, in ms
 const RELAY_ORPHANS = "\u0000orphans"; // group for words whose token is gone
 const RELAY_ANONYMOUS = "anonymous"; // the server's name for serving without a token
 
@@ -173,7 +177,7 @@ function relayCard(w) {
   };
   const rows = el("div", "relay-rows");
   const cols = el("div", "r-cols r-head");
-  for (const [text, cls] of [["Connection", ""], ["Connecting side", ""], ["Serving side", ""], ["Age", "r"], ["To serving", "r"], ["To connecting", "r"], ["", ""]]) {
+  for (const [text, cls] of [["Connection", ""], ["State", ""], ["Connecting side", ""], ["Serving side", ""], ["Age", "r"], ["To serving", "r"], ["To connecting", "r"], ["", ""]]) {
     cols.append(el("span", cls, text));
   }
   refs.rows = rows;
@@ -202,13 +206,13 @@ function relaySessionRow(p) {
   const row = el("div", "r-cols");
   const refs = {
     row,
-    id: el("span", "mono"), client: el("span", "mono"), serve: el("span", "mono"),
+    id: el("span", "mono"), state: el("span", "r-state"), client: el("span", "mono"), serve: el("span", "mono"),
     age: el("span", "r num"), up: relaySpeed("tx"), down: relaySpeed("rx"),
     stop: relayButton("Stop", "Reset this connection", true),
   };
   const last = el("span", "r");
   last.append(refs.stop);
-  row.append(refs.id, refs.client, refs.serve, refs.age, refs.up.cell, refs.down.cell, last);
+  row.append(refs.id, refs.state, refs.client, refs.serve, refs.age, refs.up.cell, refs.down.cell, last);
   refs.stop.addEventListener("click", () => relayArmed("stop:" + p.id, refs.stop, "Stop", () =>
     api(`api/pipes/${p.id}/stop`).catch((e) => toast(`Could not stop #${p.id}: ${e.message}`, true))));
   return refs;
@@ -248,6 +252,13 @@ function paintRelayWord(c, w, now) {
     const next = anchor ? anchor.nextSibling : c.body.firstChild;
     if (next !== r.row) c.body.insertBefore(r.row, next);
     anchor = r.row;
+    r.closedAt = 0;
+    const half = p.upDone || p.downDone;
+    setText(r.state, half ? "Half closed" : "Active");
+    r.state.className = half ? "r-state half" : "r-state active";
+    r.state.title = half ? (p.upDone && p.downDone ? "Both sides have finished sending; closing"
+      : p.upDone ? "The connecting side has finished sending; the serving side may still send"
+      : "The serving side has finished sending; the connecting side may still send") : "Open in both directions";
     setText(r.id, p.connId || "#" + p.id);
     r.id.title = `Connection ${p.connId}, #${p.id} in the flow log`;
     setText(r.client, p.clientRemote);
@@ -258,11 +269,28 @@ function paintRelayWord(c, w, now) {
     setText(r.down.rate, fmtRate(relayMeter("sd" + p.id).rate(now)));
     setText(r.down.total, fmtBytes(p.pfToClient));
   }
+  // A connection that left the push has closed. Its row stays, below the
+  // open ones and as it last looked, for RELAY_LINGER.
+  const wall = Date.now();
   for (const [id, r] of c.sessions) {
-    if (!keep.has(id)) { r.row.remove(); c.sessions.delete(id); }
+    if (keep.has(id)) continue;
+    if (!r.closedAt) {
+      r.closedAt = wall;
+      setText(r.state, "Closed");
+      r.state.className = "r-state closed";
+      r.state.title = "This connection has ended; the row goes away 30 seconds after it did";
+      r.row.classList.add("closed");
+      r.stop.hidden = true;
+      setText(r.up.rate, fmtRate(0));
+      setText(r.down.rate, fmtRate(0));
+    }
+    if (wall - r.closedAt >= RELAY_LINGER) { r.row.remove(); c.sessions.delete(id); continue; }
+    const next = anchor ? anchor.nextSibling : c.body.firstChild;
+    if (next !== r.row) c.body.insertBefore(r.row, next);
+    anchor = r.row;
   }
-  c.rows.hidden = sessions.length === 0;
-  c.note.hidden = !w.live || (sessions.length > 0 && w.conns <= sessions.length);
+  c.rows.hidden = c.sessions.size === 0;
+  c.note.hidden = !w.live || c.sessions.size > sessions.length || (sessions.length > 0 && w.conns <= sessions.length);
   setText(c.note, sessions.length === 0 ? "No open connections. They show up here when someone connects with this word."
     : `Showing the newest ${sessions.length} of ${w.conns} connections.`);
 }
