@@ -24,20 +24,26 @@ type settings struct {
 	// consoleRaw is [console] exactly as written.
 	configPath string
 	consoleRaw *consoleTable
-	tunnel     *tunnelSettings // nil when tunnels are off
+	tunnel     *tunnelSettings // nil when nothing was said about tunnels
 	tunnelRaw  *tunnelTable
 }
 
 type tunnelSettings struct {
-	tenants []tenantSpec // who may run "pf-client serve" here
+	enabled   bool
+	anonymous bool         // "pf-client serve" needs no serve token
+	tenants   []tenantSpec // who may run "pf-client serve" here
 }
 
 // tunnelTable is the [tunnel] table; its presence turns the relay hub on,
 // unless it says enabled = false. Enabled is always written back, so the
-// table survives a rewrite with nothing else in it.
+// table survives a rewrite with nothing else in it. The console's Relay hub
+// tab changes enabled and anonymous_serve, and adds the table if the file
+// had none.
 type tunnelTable struct {
-	Enabled *bool        `toml:"enabled"`
-	Tenants []tenantSpec `toml:"tenant,omitempty"`
+	Enabled *bool `toml:"enabled"`
+	// AnonymousServe lets "pf-client serve" register without a serve token.
+	AnonymousServe bool         `toml:"anonymous_serve,omitempty"`
+	Tenants        []tenantSpec `toml:"tenant,omitempty"`
 }
 
 // tenantSpec is one [[tunnel.tenant]]: a name and the SHA-256 of its serve
@@ -228,9 +234,7 @@ func loadConfig(path, envPassword string) (settings, error) {
 			on := true
 			t.Enabled = &on
 		}
-		if *t.Enabled {
-			s.tunnel = &tunnelSettings{tenants: t.Tenants}
-		}
+		s.tunnel = &tunnelSettings{enabled: *t.Enabled, anonymous: t.AnonymousServe, tenants: t.Tenants}
 		s.tunnelRaw = t
 	}
 	if len(s.forwards) == 0 && s.console == nil {

@@ -21,8 +21,13 @@ target = "192.168.44.132:22"
 # serve: what the tunnel is called in the server's console.
 name = "Office SSH"
 # serve: your serve token, from the server's admin. Without it,
-# $PF_SERVE_TOKEN is used. This file then holds a secret: chmod 600.
+# $PF_SERVE_TOKEN is used, and without that the registration is anonymous,
+# which only a server that allows it accepts. This file then holds a
+# secret: chmod 600.
 serve_token = "change-me-to-the-token-from-the-console"
+# Optional second secret, 8 to 128 characters, or $PF_CLIENT_TOKEN. When
+# serve has one, connect needs the same one as well as the word.
+# client_token = "something only your users know"
 
 # connect: where to listen. host:port, or a port alone for 127.0.0.1 only;
 # "stdio" or "-" carries one connection over stdin/stdout (ssh ProxyCommand).

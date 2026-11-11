@@ -13,7 +13,7 @@ const token = "serve-token-0123456789abcdefghijkl"
 func TestParse(t *testing.T) {
 	ok := func(args ...string) *options {
 		t.Helper()
-		o, err := parse(args, "", io.Discard)
+		o, err := parse(args, "", "", io.Discard)
 		if err != nil || o == nil {
 			t.Fatalf("parse(%q) = %+v, %v", args, o, err)
 		}
@@ -21,7 +21,7 @@ func TestParse(t *testing.T) {
 	}
 	fails := func(want string, args ...string) {
 		t.Helper()
-		if o, err := parse(args, "", io.Discard); err == nil || !strings.Contains(err.Error(), want) {
+		if o, err := parse(args, "", "", io.Discard); err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("parse(%q) = %+v, %v; want an error with %q", args, o, err, want)
 		}
 	}
@@ -51,7 +51,20 @@ func TestParse(t *testing.T) {
 	}
 
 	fails("needs a name", "serve", "https://relay.example.com/", "22", "-s", token)
-	fails("serve token", "serve", "https://relay.example.com/", "22", "--name", "x")
+	// Without a serve token the registration is anonymous.
+	if o := ok("serve", "https://relay.example.com/", "22", "--name", "x"); o.serveToken != "" || !o.generated {
+		t.Fatalf("anonymous serve = %+v", o)
+	}
+	fails("at least 32", "serve", "https://relay.example.com/", "22", "--name", "x", "-s", "short")
+	// A client token, on either side.
+	if o := ok("serve", "https://relay.example.com/", "22", "--name", "x", "--client-token=hunter22"); o.clientToken != "hunter22" {
+		t.Fatalf("serve with a client token = %+v", o)
+	}
+	if o := ok("connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "stdio", "-t", "hunter22"); o.clientToken != "hunter22" {
+		t.Fatalf("connect with a client token = %+v", o)
+	}
+	fails("at least 8", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "-t", "short")
+	fails("without spaces", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "-t", "has a space")
 	fails("three groups", "connect", "https://relay.example.com/", "asdf123", "2222")
 	fails("https", "connect", "http://relay.example.com/", "k3f9-x2mq-7hpa", "2222")
 	fails("usage", "connect", "https://relay.example.com/", "2222") // connect cannot make up a word

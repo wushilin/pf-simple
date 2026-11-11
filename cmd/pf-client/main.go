@@ -58,12 +58,19 @@ want to use it, with the same word:
 Flags:
   -c, --config <file>    read everything from a TOML file instead of the
                          command line; keys: server, word, target (serve),
-                         listen (connect), name, serve_token, insecure
+                         listen (connect), name, serve_token, client_token,
+                         insecure
   -n, --name <name>      what the tunnel is called in the server's console,
                          e.g. "Office SSH"; "serve" needs it
   -s, --serve-token <t>  your serve token, from the server's admin: permission
-                         to register there, which "serve" needs; defaults to
-                         $PF_SERVE_TOKEN
+                         to register there, for "serve"; defaults to
+                         $PF_SERVE_TOKEN. Without one the registration is
+                         anonymous, which works only on a server that allows
+                         serving without a token
+  -t, --client-token <t> a second secret on top of the word, 8 to 128
+                         characters; defaults to $PF_CLIENT_TOKEN. Given to
+                         "serve", whoever connects must give the same one to
+                         "connect"; a wrong or missing one is "access denied"
   -k, --insecure         do not verify the server's certificate
   --version              print the version
 
@@ -92,27 +99,29 @@ func main() {
 
 // options is one invocation, from the command line or a config file.
 type options struct {
-	command    string // "serve", "connect" or "word"
-	server     string
-	word       string
-	generated  bool   // the word was made up here, so it must be shown
-	endpoint   string // serve: the target; connect: the listen address; "-" for stdio
-	name       string
-	serveToken string
-	insecure   bool
+	command     string // "serve", "connect" or "word"
+	server      string
+	word        string
+	generated   bool   // the word was made up here, so it must be shown
+	endpoint    string // serve: the target; connect: the listen address; "-" for stdio
+	name        string
+	serveToken  string
+	clientToken string
+	insecure    bool
 }
 
 // fileConfig is a pf-client config file: the same parameters as the command
 // line, for "pf-client serve -c file" or "pf-client connect -c file". One
 // file may hold both target and listen and serve either command.
 type fileConfig struct {
-	Server     string `toml:"server"`
-	Word       string `toml:"word"`
-	Target     string `toml:"target"`
-	Listen     string `toml:"listen"`
-	Name       string `toml:"name"`
-	ServeToken string `toml:"serve_token"`
-	Insecure   bool   `toml:"insecure"`
+	Server      string `toml:"server"`
+	Word        string `toml:"word"`
+	Target      string `toml:"target"`
+	Listen      string `toml:"listen"`
+	Name        string `toml:"name"`
+	ServeToken  string `toml:"serve_token"`
+	ClientToken string `toml:"client_token"`
+	Insecure    bool   `toml:"insecure"`
 }
 
 var errUsage = errors.New("usage: pf-client serve <server> [word] <target> --name <name>, pf-client connect <server> <word> <listen>, or either with -c <file>; run 'pf-client -h' for more")
@@ -120,8 +129,8 @@ var errUsage = errors.New("usage: pf-client serve <server> [word] <target> --nam
 // parse turns the arguments into checked options, reading the config file
 // if one is named. It returns nil options when it already printed what was
 // asked for (-h, --version).
-func parse(args []string, envToken string, out io.Writer) (*options, error) {
-	o := &options{serveToken: envToken}
+func parse(args []string, envToken, envClientToken string, out io.Writer) (*options, error) {
+	o := &options{serveToken: envToken, clientToken: envClientToken}
 	configPath := ""
 	var pos, flags []string
 	for i := 0; i < len(args); i++ {
@@ -147,6 +156,9 @@ func parse(args []string, envToken string, out io.Writer) (*options, error) {
 		case "-s", "--serve-token":
 			flags = append(flags, name)
 			err = value(&o.serveToken)
+		case "-t", "--client-token":
+			flags = append(flags, name)
+			err = value(&o.clientToken)
 		case "-n", "--name":
 			flags = append(flags, name)
 			err = value(&o.name)
@@ -200,11 +212,11 @@ func parse(args []string, envToken string, out io.Writer) (*options, error) {
 		if o.name == "" {
 			return nil, errors.New("serve needs a name for the tunnel, shown in the server's console: --name \"Office SSH\", or name = \"...\" in the config file")
 		}
-		if o.serveToken == "" {
-			return nil, errors.New("serve needs your serve token for this server: give --serve-token, set $PF_SERVE_TOKEN, or put serve_token in the config file")
-		}
-		if err := tunnel.CheckSecret("serve token", o.serveToken); err != nil {
-			return nil, err
+		// No serve token: an anonymous registration, if the server allows it.
+		if o.serveToken != "" {
+			if err := tunnel.CheckSecret("serve token", o.serveToken); err != nil {
+				return nil, err
+			}
 		}
 		if o.word == "" { // made up here, and printed once it is being served
 			if o.word, err = tunnel.NewWord(); err != nil {
@@ -221,6 +233,11 @@ func parse(args []string, envToken string, out io.Writer) (*options, error) {
 		o.endpoint = "-"
 	} else {
 		if o.endpoint, err = hostPort(o.endpoint, "listen address"); err != nil {
+			return nil, err
+		}
+	}
+	if o.clientToken != "" {
+		if err := tunnel.CheckClientToken(o.clientToken); err != nil {
 			return nil, err
 		}
 	}
@@ -249,8 +266,13 @@ func (o *options) load(path string) error {
 	o.server, o.word, o.name, o.insecure = fc.Server, fc.Word, fc.Name, fc.Insecure
 	if fc.ServeToken != "" {
 		o.serveToken = fc.ServeToken
+	}
+	if fc.ClientToken != "" {
+		o.clientToken = fc.ClientToken
+	}
+	if fc.ServeToken != "" || fc.ClientToken != "" {
 		if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o004 != 0 {
-			fmt.Fprintf(os.Stderr, "warning: %s holds a serve token and is readable by every user; consider chmod 600\n", path)
+			fmt.Fprintf(os.Stderr, "warning: %s holds a token and is readable by every user; consider chmod 600\n", path)
 		}
 	}
 	o.endpoint = fc.Listen
@@ -270,7 +292,7 @@ func (o *options) load(path string) error {
 }
 
 func run(args []string) error {
-	o, err := parse(args, os.Getenv("PF_SERVE_TOKEN"), os.Stdout)
+	o, err := parse(args, os.Getenv("PF_SERVE_TOKEN"), os.Getenv("PF_CLIENT_TOKEN"), os.Stdout)
 	if err != nil || o == nil {
 		return err
 	}
@@ -294,7 +316,10 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	client.ServeToken, client.Name = o.serveToken, o.name
+	client.Name, client.ClientToken = o.name, o.clientToken
+	if o.command == "serve" {
+		client.ServeToken = o.serveToken
+	}
 
 	if o.command == "serve" {
 		if o.generated {
@@ -302,7 +327,13 @@ func run(args []string) error {
 			if stdio {
 				listen = "stdio"
 			}
+			if o.clientToken != "" {
+				listen += " --client-token <the client token>"
+			}
 			log.Printf("word: %s   (connect with: pf-client connect %s %s %s)", o.word, o.server, o.word, listen)
+		}
+		if o.serveToken == "" {
+			log.Printf("no serve token: registering anonymously, which the server must allow")
 		}
 		if stdio {
 			// Stdin can be read once: one connection, and its end is ours.
@@ -312,7 +343,11 @@ func run(args []string) error {
 			}
 			return err
 		}
-		return client.Serve(ctx, o.endpoint)
+		err := client.Serve(ctx, o.endpoint)
+		if err != nil && o.serveToken == "" && err.Error() == "access denied" {
+			return errors.New("access denied: this server does not allow serving without a serve token; give --serve-token, set $PF_SERVE_TOKEN, or put serve_token in the config file")
+		}
+		return err
 	}
 	if stdio {
 		// One connection for one caller, such as ssh: fail at once. Stderr

@@ -27,6 +27,11 @@ password = "change-me"
 # the hub on. Serve tokens, one per holder, are added in the console's Relay
 # hub tab, which writes each here as a [[tunnel.tenant]] with its name and
 # the token's SHA-256; the token itself is shown once and never stored.
+# The same tab has the hub's two switches, and writes them here:
+#   enabled = false           turns the hub off and keeps the tokens
+#   anonymous_serve = true    lets "pf-client serve" register without a
+#                             serve token: anyone who can reach the server
+#                             can then relay through it
 # [tunnel]
 
 # One [[forward]] table per listener. listen and target are required. A file

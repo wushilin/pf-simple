@@ -88,15 +88,23 @@ type tunnelHub struct {
 	// persist writes the tenants to the config file; nil when pf-simple was
 	// started from the command line, and tenants cannot be changed then.
 	persist func([]tenantSpec) error
+	// persistSettings writes enabled and anonymous to the config file; nil
+	// from the command line, and the switches are fixed then.
+	persistSettings func(enabled, anonymous bool) error
 
 	guesses  guessLimiter
 	maxWords int // maxWordsPerToken; tests lower it
 
-	mu       sync.Mutex
-	tenants  []*tenant // in the order they were added
-	tunnels  map[secretHash]*relayTunnel
-	reserved map[secretHash]*reservation
-	nextRes  int
+	mu sync.Mutex
+	// enabled is the hub's switch: off, its endpoints answer 404 as if it
+	// were not there. anonymous lets "pf-client serve" register without a
+	// serve token, as the built-in tenant anonymousOwner.
+	enabled   bool
+	anonymous bool
+	tenants   []*tenant // in the order they were added
+	tunnels   map[secretHash]*relayTunnel
+	reserved  map[secretHash]*reservation
+	nextRes   int
 }
 
 // tenant is one holder of a serve token.
@@ -117,14 +125,17 @@ type reservation struct {
 
 // relayTunnel is one word being served.
 type relayTunnel struct {
-	key       secretHash
-	word      string
-	name      string         // given by the serving side; shown in the console
-	owner     string         // tenant name
-	stats     *listenerStats // counters, and the "listener" its pipes belong to
-	started   time.Time
-	ctl       *wsConn // the serving side's control channel
-	serveAddr string
+	key   secretHash
+	word  string
+	name  string // given by the serving side; shown in the console
+	owner string // tenant name
+	// clientHash is the SHA-256 of the client token the serving side asks
+	// of whoever connects; nil when it asks for none.
+	clientHash *secretHash
+	stats      *listenerStats // counters, and the "listener" its pipes belong to
+	started    time.Time
+	ctl        *wsConn // the serving side's control channel
+	serveAddr  string
 
 	mu      sync.Mutex
 	why     string                // why the tunnel was closed, once it is
@@ -154,6 +165,7 @@ func newTunnelHub(tenants []tenantSpec, idle time.Duration, newID func() int, st
 		statePath: statePath,
 		guesses:   guessLimiter{limit: guessLimit, seen: make(map[string]*guessCount)},
 		maxWords:  maxWordsPerToken,
+		enabled:   true,
 		tunnels:   make(map[secretHash]*relayTunnel),
 		reserved:  make(map[secretHash]*reservation),
 	}
@@ -193,12 +205,20 @@ func newTunnelHub(tenants []tenantSpec, idle time.Duration, newID func() int, st
 // ---------- tenants ----------
 
 var (
-	errTenantsFixed = errors.New("tenants can only be changed when pf-simple runs from a config file (-c); these came from --tunnel")
-	errNoTenant     = errors.New("no such tenant")
-	errTenantExists = errors.New("a tenant with this name already exists")
+	errTenantsFixed  = errors.New("tenants can only be changed when pf-simple runs from a config file (-c); these came from --tunnel")
+	errNoTenant      = errors.New("no such tenant")
+	errTenantExists  = errors.New("a tenant with this name already exists")
+	errSettingsFixed = errors.New("the relay hub's settings can only be changed when pf-simple runs from a config file (-c)")
 )
 
+// anonymousOwner is the tenant that words served without a serve token
+// belong to. No token can have this name.
+const anonymousOwner = "anonymous"
+
 func checkTenantName(name string) error {
+	if strings.EqualFold(name, anonymousOwner) {
+		return fmt.Errorf("the name %q is taken by serving without a token", anonymousOwner)
+	}
 	if name == "" || len(name) > maxTenantName {
 		return fmt.Errorf("a tenant name is 1 to %d characters long", maxTenantName)
 	}
@@ -509,6 +529,17 @@ func sourceKey(r *http.Request) string {
 // wrong one.
 func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		on := h.enabled
+		h.mu.Unlock()
+		if !on { // as on a server without a hub
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if !overTLS(r) {
+			writeError(w, http.StatusBadRequest, "tunnels are only served over https: the word and the tokens must not travel in the clear")
+			return
+		}
 		if h.guesses.blocked(sourceKey(r)) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(guessWindow/time.Second)))
 			writeError(w, http.StatusTooManyRequests, "too many refused attempts from your address; try again in a minute")
@@ -516,6 +547,15 @@ func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// overTLS reports whether a request reached the hub over https: on a TLS
+// listener of its own, or through a reverse proxy that says so. pf-client
+// refuses http:// URLs itself, which is what keeps its secrets off the
+// wire; this turns away anything else that would send them in the clear,
+// and a proxy that forwards from a plain listener.
+func overTLS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 // deny refuses after a delay, as the console does for a wrong password, and
@@ -542,6 +582,18 @@ func (h *tunnelHub) find(r *http.Request) *relayTunnel {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.tunnels[sha256.Sum256([]byte(word))]
+}
+
+// admit returns the tunnel a connecting side may use: the one its word
+// names, if it also brought the client token that tunnel asks for. A wrong
+// or missing token is not told apart from a wrong word.
+func (h *tunnelHub) admit(r *http.Request) *relayTunnel {
+	t := h.find(r)
+	given := sha256.Sum256([]byte(r.Header.Get(tunnel.HeaderClientToken)))
+	if t == nil || (t.clientHash != nil && subtle.ConstantTimeCompare(given[:], t.clientHash[:]) != 1) {
+		return nil
+	}
+	return t
 }
 
 // peerAddr is the address to show for a request's sender. The hub sits
@@ -590,14 +642,41 @@ func cleanHeader(s string) string {
 // tenant that owns it, takes it over and ends the old tunnel: that is how a
 // serving side that lost its link gets back in before the hub has noticed.
 func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
+	// Without a serve token the registration is anonymous, if the hub
+	// allows that. A token that is given must be right either way.
+	serveToken := r.Header.Get(tunnel.HeaderServe)
 	h.mu.Lock()
-	holder := h.tenantOfLocked(r.Header.Get(tunnel.HeaderServe))
+	anon := serveToken == "" && h.anonymous
+	var holder *tenant
+	if serveToken != "" {
+		holder = h.tenantOfLocked(serveToken)
+	}
 	h.mu.Unlock()
-	if holder == nil {
+	if holder == nil && !anon {
 		h.deny(w, r)
 		return
 	}
-	owner := holder.name
+	owner := anonymousOwner
+	if holder != nil {
+		owner = holder.name
+	}
+	// allowed reports, under h.mu, whether owner may still serve.
+	allowed := func() bool {
+		if anon {
+			return h.anonymous
+		}
+		return h.tenantLocked(owner) == holder
+	}
+	var clientHash *secretHash
+	if hexHash := r.Header.Get(tunnel.HeaderClientHash); hexHash != "" {
+		raw, err := hex.DecodeString(hexHash)
+		if err != nil || len(raw) != sha256.Size {
+			writeError(w, http.StatusBadRequest, "the client token's hash must be 64 hex digits")
+			return
+		}
+		sum := secretHash(raw)
+		clientHash = &sum
+	}
 	word, err := tunnel.NormalizeWord(r.Header.Get(tunnel.HeaderWord))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -615,10 +694,15 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	res := h.reserved[key]
 	refusal, status := "", 0
 	switch {
-	case h.tenantLocked(owner) != holder: // deleted or rotated a moment ago
+	case !allowed(): // deleted, rotated or switched off a moment ago
 		refusal, status = "access denied", http.StatusForbidden
 	case res != nil && res.Owner != owner:
 		refusal, status = "this word belongs to another tenant; choose a different word", http.StatusConflict
+	case anon && h.tunnels[key] != nil:
+		// Anyone may serve anonymously, so nobody may take over a tunnel
+		// that way. One whose serving side is gone frees its word as soon
+		// as the hub notices, and the serving side keeps trying until then.
+		refusal, status = "this word is being served already; without a serve token it cannot be taken over", http.StatusServiceUnavailable
 	case res == nil && !h.makeRoomLocked(owner):
 		refusal, status = "this token is already serving its limit of "+strconv.Itoa(h.maxWords)+" words", http.StatusServiceUnavailable
 	}
@@ -648,17 +732,17 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	stats := newListenerStats(h.newID(), wordLabel(word), target)
 	stats.name = name
 	t := &relayTunnel{
-		key: key, word: word, name: name, owner: owner, stats: stats, started: time.Now(),
+		key: key, word: word, name: name, owner: owner, clientHash: clientHash, stats: stats, started: time.Now(),
 		ctl: ws, serveAddr: peerAddr(r),
 		pending: make(map[string]*relayConn), connIDs: make(map[uint64]string),
 	}
 	h.mu.Lock()
-	if h.reserved[key] != res || h.tenantLocked(owner) != holder { // changed while the handshake was under way
+	old := h.tunnels[key]
+	if h.reserved[key] != res || !h.enabled || !allowed() || (anon && old != nil) { // changed while the handshake was under way
 		h.mu.Unlock()
 		_ = ws.Close()
 		return
 	}
-	old := h.tunnels[key]
 	h.tunnels[key] = t
 	h.mu.Unlock()
 	if old != nil {
@@ -760,6 +844,61 @@ func (h *tunnelHub) reset(id int, clear bool) error {
 	return nil
 }
 
+// setSettings changes the hub's switches and saves them; nil leaves one as
+// it is. Turning the hub off ends every tunnel. Turning anonymous serving
+// off ends the tunnels served that way and frees their words.
+func (h *tunnelHub) setSettings(enabled, anonymous *bool) error {
+	h.mu.Lock()
+	on, anon := h.enabled, h.anonymous
+	if enabled != nil {
+		on = *enabled
+	}
+	if anonymous != nil {
+		anon = *anonymous
+	}
+	if on == h.enabled && anon == h.anonymous {
+		h.mu.Unlock()
+		return nil
+	}
+	if h.persistSettings == nil {
+		h.mu.Unlock()
+		return errSettingsFixed
+	}
+	if err := h.persistSettings(on, anon); err != nil {
+		h.mu.Unlock()
+		return err
+	}
+	wasOn, wasAnon := h.enabled, h.anonymous
+	h.enabled, h.anonymous = on, anon
+	var closing []*relayTunnel
+	why := ""
+	switch {
+	case wasOn && !on:
+		why = "the relay hub was turned off"
+		for _, t := range h.tunnels {
+			closing = append(closing, t)
+		}
+	case wasAnon && !anon:
+		why = "serving without a token was turned off"
+		closing = h.tunnelsOfLocked(anonymousOwner)
+	}
+	if wasAnon && !anon {
+		for key, res := range h.reserved {
+			if res.Owner == anonymousOwner {
+				delete(h.reserved, key)
+			}
+		}
+		h.saveLocked()
+	}
+	h.mu.Unlock()
+	for _, t := range closing {
+		h.drop(t, why)
+	}
+	log.Printf("relay: settings changed from the console: enabled=%v, anonymous serve=%v", on, anon)
+	changes.notify()
+	return nil
+}
+
 func (h *tunnelHub) closeAll() {
 	h.mu.Lock()
 	all := make([]*relayTunnel, 0, len(h.tunnels))
@@ -773,7 +912,7 @@ func (h *tunnelHub) closeAll() {
 }
 
 func (h *tunnelHub) handleCheck(w http.ResponseWriter, r *http.Request) {
-	if h.find(r) == nil {
+	if h.admit(r) == nil {
 		h.deny(w, r)
 		return
 	}
@@ -845,7 +984,7 @@ func (h *tunnelHub) open(t *relayTunnel, id string) (*tunnel.Stream, string) {
 
 // handleConnect is the connecting side's leg of a new connection.
 func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
-	t := h.find(r)
+	t := h.admit(r)
 	if t == nil {
 		h.deny(w, r)
 		return
@@ -977,15 +1116,22 @@ func (h *tunnelHub) handleAccept(w http.ResponseWriter, r *http.Request) {
 type relayState struct {
 	// Manage says whether tenants can be added, rotated and deleted: only
 	// when they are kept in a config file.
-	Manage  bool                  `json:"manage"`
-	Tenants []relayTenantSnapshot `json:"tenants"`
-	Words   []relayWordSnapshot   `json:"words"`
+	Manage bool `json:"manage"`
+	// Enabled and Anonymous are the hub's switches. With Enabled false the
+	// rest is empty.
+	Enabled   bool                  `json:"enabled"`
+	Anonymous bool                  `json:"anonymous"`
+	Tenants   []relayTenantSnapshot `json:"tenants"`
+	Words     []relayWordSnapshot   `json:"words"`
 }
 
 type relayTenantSnapshot struct {
 	Name  string `json:"name"`
 	Words int    `json:"words"` // bound to it
 	Live  int    `json:"live"`  // tunnels it serves now
+	// Anonymous marks the built-in tenant of serving without a token,
+	// listed last while that is allowed. It cannot be rotated or deleted.
+	Anonymous bool `json:"anonymous,omitempty"`
 }
 
 // relayWordSnapshot is one reserved word, and its tunnel while it is served.
@@ -998,13 +1144,16 @@ type relayWordSnapshot struct {
 	LastServed int64  `json:"lastServed"` // unix milliseconds
 	Live       bool   `json:"live"`
 
-	ServeAddr string `json:"serveAddr,omitempty"`
-	Target    string `json:"target,omitempty"`
-	Since     int64  `json:"since,omitempty"` // served since, unix milliseconds
-	Accepted  uint64 `json:"accepted"`
-	Failed    uint64 `json:"failed"`
-	BytesUp   uint64 `json:"bytesUp"` // towards the serving side, closed + live
-	BytesDown uint64 `json:"bytesDown"`
+	// ClientToken: whoever connects must also give the serving side's
+	// client token.
+	ClientToken bool   `json:"clientToken,omitempty"`
+	ServeAddr   string `json:"serveAddr,omitempty"`
+	Target      string `json:"target,omitempty"`
+	Since       int64  `json:"since,omitempty"` // served since, unix milliseconds
+	Accepted    uint64 `json:"accepted"`
+	Failed      uint64 `json:"failed"`
+	BytesUp     uint64 `json:"bytesUp"` // towards the serving side, closed + live
+	BytesDown   uint64 `json:"bytesDown"`
 	// Conns counts every open connection; Sessions lists at most the newest
 	// maxSnapshotPipes.
 	Conns    int            `json:"conns"`
@@ -1028,12 +1177,18 @@ func (h *tunnelHub) snapshot() relayState {
 	for key, res := range h.reserved {
 		entries = append(entries, entry{*res, h.tunnels[key]})
 	}
-	tenants := make([]relayTenantSnapshot, len(h.tenants))
-	index := make(map[string]*relayTenantSnapshot, len(h.tenants))
+	tenants := make([]relayTenantSnapshot, len(h.tenants), len(h.tenants)+1)
+	index := make(map[string]*relayTenantSnapshot, len(h.tenants)+1)
 	for i, t := range h.tenants {
 		tenants[i] = relayTenantSnapshot{Name: t.name}
-		index[t.name] = &tenants[i]
 	}
+	if h.anonymous {
+		tenants = append(tenants, relayTenantSnapshot{Name: anonymousOwner, Anonymous: true})
+	}
+	for i := range tenants {
+		index[tenants[i].Name] = &tenants[i]
+	}
+	enabled, anonymous := h.enabled, h.anonymous
 	for _, e := range entries {
 		if ts := index[e.res.Owner]; ts != nil {
 			ts.Words++
@@ -1052,7 +1207,7 @@ func (h *tunnelHub) snapshot() relayState {
 		}
 	}
 	live := pipes.snapshot(stats)
-	out := relayState{Manage: h.persist != nil, Tenants: tenants, Words: make([]relayWordSnapshot, len(entries))}
+	out := relayState{Manage: h.persist != nil, Enabled: enabled, Anonymous: anonymous, Tenants: tenants, Words: make([]relayWordSnapshot, len(entries))}
 	next := 0
 	for i, e := range entries {
 		ws := relayWordSnapshot{
@@ -1062,7 +1217,7 @@ func (h *tunnelHub) snapshot() relayState {
 		if t := e.t; t != nil {
 			ls := live[next]
 			next++
-			ws.Live = true
+			ws.Live, ws.ClientToken = true, t.clientHash != nil
 			ws.ServeAddr, ws.Target, ws.Since = t.serveAddr, ls.Target, t.started.UnixMilli()
 			ws.Accepted, ws.Failed, ws.BytesUp, ws.BytesDown, ws.Conns = ls.Accepted, ls.Failed, ls.BytesUp, ls.BytesDown, ls.PipeCount
 			t.mu.Lock()
@@ -1096,6 +1251,30 @@ func (s *consoleServer) handleRelayAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRelaySettings changes the hub's switches; a field left out stays.
+func (s *consoleServer) handleRelaySettings(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled   *bool `json:"enabled"`
+		Anonymous *bool `json:"anonymous"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad request body")
+		return
+	}
+	if s.tunnels == nil {
+		writeError(w, http.StatusNotFound, "this server has no relay hub")
+		return
+	}
+	switch err := s.tunnels.setSettings(body.Enabled, body.Anonymous); {
+	case err == nil:
+		writeJSON(w, s.tunnels.snapshot())
+	case errors.Is(err, errSettingsFixed):
+		writeError(w, http.StatusForbidden, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 // handleAddTenant creates a tenant; the response is the only place its
