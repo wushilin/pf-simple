@@ -329,12 +329,27 @@ be read twice, so nothing is retried once the connection has started.
 wrong word gets `access denied`; the right one gets
 `connected; listening on 127.0.0.1:2222`.
 
-Two secrets are involved:
+Up to three secrets are involved:
 
 | Secret | Who has it | What it is for |
 | --- | --- | --- |
 | Serve token | One holder: whoever may run `serve` with it | Permission to register tunnels on this server. Without one, anyone who can reach the server could relay through it. |
-| Word | Both sides of one tunnel | Names the tunnel. `connect` needs nothing else. |
+| Word | Both sides of one tunnel | Names the tunnel. |
+| Client token (optional) | Both sides of one tunnel | A second secret the serving side may ask for. `connect` then needs it as well as the word. |
+
+To ask for a client token, give `serve` one, and give `connect` the same:
+
+```sh
+pf-client serve   https://relay.example.com/ 22 --name "Office SSH" --client-token correct-horse
+pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa 2222   --client-token correct-horse
+```
+
+It is 8 to 128 printable characters without spaces, and can also come from
+`$PF_CLIENT_TOKEN` or `client_token` in the config file. The server checks it before anything reaches the serving side: it
+keeps only the token's SHA-256, which `serve` registers, and a missing or
+wrong token gets the same `access denied` as a wrong word, counted against
+the sender's address like any other wrong guess. The console marks such a
+tunnel **Client token**.
 
 A word is three groups of four letters or digits, like `k3f9-x2mq-7hpa`,
 and case does not matter. A generated word (from `serve` without one, or
@@ -351,12 +366,32 @@ The first token to register a word owns it for good: no other token can
 serve that word until an admin clears the binding in the console. Nothing
 caps how many tunnels or connections a token has.
 
-Turn the hub on with a `[tunnel]` table in the config file, then add tokens
-in the console's **Relay hub** tab:
+The console's **Relay hub** tab has a **Settings** card with two switches,
+and a **Details** card with the tokens and tunnels. Both switches are saved
+in the config file's `[tunnel]` table, which the console adds if the file
+has none:
+
+| Switch | In the file | Meaning |
+| --- | --- | --- |
+| Relay hub | `enabled` | Off (the default without a `[tunnel]` table), the tunnel endpoints answer 404, as on a server without a hub, and the tab shows only this switch. Turning it off ends every tunnel; tokens and bindings are kept. |
+| Enable anonymous serve | `anonymous_serve` | `pf-client serve` needs no serve token. Off by default. |
 
 ```toml
 [tunnel]
+enabled = true
+anonymous_serve = false
 ```
+
+With anonymous serve on, anyone who can reach the server can relay through
+it, so turn it on only where that is meant. A `serve` without a token then
+registers as the built-in tenant `anonymous`, listed last in the console.
+Because that tenant is everybody, it works a little differently: a word
+that is being served cannot be taken over by a second anonymous `serve`
+(it is told to wait, and gets the word once the first is gone), all
+anonymous words together share one token's limit of 256, and turning the
+switch off ends those tunnels and frees their words. A token that is given
+must still be right, and a word bound to a token cannot be served
+anonymously.
 
 **Add token** generates a 40-character serve token and shows it once. The
 config file gets only its SHA-256, so a leaked config file does not let
@@ -370,8 +405,7 @@ token_sha256 = "5f2b…"     # written by the console
 ```
 
 **New token** ends that holder's tunnels and keeps their words; **Delete**
-ends them and frees the words. `enabled = false` in `[tunnel]` turns the hub
-off without losing the tokens.
+ends them and frees the words.
 
 Without a config file, `--tunnel <serve-token>` (repeatable) turns the hub
 on with fixed tokens named `cli-1`, `cli-2`, ...; they cannot be changed in
@@ -382,10 +416,12 @@ pf-simple --console 18222@secret --tunnel "$PF_SERVE_TOKEN"
 ```
 
 The hub is served on the console's own listener, under `/pf/api/tunnel/`;
-there is no separate port. `pf-client` only speaks
-`https://`, so put a TLS reverse proxy in front, as for the
-[console](#web-console) (the WebSocket `Upgrade` headers are needed here
-too). With a config file, the bindings of words to tokens are kept next to
+there is no separate port. Tunnels are https only, at both ends:
+`pf-client` refuses an `http://` server, and the hub refuses a tunnel
+request that did not arrive over TLS, so the word and the tokens never
+travel in the clear. Put a TLS reverse proxy in front, as for the
+[console](#web-console); it must pass the WebSocket `Upgrade` headers and
+set `X-Forwarded-Proto: https`, which is how the hub knows. With a config file, the bindings of words to tokens are kept next to
 it as `<name>.relay.json` (mode 600; the words in it are secrets). Started
 from the command line, they last until a restart.
 
@@ -398,7 +434,8 @@ from the command line, they last until a restart.
 | `<target>` (serve) | `host:port`, or a port alone for `127.0.0.1`. `stdio` (any case) or `-` offers pf-client's own stdin/stdout instead: it waits for one connection, carries it, and exits when it ends (exit status 1 if it broke). Further connections meanwhile are refused. |
 | `<listen>` (connect) | `host:port`, or a port alone to listen on `127.0.0.1` only. `stdio` (any case) or `-` carries one connection over stdin/stdout and then exits, for `ssh -o ProxyCommand='pf-client connect https://relay.example.com/ <word> stdio' user@host`; nothing listens locally, and it is silent unless the connection fails. |
 | `-n`, `--name` | The tunnel's name in the console. `serve` needs it. |
-| `-s`, `--serve-token` | Your serve token, for `serve`. Defaults to `$PF_SERVE_TOKEN`. |
+| `-s`, `--serve-token` | Your serve token, for `serve`. Defaults to `$PF_SERVE_TOKEN`. Without one the registration is anonymous, which works only where the server allows it. |
+| `-t`, `--client-token` | A second secret on top of the word. Given to `serve`, `connect` needs the same one. Defaults to `$PF_CLIENT_TOKEN`. |
 | `-k`, `--insecure` | Do not verify the server's certificate. |
 | `-c`, `--config` | Read everything from a TOML file instead; cannot be combined with other arguments. |
 
@@ -411,6 +448,7 @@ word = "k3f9-x2mq-7hpa"
 target = "192.168.44.132:22"     # for: pf-client serve -c client.toml
 name = "Office SSH"
 serve_token = "..."              # or $PF_SERVE_TOKEN; chmod 600 the file
+client_token = "..."             # optional, both commands; or $PF_CLIENT_TOKEN
 listen = "2222"                  # for: pf-client connect -c client.toml
 ```
 

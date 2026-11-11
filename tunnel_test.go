@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -516,11 +517,239 @@ func TestTunnelSettings(t *testing.T) {
 		}
 	}
 	write("[console]\nlisten = \"18222\"\n\n[tunnel]\nenabled = false\n")
-	if cfg, err := loadConfig(path, ""); err != nil || cfg.tunnel != nil {
+	if cfg, err := loadConfig(path, ""); err != nil || cfg.tunnel == nil || cfg.tunnel.enabled || cfg.tunnel.anonymous {
 		t.Fatalf("enabled = false: %+v, %v", cfg.tunnel, err)
+	}
+	write("[console]\nlisten = \"18222\"\n\n[tunnel]\nanonymous_serve = true\n")
+	if cfg, err := loadConfig(path, ""); err != nil || cfg.tunnel == nil || !cfg.tunnel.enabled || !cfg.tunnel.anonymous {
+		t.Fatalf("anonymous_serve = true: %+v, %v", cfg.tunnel, err)
+	}
+	write("[console]\nlisten = \"18222\"\n\n[[tunnel.tenant]]\nname = \"Anonymous\"\ntoken_sha256 = \"" + tenantFor("x", testServeToken).TokenSHA256 + "\"\n")
+	if _, err := loadConfig(path, ""); err == nil || !strings.Contains(err.Error(), "taken") {
+		t.Fatalf("a tenant named anonymous = %v", err)
 	}
 	if got := relayStatePath(path); got != filepath.Join(dir, "pf.relay.json") {
 		t.Fatalf("relayStatePath = %s", got)
+	}
+}
+
+// The hub's two switches are changed in the console and kept in the config
+// file, which gets a [tunnel] table if it had none.
+func TestRelaySwitches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pf.toml")
+	if err := os.WriteFile(path, []byte("[console]\nlisten = \"18222\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path, "")
+	if err != nil || cfg.tunnel != nil {
+		t.Fatalf("loadConfig = %+v, %v", cfg.tunnel, err)
+	}
+	mgr := newManager(cfg.forwards, cfg.console.manage, halfCloseIdleTimeout)
+	mgr.configPath, mgr.consoleRaw, mgr.tunnelRaw = cfg.configPath, cfg.consoleRaw, cfg.tunnelRaw
+	cs := newConsoleServer("", "", mgr)
+	hub := newTunnelHub(nil, halfCloseIdleTimeout, mgr.allocID, relayStatePath(path))
+	hub.enabled = false // what main does for a file without [tunnel]
+	hub.denyDelay, hub.persist, hub.persistSettings = 5*time.Millisecond, mgr.saveTenants, mgr.saveTunnelSettings
+	hub.guesses.limit = 1 << 30
+	cs.tunnels = hub
+	srv := httptest.NewTLSServer(cs.handler())
+	defer func() {
+		hub.closeAll()
+		srv.CloseClientConnections()
+		srv.Close()
+	}()
+	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	set := func(body string) relayState {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/pf/api/relay/settings", strings.NewReader(body))
+		req.Header.Set(csrfHeader, "1")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var state relayState
+		if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&state) != nil {
+			t.Fatalf("POST settings %s = %d", body, resp.StatusCode)
+		}
+		return state
+	}
+	saved := func() *tunnelSettings {
+		t.Helper()
+		cfg, err := loadConfig(path, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.tunnel
+	}
+	anon := f.client(t, testWord, "")
+
+	// Off: the endpoints are not there, for a right word as for a wrong one.
+	if err := anon.Check(ctx); err == nil || !strings.Contains(err.Error(), "does not accept tunnels") {
+		t.Fatalf("check with the hub off = %v", err)
+	}
+	if s := hub.snapshot(); s.Enabled || s.Anonymous || !s.Manage {
+		t.Fatalf("snapshot = %+v", s)
+	}
+
+	// On, but serving still needs a token.
+	if s := set(`{"enabled":true}`); !s.Enabled || s.Anonymous {
+		t.Fatalf("after enabling = %+v", s)
+	}
+	if got := saved(); got == nil || !got.enabled || got.anonymous {
+		t.Fatalf("saved after enabling = %+v", got)
+	}
+	if err := anon.Serve(ctx, "127.0.0.1:1"); err == nil || err.Error() != "access denied" {
+		t.Fatalf("serve without a token = %v, want access denied", err)
+	}
+
+	// Anonymous serving on: no token needed, and the tunnel is listed
+	// under the built-in tenant.
+	if s := set(`{"anonymous":true}`); !s.Enabled || !s.Anonymous || len(s.Tenants) != 1 || !s.Tenants[0].Anonymous {
+		t.Fatalf("after allowing anonymous serving = %+v", s)
+	}
+	if got := saved(); got == nil || !got.enabled || !got.anonymous {
+		t.Fatalf("saved = %+v", got)
+	}
+	served := make(chan error, 1)
+	go func() { served <- anon.Serve(ctx, echoTarget(t)) }()
+	waitFor(t, "the anonymous word to be served", func() bool { return anon.Check(ctx) == nil })
+	if w := hub.snapshot().Words[0]; w.Owner != anonymousOwner || !w.Live || w.Orphan {
+		t.Fatalf("word = %+v", w)
+	}
+	// A wrong token is still wrong, and nobody takes the tunnel over.
+	if err := f.client(t, otherWord, "not-a-serve-token-0123456789abcdefgh").Serve(ctx, "127.0.0.1:1"); err == nil || err.Error() != "access denied" {
+		t.Fatalf("serve with an unknown token = %v", err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+tunnel.Path+"/serve", nil)
+	req.Header.Set(tunnel.HeaderWord, testWord)
+	req.Header.Set(tunnel.HeaderName, "thief")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("a second anonymous serve of a live word = %d, want 503", resp.StatusCode)
+	}
+	if anon.Check(ctx) != nil {
+		t.Fatal("the tunnel did not survive the takeover attempt")
+	}
+
+	// Anonymous serving off: its tunnels end and their words are free.
+	if s := set(`{"anonymous":false}`); s.Anonymous || len(s.Words) != 0 || len(s.Tenants) != 0 {
+		t.Fatalf("after disallowing anonymous serving = %+v", s)
+	}
+	waitFor(t, "the anonymous tunnel to end", func() bool { return anon.Check(ctx) != nil })
+
+	// Off again: a token's tunnel ends too, and stays bound.
+	token, err := hub.addTenant("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice := f.client(t, otherWord, token)
+	go func() { _ = alice.Serve(ctx, echoTarget(t)) }()
+	waitFor(t, "alice's word to be served", func() bool { return alice.Check(ctx) == nil })
+	if s := set(`{"enabled":false}`); s.Enabled {
+		t.Fatalf("after disabling = %+v", s)
+	}
+	if got := saved(); got == nil || got.enabled || len(got.tenants) != 1 {
+		t.Fatalf("saved after disabling = %+v", got)
+	}
+	if err := alice.Check(ctx); err == nil || !strings.Contains(err.Error(), "does not accept tunnels") {
+		t.Fatalf("check after disabling = %v", err)
+	}
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the anonymous serve did not stop")
+	}
+
+	// From the command line the switches are fixed.
+	hub.persistSettings = nil
+	on := true
+	if err := hub.setSettings(&on, nil); !errors.Is(err, errSettingsFixed) {
+		t.Fatalf("setSettings without a config file = %v", err)
+	}
+}
+
+// A serving side that names a client token is only reached with it.
+func TestRelayClientToken(t *testing.T) {
+	f := newRelayFixture(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := f.client(t, testWord, testServeToken)
+	server.ClientToken = "open sesame"[:4] + "-sesame"
+	go func() { _ = server.Serve(ctx, echoTarget(t)) }()
+
+	right := f.client(t, testWord, "")
+	right.ClientToken = server.ClientToken
+	waitFor(t, "the word to be served", func() bool { return right.Check(ctx) == nil })
+	if w := f.hub.snapshot().Words[0]; !w.ClientToken {
+		t.Fatalf("word = %+v", w)
+	}
+	for name, token := range map[string]string{"no": "", "a wrong": "open-sesame!"} {
+		c := f.client(t, testWord, "")
+		c.ClientToken = token
+		if err := c.Check(ctx); err == nil || err.Error() != "access denied" {
+			t.Fatalf("check with %s client token = %v, want access denied", name, err)
+		}
+		if err := c.ConnectOne(ctx, tunnel.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || err.Error() != "access denied" {
+			t.Fatalf("connect with %s client token = %v, want access denied", name, err)
+		}
+	}
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- right.ConnectOne(ctx, tunnel.Stdio{In: inR, Out: outW}) }()
+	go func() {
+		_, _ = inW.Write([]byte("hello"))
+		_ = inW.Close()
+	}()
+	if got, err := io.ReadAll(outR); err != nil || string(got) != "hello" {
+		t.Fatalf("echo through a token-protected tunnel = %q, %v", got, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("ConnectOne = %v", err)
+	}
+}
+
+// The tunnel endpoints answer over https only: directly, or behind a proxy
+// that says so.
+func TestRelayHTTPSOnly(t *testing.T) {
+	mgr := newManager(nil, nil, halfCloseIdleTimeout)
+	cs := newConsoleServer("", "", mgr)
+	hub := newTunnelHub(testTenants(), halfCloseIdleTimeout, mgr.allocID, "")
+	hub.denyDelay = 5 * time.Millisecond
+	cs.tunnels = hub
+	srv := httptest.NewServer(cs.handler()) // plain http
+	defer srv.Close()
+	check := func(proto string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+tunnel.Path+"/check", nil)
+		req.Header.Set(tunnel.HeaderWord, testWord)
+		if proto != "" {
+			req.Header.Set("X-Forwarded-Proto", proto)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := check(""); got != http.StatusBadRequest {
+		t.Fatalf("plain http = %d, want 400", got)
+	}
+	if got := check("http"); got != http.StatusBadRequest {
+		t.Fatalf("forwarded from http = %d, want 400", got)
+	}
+	if got := check("https"); got != http.StatusForbidden { // reached the hub: nobody serves the word
+		t.Fatalf("forwarded from https = %d, want 403", got)
 	}
 }
 

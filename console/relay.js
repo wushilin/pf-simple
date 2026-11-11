@@ -6,14 +6,17 @@
 // connections with live speeds. A backend is listed from the moment it
 // registers, connections or not, and a token that is serving opens on its
 // own. Words bound to the token that nobody is serving follow in a list of
-// their own. The data arrives with each console push as state.relay, which
-// is absent when the hub is off; the tab's button is hidden then.
+// their own. Above all that is a Settings card with the hub's two switches:
+// the hub itself, and serving without a token. With the hub off the page
+// shows nothing else. The data arrives with each console push as
+// state.relay, which is absent only on a server without a hub.
 //
 // The server calls a token's holder a tenant (state.relay.tenants, and
 // "tenant" in the API paths); the page calls it a token.
 
 const RELAY_ROWS = 200; // most connections drawn per word
 const RELAY_ORPHANS = "\u0000orphans"; // group for words whose token is gone
+const RELAY_ANONYMOUS = "anonymous"; // the server's name for serving without a token
 
 const rl = {
   groups: new Map(), // token name -> group refs
@@ -92,7 +95,8 @@ function relayGroup(name) {
   const head = el("div", "relay-group-head");
   const toggle = el("button", "relay-toggle");
   toggle.type = "button";
-  toggle.append(chevron(), el("span", "relay-group-name", orphans ? "Deleted tokens" : name));
+  const anonymous = name === RELAY_ANONYMOUS;
+  toggle.append(chevron(), el("span", "relay-group-name", orphans ? "Deleted tokens" : anonymous ? "Anonymous (no token)" : name));
   const facts = el("span", "relay-group-facts");
   toggle.append(facts);
   const refs = {
@@ -109,7 +113,7 @@ function relayGroup(name) {
   refs.idleLabel.title = "Words bound to this token that nobody is serving right now";
   facts.append(refs.summary, refs.tx, refs.rx);
   const actions = el("div", "relay-actions");
-  if (!orphans) {
+  if (!orphans && !anonymous) {
     refs.rotate = relayButton("New token", "Replace this serve token; the old one stops working and its tunnels end");
     refs.del = relayButton("Delete", "Delete this token, end its tunnels and free its words", true);
     actions.append(refs.rotate, refs.del);
@@ -146,15 +150,17 @@ function relayCard(w) {
   route.append(word, arrow, target);
   const title = el("span", "relay-word-title");
   title.title = "The name the serving side gave this tunnel";
+  const locked = el("span", "relay-chip locked", "Client token");
+  locked.title = "The serving side asks for a client token: connecting needs it as well as the word";
   const actions = el("div", "relay-actions");
   const reset = relayButton("Reset", "End this tunnel and its connections; the serving side registers again on its own");
   const clear = relayButton("Clear binding", "Remove the binding of this word to its token, and end its tunnel", true);
   actions.append(reset, clear);
-  head.append(chip, route, title, actions);
+  head.append(chip, route, locked, title, actions);
 
   const meta = el("div", "relay-meta");
   const refs = {
-    card, chip, title, arrow, target, reset, clear, sessions: new Map(),
+    card, chip, locked, title, arrow, target, reset, clear, sessions: new Map(),
     owner: relayFact(meta, "Token"),
     from: relayFact(meta, "Served from"),
     since: relayFact(meta, ""),
@@ -213,6 +219,7 @@ function paintRelayWord(c, w, now) {
   c.chip.className = w.live ? "relay-chip live" : "relay-chip";
   c.card.classList.toggle("idle", !w.live);
   setText(c.title, w.name || "(unnamed)");
+  c.locked.hidden = !(w.live && w.clientToken);
   c.arrow.hidden = c.target.hidden = !w.live;
   setText(c.target, w.live ? w.target || "(target not given)" : "");
   c.reset.hidden = !w.live;
@@ -301,6 +308,36 @@ $("tenant-token-copy").addEventListener("click", () => {
   }
 });
 
+// ---------- settings ----------
+
+function relaySetting(id, field, done) {
+  const box = $(id);
+  box.addEventListener("change", () => {
+    const on = box.checked;
+    box.disabled = true;
+    api("api/relay/settings", { [field]: on }).then(() => toast(done(on)))
+      .catch((e) => { box.checked = !on; toast(`Could not change the setting: ${e.message}`, true); })
+      .finally(() => { box.disabled = false; if (ui.state) relayPaint(ui.state.relay); });
+  });
+}
+relaySetting("relay-enabled", "enabled", (on) => on ? "The relay hub is on" : "The relay hub is off; its tunnels were closed");
+relaySetting("relay-anonymous", "anonymous", (on) => on ? "Anyone can serve without a token now" : "Serving needs a token again; anonymous tunnels were closed");
+
+function relayPaintSettings(relay) {
+  const enabled = $("relay-enabled"), anonymous = $("relay-anonymous");
+  // A switch being changed keeps what the viewer chose until the answer.
+  if (!enabled.disabled || !relay.manage) enabled.checked = relay.enabled;
+  if (!anonymous.disabled || !relay.manage) anonymous.checked = relay.anonymous;
+  if (!relay.manage) enabled.disabled = anonymous.disabled = true;
+  $("relay-settings-fixed").hidden = relay.manage;
+  $("relay-anonymous-row").hidden = !relay.enabled;
+  setText($("relay-anonymous-note"), relay.anonymous
+    ? "On: pf-client serve needs no serve token, so anyone who can reach this server can relay through it. Their tunnels are listed under Anonymous."
+    : "Off: pf-client serve needs a serve token from the list below. Turn this on to let anyone who can reach this server serve without one.");
+  $("relay-anonymous-row").classList.toggle("warn", relay.anonymous);
+  $("relay-details").hidden = !relay.enabled;
+}
+
 // ---------- paint ----------
 
 function relayPaint(relay) {
@@ -310,6 +347,8 @@ function relayPaint(relay) {
     return;
   }
   if ($("tab-relay").hidden) return;
+  relayPaintSettings(relay);
+  if (!relay.enabled) return;
   const now = serverNow();
 
   // Group the words by token; words whose token is gone get their own group.
@@ -366,10 +405,12 @@ function relayPaint(relay) {
     setText(g.tx, "↑ " + fmtRate(tx));
     setText(g.rx, "↓ " + fmtRate(rx));
     if (g.rotate) g.rotate.hidden = g.del.hidden = !relay.manage;
+    if (name === RELAY_ANONYMOUS) g.toggle.title = "Tunnels served without a serve token";
     g.liveLabel.hidden = live === 0;
     g.idleLabel.hidden = idle === 0;
     g.note.hidden = live > 0;
     setText(g.note, words.length ? "Not serving anything right now. A backend appears here as soon as pf-client serve registers it."
+      : name === RELAY_ANONYMOUS ? "No words yet. One appears when pf-client serve registers it without a serve token."
       : "No words yet. One appears when pf-client serve registers it with this token.");
     if (open) for (const w of words) paintRelayWord(rl.words.get(w.id), w, now);
   }
@@ -385,7 +426,7 @@ function relayPaint(relay) {
   setText($("tenant-note"), relay.manage ? "Each token lets one holder run pf-client serve. Under a token are the backends it serves, and under each its connections."
     : "Set with --tunnel. Start pf-simple from a config file to manage tokens here.");
   $("relay-empty").hidden = names.length > 0;
-  const count = relay.tenants.length;
+  const count = relay.tenants.filter((t) => !t.anonymous).length;
   const idleAll = relay.words.length - liveAll;
   setText($("relay-note"), `${plural(count, "token")} · ${plural(liveAll, "backend")} serving · ${plural(connsAll, "open connection")}`
     + (idleAll ? ` · ${plural(idleAll, "word")} not served` : ""));

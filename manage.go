@@ -563,15 +563,34 @@ func (m *manager) validate(spec listenerSpec, id int) (listenerSpec, error) {
 // saveTenants writes the relay hub's tenants into the config file. On
 // failure the file and the manager's copy stay as they were.
 func (m *manager) saveTenants(tenants []tenantSpec) error {
+	return m.saveTunnel(func(t *tunnelTable) { t.Tenants = tenants })
+}
+
+// saveTunnelSettings writes the hub's switches into the config file.
+func (m *manager) saveTunnelSettings(enabled, anonymous bool) error {
+	return m.saveTunnel(func(t *tunnelTable) { t.Enabled, t.AnonymousServe = &enabled, anonymous })
+}
+
+// saveTunnel changes [tunnel] and rewrites the config file, adding the
+// table if the file had none. On failure nothing has changed.
+func (m *manager) saveTunnel(change func(*tunnelTable)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.tunnelRaw == nil || m.configPath == "" {
+	if m.configPath == "" {
 		return errNoManaging
 	}
-	old := m.tunnelRaw.Tenants
-	m.tunnelRaw.Tenants = tenants
+	old := m.tunnelRaw
+	next := tunnelTable{}
+	if old != nil {
+		next = *old
+	} else {
+		off := false // what a file without the table means
+		next.Enabled = &off
+	}
+	change(&next)
+	m.tunnelRaw = &next
 	if err := m.saveLocked(); err != nil {
-		m.tunnelRaw.Tenants = old
+		m.tunnelRaw = old
 		return err
 	}
 	return nil

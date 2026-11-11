@@ -32,9 +32,15 @@ const (
 	HeaderName   = "X-PF-Tunnel-Name" // what the tunnel is called in the console; URL-escaped
 	HeaderTarget = "X-PF-Tunnel-Target"
 	HeaderError  = "X-PF-Tunnel-Error"
+	// A serving side may ask for a client token on top of the word. It
+	// registers the token's SHA-256, and the connecting side sends the token.
+	HeaderClientHash  = "X-PF-Client-Token-SHA256"
+	HeaderClientToken = "X-PF-Client-Token"
 
 	MinSecret = 32
 	MaxSecret = 128
+	// A client token is typed by people, like a password.
+	MinClientToken = 8
 
 	// The serving side pings its control channel; either end gives up on it
 	// after ControlSilence.
@@ -102,6 +108,23 @@ func CheckSecret(what, secret string) error {
 	return nil
 }
 
+// CheckClientToken applies the rules for client tokens: 8 to 128 printable
+// ASCII characters, without spaces.
+func CheckClientToken(token string) error {
+	if len(token) < MinClientToken {
+		return fmt.Errorf("the client token must be at least %d characters long (got %d)", MinClientToken, len(token))
+	}
+	if len(token) > MaxSecret {
+		return fmt.Errorf("the client token must be at most %d characters long", MaxSecret)
+	}
+	for _, c := range token {
+		if c <= ' ' || c > '~' {
+			return errors.New("the client token may only use printable ASCII characters, without spaces")
+		}
+	}
+	return nil
+}
+
 // ControlMessage is what the relay sends down a serving side's control
 // channel: open a connection to your target and bring it to /accept.
 type ControlMessage struct {
@@ -116,9 +139,13 @@ type Client struct {
 	http *http.Client
 	Logf func(format string, args ...any)
 	// ServeToken is a serve token of the server, and Name what the tunnel is
-	// called in the server's console. Only Serve needs them.
+	// called in the server's console. Only Serve uses them; without a serve
+	// token the registration is anonymous, which the server must allow.
 	ServeToken string
 	Name       string
+	// ClientToken is a second secret the serving side may ask of whoever
+	// connects. Serve registers it, and the connecting side must send it.
+	ClientToken string
 }
 
 // NewClient checks the relay URL and the word. tlsConfig may be nil.
@@ -160,6 +187,16 @@ func (c *Client) header(conn string) http.Header {
 	h.Set(HeaderWord, c.word)
 	if conn != "" {
 		h.Set(HeaderConn, conn)
+	}
+	return h
+}
+
+// connectHeader is what the connecting side sends: the word, and the client
+// token if the serving side asks for one.
+func (c *Client) connectHeader() http.Header {
+	h := c.header("")
+	if c.ClientToken != "" {
+		h.Set(HeaderClientToken, c.ClientToken)
 	}
 	return h
 }
@@ -209,7 +246,7 @@ func explain(err error) error {
 
 // Check asks the relay whether someone is serving this word.
 func (c *Client) Check(ctx context.Context) error {
-	return explain(c.get(ctx, "check", c.header("")))
+	return explain(c.get(ctx, "check", c.connectHeader()))
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
@@ -305,7 +342,13 @@ func (c *Client) ServeOne(ctx context.Context, local localConn) error {
 func (c *Client) serve(ctx context.Context, target string, open func(id string)) error {
 	h := c.header("")
 	h.Set(HeaderTarget, target)
-	h.Set(HeaderServe, c.ServeToken)
+	if c.ServeToken != "" {
+		h.Set(HeaderServe, c.ServeToken)
+	}
+	if c.ClientToken != "" {
+		sum := sha256.Sum256([]byte(c.ClientToken))
+		h.Set(HeaderClientHash, hex.EncodeToString(sum[:]))
+	}
 	h.Set(HeaderName, url.QueryEscape(c.Name))
 	backoff, served := retryMin, false
 	for attempt := 1; ; attempt++ {
@@ -366,7 +409,7 @@ func (c *Client) Watch(ctx context.Context) {
 			up, backoff = true, retryMin
 		default:
 			if up || first {
-				c.Logf("the tunnel is not available (%v): the word is wrong or nobody is serving it yet; connections are refused until it is, and this keeps checking", err)
+				c.Logf("the tunnel is not available (%v): the word is wrong, nobody is serving it yet, or it asks for a client token that was not given; connections are refused until it is, and this keeps checking", err)
 			}
 			up, wait = false, backoff
 			backoff = min(backoff*2, retryMax)
@@ -689,7 +732,7 @@ func (e *endError) Error() string { return e.reason }
 func (e *endError) Unwrap() error { return e.err }
 
 func (c *Client) carry(ctx context.Context, local localConn, from string) error {
-	ws, err := c.dial(ctx, "connect", c.header(""))
+	ws, err := c.dial(ctx, "connect", c.connectHeader())
 	if err != nil {
 		_ = local.Close()
 		err = explain(err)

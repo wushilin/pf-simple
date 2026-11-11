@@ -119,6 +119,26 @@
     </section>
 
     <section id="tab-relay" role="tabpanel" aria-labelledby="tab-btn-relay" hidden>
+      <h2 class="relay-card-title">Settings</h2>
+      <div class="relay-word relay-settings">
+        <label class="relay-setting" for="relay-enabled">
+          <input class="switch" type="checkbox" role="switch" id="relay-enabled">
+          <span class="relay-setting-text">
+            <b>Relay hub</b>
+            <span id="relay-enabled-note">Lets two pf-client processes meet here and forward a port between them. Off, the tunnel endpoints answer as if they did not exist.</span>
+          </span>
+        </label>
+        <label class="relay-setting" for="relay-anonymous" id="relay-anonymous-row">
+          <input class="switch" type="checkbox" role="switch" id="relay-anonymous">
+          <span class="relay-setting-text">
+            <b>Enable anonymous serve</b>
+            <span id="relay-anonymous-note"></span>
+          </span>
+        </label>
+        <div class="relay-none" id="relay-settings-fixed" hidden>Set on the command line. Start pf-simple from a config file to change these here.</div>
+      </div>
+      <div id="relay-details">
+      <h2 class="relay-card-title">Details</h2>
       <div class="toolbar">
         <span class="toolbar-note" id="relay-note"></span>
       </div>
@@ -145,6 +165,7 @@
       </div>
       <div id="relay-groups"></div>
       <div class="empty relay-empty" id="relay-empty"><img src="logo-sleep.svg" alt=""><span>No tokens yet, so nobody can serve. Add one to get a serve token for <code>pf-client serve</code>.</span></div>
+      </div>
     </section>
 
     <section id="tab-api" role="tabpanel" aria-labelledby="tab-btn-api" hidden>

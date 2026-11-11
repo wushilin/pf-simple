@@ -951,6 +951,10 @@
              "name": {
               "type": "string",
               "description": "What the serving side called the tunnel (pf-client serve --name)"
+             },
+             "clientToken": {
+              "type": "boolean",
+              "description": "The serving side asks for a client token: connecting needs it as well as the word"
              }
             }
            }
@@ -972,10 +976,22 @@
              },
              "live": {
               "type": "integer"
+             },
+             "anonymous": {
+              "type": "boolean",
+              "description": "The built-in tenant of serving without a token; it cannot be rotated or deleted"
              }
             }
            },
            "description": "The serve tokens by name; the console calls these Tokens"
+          },
+          "enabled": {
+           "type": "boolean",
+           "description": "The hub's switch. Off, the tunnel endpoints answer 404 and the lists are empty"
+          },
+          "anonymous": {
+           "type": "boolean",
+           "description": "Whether `pf-client serve` may register without a serve token; such words belong to the built-in tenant `anonymous`"
           }
          }
         }
@@ -983,7 +999,7 @@
       }
      },
      "404": {
-      "description": "The relay hub is off",
+      "description": "This server has no relay hub",
       "content": {
        "application/json": {
         "schema": {
@@ -1106,6 +1122,87 @@
      },
      "401": {
       "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/settings": {
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Change the relay hub's switches",
+    "description": "Turns the hub on or off, and allows or disallows `pf-client serve` without a serve token. A field left out keeps its value. The change is saved to the config file's `[tunnel]` table. Turning the hub off ends every tunnel; disallowing anonymous serving ends the tunnels served that way and frees their words.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "enabled": {
+          "type": "boolean",
+          "description": "The hub itself"
+         },
+         "anonymous": {
+          "type": "boolean",
+          "description": "Serving without a serve token"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The hub's state after the change, as from GET /relay",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Bad request body",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "This server has no relay hub",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "Missing X-PF-Console / X-API-Token header, or the switches are fixed because pf-simple was started from the command line",
       "content": {
        "application/json": {
         "schema": {

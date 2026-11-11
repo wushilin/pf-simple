@@ -56,11 +56,18 @@ func main() {
 	var console *consoleServer
 	if cfg.console != nil {
 		console = newConsoleServer(cfg.console.addr, cfg.console.password, mgr)
+		// The hub is always there with a console, switched on or off: from
+		// a config file, the console's Relay hub tab can change that.
+		var tenants []tenantSpec
 		if cfg.tunnel != nil {
-			console.tunnels = newTunnelHub(cfg.tunnel.tenants, halfCloseIdleTimeout, mgr.allocID, relayStatePath(cfg.configPath))
-			if cfg.configPath != "" {
-				console.tunnels.persist = mgr.saveTenants
-			}
+			tenants = cfg.tunnel.tenants
+		}
+		console.tunnels = newTunnelHub(tenants, halfCloseIdleTimeout, mgr.allocID, relayStatePath(cfg.configPath))
+		console.tunnels.enabled = cfg.tunnel != nil && cfg.tunnel.enabled
+		console.tunnels.anonymous = cfg.tunnel != nil && cfg.tunnel.anonymous
+		if cfg.configPath != "" {
+			console.tunnels.persist = mgr.saveTenants
+			console.tunnels.persistSettings = mgr.saveTunnelSettings
 		}
 	}
 
@@ -89,7 +96,7 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 		if console.mgr.policy != nil {
 			mode += ", listener management on"
 		}
-		if console.tunnels != nil {
+		if console.tunnels.enabled {
 			mode += ", tunnels on"
 		}
 		log.Printf("console on http://%s%s/ (%s)", ln.Addr(), consolePrefix, mode)

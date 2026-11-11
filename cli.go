@@ -30,6 +30,8 @@ console; see pf-client -h):
 
   pf-simple --console 18222@secret --tunnel <serve-token>
 
+With -c, the console's Relay hub tab turns the hub on and off instead.
+
 --config/-c cannot be combined with any other flag or argument.
 pf-simple --version prints the version.
 
@@ -145,7 +147,7 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 		s.console = &consoleSettings{addr: addr, password: password}
 	}
 	if tunnelOn {
-		s.tunnel = &tunnelSettings{tenants: tenants}
+		s.tunnel = &tunnelSettings{enabled: true, tenants: tenants}
 	}
 	return s, nil
 }
