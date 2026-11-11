@@ -58,6 +58,12 @@ type consoleSettings struct {
 	addr     string
 	password string
 	manage   *managePolicy // set in config mode: the console may change listeners
+	// tlsMode makes the console serve https itself: tlsSelfSigned or
+	// tlsDirectory, with the files in tlsDir; tlsOff is plain http.
+	// tlsNames are extra names for a self-signed certificate.
+	tlsMode  string
+	tlsDir   string
+	tlsNames []string
 }
 
 // consoleTable is the [console] table. The tags keep a rewritten file free of
@@ -65,6 +71,15 @@ type consoleSettings struct {
 type consoleTable struct {
 	Listen   string `toml:"listen"`
 	Password string `toml:"password,omitempty"`
+	// TLS serves https on the console's listener: "self_signed" (pf-simple
+	// is its own CA) or "directory" (server.pem and server.key of your
+	// own); absent or "off" is plain http. TLSDir is where the files are,
+	// "certs" next to this file by default. TLSNames adds host names and
+	// addresses to a self-signed certificate. The console's Relay hub tab
+	// changes all three.
+	TLS      string   `toml:"tls,omitempty"`
+	TLSDir   string   `toml:"tls_dir,omitempty"`
+	TLSNames []string `toml:"tls_names,omitempty"`
 	// Optional fences for listeners added or edited in the console. An
 	// omitted one means no restriction.
 	AllowTargetHosts []string `toml:"allow_target_hosts,omitempty"`
@@ -206,7 +221,14 @@ func loadConfig(path, envPassword string) (settings, error) {
 		if password == "" {
 			password = envPassword
 		}
-		s.console = &consoleSettings{addr: addr, password: password}
+		mode, err := checkTLSMode(c.TLS)
+		if err != nil {
+			return settings{}, fmt.Errorf("config %s: [console]: %w", path, err)
+		}
+		if err := checkTLSNames(c.TLSNames); err != nil {
+			return settings{}, fmt.Errorf("config %s: [console]: %w", path, err)
+		}
+		s.console = &consoleSettings{addr: addr, password: password, tlsMode: mode, tlsDir: c.TLSDir, tlsNames: c.TLSNames}
 		if c.Password != "" {
 			if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o004 != 0 {
 				fmt.Fprintf(os.Stderr, "warning: %s holds the console password and is readable by every user; consider chmod 600\n", path)

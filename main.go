@@ -63,6 +63,14 @@ func main() {
 			tenants = cfg.tunnel.tenants
 		}
 		console.tunnels = newTunnelHub(tenants, halfCloseIdleTimeout, mgr.allocID, relayStatePath(cfg.configPath))
+		// Before anything listens, so a bad certificate stops the start.
+		console.tls = newTLSManager(cfg.console.addr, cfg.configPath)
+		if err := console.tls.start(cfg.console.tlsMode, cfg.console.tlsDir, cfg.console.tlsNames); err != nil {
+			log.Fatalf("%v", err)
+		}
+		if cfg.configPath != "" {
+			console.tls.persist = mgr.saveConsoleTLS
+		}
 		console.tunnels.enabled = cfg.tunnel != nil && cfg.tunnel.enabled
 		console.tunnels.anonymous = cfg.tunnel != nil && cfg.tunnel.anonymous
 		if cfg.configPath != "" {
@@ -89,6 +97,11 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 			mgr.shutdown()
 			return fmt.Errorf("console listen on %s: %w", console.addr, err)
 		}
+		scheme, tlsOn := "http", console.tls.config.Load() != nil
+		if tlsOn {
+			scheme = "https"
+		}
+		ln = console.tls.listen(ln)
 		mode := "password required"
 		if console.password == "" {
 			mode = "no password"
@@ -99,7 +112,12 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 		if console.tunnels.enabled {
 			mode += ", tunnels on"
 		}
-		log.Printf("console on http://%s%s/ (%s)", ln.Addr(), consolePrefix, mode)
+		log.Printf("console on %s://%s%s/ (%s)", scheme, ln.Addr(), consolePrefix, mode)
+		if tlsOn {
+			log.Printf("console TLS: %s", console.tls.describe())
+		} else if console.tunnels.enabled {
+			log.Printf("the relay hub answers only over https: put a TLS reverse proxy that sets X-Forwarded-Proto in front, or turn on the console's own TLS (in the Relay hub tab, with tls in [console], or --console-tls)")
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

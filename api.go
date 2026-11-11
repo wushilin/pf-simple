@@ -33,6 +33,8 @@ func (s *consoleServer) apiRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+p+"/flows", read(s.handleFlows))
 	mux.HandleFunc("GET "+p+"/relay", read(s.handleRelay))
 	mux.HandleFunc("POST "+p+"/relay/{id}/{action}", write(s.handleRelayAction))
+	mux.HandleFunc("GET "+p+"/tls", read(s.handleTLS))
+	mux.HandleFunc("POST "+p+"/tls", write(s.handleSetTLS))
 	mux.HandleFunc("POST "+p+"/relay/settings", write(s.handleRelaySettings))
 	mux.HandleFunc("POST "+p+"/relay/tenants", write(s.handleAddTenant))
 	mux.HandleFunc("POST "+p+"/relay/tenants/{name}/{action}", write(s.handleTenantAction))

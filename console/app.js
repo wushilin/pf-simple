@@ -620,6 +620,7 @@ function applyState(s) {
   ui.state = s;
   relayFeed(s.relay, s.now);
   relayPaint(s.relay);
+  tlsPaint(s.tls);
   // A link to #relay can only be honored once the first push says the hub is on.
   if (s.relay && !hadRelay && location.hash === "#relay" && !$("app").hidden) showTab("relay");
   if (s.host) { $("host").hidden = false; setText($("host"), s.host); document.title = `${s.host} · pf-simple`; }

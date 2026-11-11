@@ -336,7 +336,88 @@ $("tenant-token-copy").addEventListener("click", () => {
   }
 });
 
-// ---------- settings ----------
+// ---------- settings: https on this listener ----------
+
+// The console's own TLS: off, self-signed (pf-simple is its own CA) or a
+// directory with the user's certificate. Changing it switches the very
+// listener this page is served from, so after a change between http and
+// https the page moves to the other scheme.
+const tlsUI = { synced: "", busy: false, armed: 0 };
+
+// direct says whether the browser talks to pf-simple itself. Behind a TLS
+// proxy the page is https while pf-simple speaks plain http.
+function tlsDirect(tls) {
+  return (location.protocol === "https:") === (tls.mode !== "off");
+}
+
+function tlsForm() {
+  return {
+    mode: $("tls-mode").value,
+    dir: $("tls-dir").value.trim(),
+    names: $("tls-names").value.split(/[\s,]+/).filter(Boolean),
+  };
+}
+
+function tlsPaint(tls) {
+  $("tls-row").hidden = !tls;
+  if (!tls) return;
+  // Fill the form from the server when its settings change, not on every
+  // push: the viewer may be typing.
+  const key = JSON.stringify([tls.mode, tls.dir, tls.names]);
+  if (key !== tlsUI.synced) {
+    tlsUI.synced = key;
+    $("tls-mode").value = tls.mode;
+    $("tls-dir").value = tls.dir;
+    $("tls-names").value = tls.names.join(", ");
+  }
+  const mode = $("tls-mode").value;
+  for (const id of ["tls-mode", "tls-dir", "tls-names", "tls-apply"]) $(id).disabled = !tls.manage || tlsUI.busy;
+  $("tls-dir").hidden = mode === "off";
+  $("tls-names").hidden = mode !== "self_signed";
+  $("tls-apply").hidden = !tls.manage;
+  const proxied = !tlsDirect(tls);
+  setText($("tls-note"), !tls.manage ? "Set on the command line. Start pf-simple from a config file to change it here."
+    : mode === "off" ? "pf-simple speaks plain http and needs a TLS reverse proxy in front for the relay hub, which answers over https only."
+    : mode === "self_signed" ? "pf-simple makes a CA and a server certificate in the directory and renews both on its own; the keys never change. Give ca.pem to clients: pf-client --ca ca.pem."
+    : "pf-simple serves server.pem with server.key from the directory, and reads them again when they change.");
+  const on = tls.mode !== "off";
+  setText($("tls-cert"), !on ? (proxied ? "This page reached pf-simple through a TLS proxy. Turning https on here would cut that proxy off unless it is changed to speak https to pf-simple." : "")
+    : `Serving from ${tls.path}: certificate ${tls.fingerprint || "(none)"}, issued by ${tls.issuer || "?"}, valid until ${tls.notAfter ? new Date(tls.notAfter).toISOString().slice(0, 10) : "?"}, for ${(tls.certNames || []).join(", ")}.`);
+  $("tls-cert").className = !on && proxied ? "tls-warn" : "";
+}
+
+$("tls-mode").addEventListener("change", () => { if (ui.state) tlsPaint(ui.state.tls); });
+$("tls-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const tls = ui.state && ui.state.tls;
+  if (!tls || tlsUI.busy) return;
+  const want = tlsForm();
+  const btn = $("tls-apply");
+  // Behind a proxy, turning TLS on locks this page out: ask twice.
+  if (!tlsDirect(tls) && want.mode !== "off" && Date.now() - tlsUI.armed > ARM_MS) {
+    tlsUI.armed = Date.now();
+    setText(btn, "Confirm");
+    btn.classList.add("armed");
+    setTimeout(() => { setText(btn, "Apply"); btn.classList.remove("armed"); }, ARM_MS);
+    return;
+  }
+  tlsUI.armed = 0;
+  setText(btn, "Apply");
+  btn.classList.remove("armed");
+  setText($("tls-error"), "");
+  const moves = tlsDirect(tls) && (tls.mode === "off") !== (want.mode === "off");
+  tlsUI.busy = true;
+  tlsPaint(tls);
+  api("api/tls", want).then(() => {
+    if (!moves) { toast("Saved the HTTPS settings"); return; }
+    const scheme = want.mode === "off" ? "http:" : "https:";
+    toast(`The console now speaks ${scheme.slice(0, -1)}; reloading there`);
+    setTimeout(() => { location.href = `${scheme}//${location.host}${location.pathname}${location.hash}`; }, 1200);
+  }).catch((e) => setText($("tls-error"), e.message))
+    .finally(() => { tlsUI.busy = false; if (ui.state) tlsPaint(ui.state.tls); });
+});
+
+// ---------- settings: the hub ----------
 
 function relaySetting(id, field, done) {
   const box = $(id);
