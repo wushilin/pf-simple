@@ -233,8 +233,10 @@ function paintRelayWord(c, w, now) {
   c.from.wrap.hidden = !w.live;
   setText(c.from.value, w.live ? w.serveAddr : "");
   c.client.wrap.hidden = !w.live || !w.client;
-  setText(c.client.value, w.live && w.client ? `${w.client} · protocol ${w.proto}` : "");
-  c.client.wrap.title = "The serving side's program, and the tunnel protocol version in use with it";
+  // The server leaves proto out when it is 0: a pf-client from before
+  // 0.14.0, which announces no tunnel protocol.
+  setText(c.client.value, w.live && w.client ? `${w.client} · protocol ${w.proto || 0}` : "");
+  c.client.wrap.title = "The serving side's program, and the tunnel protocol in use with it: 1 for pf-client 0.14.0 or later, 0 for an older one that announces none (plain tunnels only)";
   setText(c.since.wrap.firstChild, w.live ? "Up " : "Last served ");
   setText(c.since.value, w.live ? fmtAge(now - w.since) : fmtClock(w.lastServed));
   for (const f of [c.conns, c.tx, c.rx, c.up, c.down]) f.wrap.hidden = !w.live;
