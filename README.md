@@ -475,6 +475,62 @@ command line, `--console-tls` is the self-signed mode with `./certs`.
 it as `<name>.relay.json` (mode 600; the words in it are secrets). Started
 from the command line, they last until a restart.
 
+### Versions: which pf-client works with which server
+
+`pf-client` and the hub speak a tunnel protocol with a version of its own,
+separate from the release numbers, and agree on one at every request. One
+`pf-client` therefore works with servers of several ages, and a server with
+clients of several ages; the two do not have to be the same release.
+
+| Tunnel protocol | Spoken by | What it covers |
+| --- | --- | --- |
+| 1 (sealed) | 0.14.0 and later | Everything on this page: serve tokens, serving without one, client tokens, stdio. |
+| 0 | 0.11.0 to 0.13.0, which announce no version | Plain tunnels: a word, a serve token, a name and a target. |
+
+Protocol 1 is sealed: it will not change. Whatever is added later becomes
+protocol 2, and both programs keep speaking the older ones, so upgrading
+one side does not force the other.
+
+What happens when the two sides differ:
+
+- **Plain tunnels work across all of them**, in both directions.
+- **A feature the server is too old for is refused, never silently
+  dropped.** `pf-client` 0.14.0 will not use `--client-token`, or serve
+  without a serve token, against a server older than 0.14.0, and says so:
+  such a server may ignore the client token and leave the tunnel open to
+  anyone with the word. (0.12.0 and 0.13.0 do check it, but do not say so,
+  and are treated the same; upgrade them.)
+- **An older `pf-client` against a newer server** works for plain tunnels,
+  and gets `access denied` from a tunnel that asks for a client token it
+  cannot send.
+- **A `pf-client` that needs a protocol the server does not have** is
+  answered `426` with which versions each side speaks and what to upgrade.
+
+`pf-client version` and `pf-simple --version` print the program's version
+and the protocol range it speaks. To ask a server which one it is, use a
+serve token of that server:
+
+```sh
+pf-client version
+# pf-client 0.14.0 (tunnel protocol 0-1)
+
+pf-client server-version --server https://relay.example.com/ --token "$PF_SERVE_TOKEN"
+# server:  pf-simple 0.14.0, tunnel protocol 0-1
+# client:  pf-client 0.14.0, tunnel protocol 0-1
+# in use:  tunnel protocol 1
+# token:   alice-laptop
+```
+
+Without a valid serve token the hub says nothing about its version, on any
+tunnel request: `server-version` gets `access denied`, also where serving
+needs no token. A server older than 0.14.0 cannot be asked. (The
+console's own `/pf/api/health` does report the version to whoever can
+reach the console's address.) The console
+shows, for each tunnel, the serving side's `pf-client` version and the
+protocol in use. The rules for changing the protocol are in
+[`AGENTS.md`](AGENTS.md) and at the top of
+[`internal/tunnel/proto.go`](internal/tunnel/proto.go).
+
 `pf-client` arguments:
 
 | Argument | Meaning |

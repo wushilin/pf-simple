@@ -143,6 +143,9 @@ type Client struct {
 	// token the registration is anonymous, which the server must allow.
 	ServeToken string
 	Name       string
+	// Version is this program's version, sent to the server for its logs
+	// and console.
+	Version string
 	// ClientToken is a second secret the serving side may ask of whoever
 	// connects. Serve registers it, and the connecting side must send it.
 	ClientToken string
@@ -182,6 +185,54 @@ func normalizeBase(raw string) (string, error) {
 	return "https://" + u.Host, nil
 }
 
+// needs lists what a request to endpoint depends on beyond protocol 0.
+func (c *Client) needs(endpoint string) []Feature {
+	var out []Feature
+	switch endpoint {
+	case "serve":
+		if c.ClientToken != "" {
+			out = append(out, FeatureClientToken)
+		}
+		if c.ServeToken == "" {
+			out = append(out, FeatureAnonymousServe)
+		}
+	case "connect", "check":
+		if c.ClientToken != "" {
+			out = append(out, FeatureClientToken)
+		}
+	}
+	return out
+}
+
+// offer adds the protocol range for a request to endpoint to its headers:
+// from the newest protocol it depends on, so a server that knows about
+// protocols refuses one it cannot honor.
+func (c *Client) offer(endpoint string, h http.Header) {
+	min := ProtoMin
+	for _, f := range c.needs(endpoint) {
+		if p := featureProto[f].proto; p > min {
+			min = p
+		}
+	}
+	h.Set(HeaderProto, ProtoRange(min, ProtoMax))
+	if c.Version != "" {
+		h.Set(HeaderVersion, "pf-client "+c.Version)
+	}
+}
+
+// answered checks a response to endpoint: a server from before protocols
+// were negotiated ignores what it does not know, so it is for this side to
+// refuse when the run depends on something that server would not do.
+func (c *Client) answered(endpoint string, h http.Header) error {
+	proto := serverProto(h)
+	for _, f := range c.needs(endpoint) {
+		if proto < featureProto[f].proto {
+			return &ProtoError{Server: proto, Need: f}
+		}
+	}
+	return nil
+}
+
 func (c *Client) header(conn string) http.Header {
 	h := http.Header{}
 	h.Set(HeaderWord, c.word)
@@ -202,7 +253,22 @@ func (c *Client) connectHeader() http.Header {
 }
 
 func (c *Client) dial(ctx context.Context, endpoint string, h http.Header) (*Conn, error) {
-	return Dial(ctx, c.base+Path+"/"+endpoint, h, c.tls)
+	c.offer(endpoint, h)
+	ws, err := Dial(ctx, c.base+Path+"/"+endpoint, h, c.tls)
+	var se *StatusError
+	switch {
+	case err == nil:
+		if perr := c.answered(endpoint, ws.Header); perr != nil {
+			_ = ws.Close()
+			return nil, perr
+		}
+	case errors.As(err, &se) && se.Code != http.StatusNotFound:
+		// Refused, perhaps for the very thing the server is too old for.
+		if perr := c.answered(endpoint, se.Header); perr != nil {
+			return nil, perr
+		}
+	}
+	return ws, err
 }
 
 // get makes a plain request; anything but 2xx is a *StatusError.
@@ -211,14 +277,20 @@ func (c *Client) get(ctx context.Context, endpoint string, h http.Header) error 
 	if err != nil {
 		return err
 	}
+	c.offer(endpoint, h)
 	req.Header = h
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound { // 404: no hub there to be old
+		if perr := c.answered(endpoint, resp.Header); perr != nil {
+			return perr
+		}
+	}
 	if resp.StatusCode/100 != 2 {
-		return &StatusError{Code: resp.StatusCode, Msg: errorText(resp.Body)}
+		return &StatusError{Code: resp.StatusCode, Msg: errorText(resp.Body), Header: resp.Header}
 	}
 	return nil
 }
@@ -236,12 +308,47 @@ func explain(err error) error {
 		if se.Msg != "" {
 			return errors.New(se.Msg)
 		}
+	case http.StatusUpgradeRequired:
+		if se.Msg != "" { // the protocols do not meet; the server says how
+			return errors.New(se.Msg)
+		}
 	case http.StatusNotFound:
 		if se.Msg == "" {
 			return errors.New("this server does not accept tunnels (it needs --tunnel or a [tunnel] table)")
 		}
 	}
 	return err
+}
+
+// ErrNoProbe is a server that does not answer a version probe.
+var ErrNoProbe = errors.New("this server does not answer a version probe: it is older than pf-simple 0.14.0, or its relay hub is off")
+
+// Probe asks the server for its version and the tunnel protocols it
+// speaks. It needs a valid serve token: without one the server says
+// nothing about itself.
+func (c *Client) Probe(ctx context.Context) (*ServerInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+Path+"/version", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(HeaderServe, c.ServeToken)
+	c.offer("version", req.Header)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, ErrNoProbe
+	case resp.StatusCode/100 != 2:
+		return nil, explain(&StatusError{Code: resp.StatusCode, Msg: errorText(resp.Body), Header: resp.Header})
+	}
+	var info ServerInfo
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&info); err != nil || info.Version == "" {
+		return nil, errors.New("the server's answer to the version probe is not understood")
+	}
+	return &info, nil
 }
 
 // Check asks the relay whether someone is serving this word.
@@ -361,6 +468,10 @@ func (c *Client) serve(ctx context.Context, target string, open func(id string))
 		}
 		if err != nil {
 			var se *StatusError
+			var pe *ProtoError
+			if errors.As(err, &pe) { // the server cannot do what was asked: waiting will not change it
+				return err
+			}
 			if !served && errors.As(err, &se) && se.Final() {
 				return explain(err)
 			}
@@ -407,6 +518,12 @@ func (c *Client) Watch(ctx context.Context) {
 				c.Logf("the tunnel is up")
 			}
 			up, backoff = true, retryMin
+		case errors.As(err, new(*ProtoError)):
+			if up || first {
+				c.Logf("%v; connections are refused meanwhile, and this keeps checking", err)
+			}
+			up, wait = false, backoff
+			backoff = min(backoff*2, retryMax)
 		default:
 			if up || first {
 				c.Logf("the tunnel is not available (%v): the word is wrong, nobody is serving it yet, or it asks for a client token that was not given; connections are refused until it is, and this keeps checking", err)

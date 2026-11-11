@@ -67,6 +67,25 @@ func TestParse(t *testing.T) {
 		t.Fatalf("connect with a CA = %+v", o)
 	}
 	fails("contradict", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "--ca=/x/ca.crt", "-k")
+	for _, args := range [][]string{
+		{"server-version", "--server", "https://relay.example.com/", "--token", token},
+		{"server-version", "--server=https://relay.example.com/", "--serve-token=" + token},
+		{"server-version", "https://relay.example.com/", "-s", token},
+	} {
+		if o := ok(args...); o.command != "server-version" || o.serveToken != token || o.server != "https://relay.example.com/" {
+			t.Fatalf("parse(%q) = %+v", args, o)
+		}
+	}
+	fails("needs a serve token", "server-version", "--server", "https://relay.example.com/")
+	fails("usage", "server-version", "--token", token)
+	fails("usage", "server-version", "https://relay.example.com/", "extra", "--token", token)
+	fails("https", "server-version", "--server", "http://relay.example.com/", "--token", token)
+	fails("--server is for", "connect", "--server", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222")
+	// "version" prints, like --version, and asks nothing of the network.
+	var out strings.Builder
+	if o, err := parse([]string{"version"}, "", "", &out); err != nil || o != nil || !strings.HasPrefix(out.String(), "pf-client "+version+" (tunnel protocol ") {
+		t.Fatalf("version = %+v, %v, %q", o, err, out.String())
+	}
 	fails("at least 8", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "-t", "short")
 	fails("without spaces", "connect", "https://relay.example.com/", "k3f9-x2mq-7hpa", "2222", "-t", "has a space")
 	fails("three groups", "connect", "https://relay.example.com/", "asdf123", "2222")

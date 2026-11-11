@@ -31,6 +31,8 @@ const usage = `pf-client: reach a TCP port on another machine through a pf-simpl
   pf-client connect <server> <word> <listen>                 reach it on a local port
   pf-client serve|connect -c <file>                          the same, from a config file
   pf-client word                                             print a random word
+  pf-client version                                          print this program's version
+  pf-client server-version --server <server> --token <t>     ask a server for its version
 
 Run "serve" on the machine that can reach the target and "connect" where you
 want to use it, with the same word:
@@ -38,6 +40,11 @@ want to use it, with the same word:
   pf-client serve https://relay.example.com/ 22 --name "Office SSH"
   pf-client connect https://relay.example.com/ k3f9-x2mq-7hpa 2222
   ssh -p 2222 user@127.0.0.1
+
+"server-version" prints the server's version and the tunnel protocols it
+and this pf-client speak, and so whether they fit. It needs a serve token
+of that server (--token is short for --serve-token): without one a server
+says nothing about itself.
 
 <server>  the pf-simple server, https only:  https://relay.example.com/
 <word>    the tunnel's secret, the same on both sides: three groups of four
@@ -104,7 +111,7 @@ func main() {
 
 // options is one invocation, from the command line or a config file.
 type options struct {
-	command     string // "serve", "connect" or "word"
+	command     string // "serve", "connect", "word" or "server-version"
 	server      string
 	word        string
 	generated   bool   // the word was made up here, so it must be shown
@@ -138,7 +145,7 @@ var errUsage = errors.New("usage: pf-client serve <server> [word] <target> --nam
 // asked for (-h, --version).
 func parse(args []string, envToken, envClientToken string, out io.Writer) (*options, error) {
 	o := &options{serveToken: envToken, clientToken: envClientToken}
-	configPath := ""
+	configPath, serverFlag := "", ""
 	var pos, flags []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -160,7 +167,10 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 		switch name {
 		case "-c", "--config":
 			err = value(&configPath)
-		case "-s", "--serve-token":
+		case "--server":
+			flags = append(flags, name)
+			err = value(&serverFlag)
+		case "-s", "--serve-token", "--token":
 			flags = append(flags, name)
 			err = value(&o.serveToken)
 		case "-t", "--client-token":
@@ -178,8 +188,8 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 		case "-h", "--help", "help":
 			fmt.Fprint(out, usage)
 			return nil, nil
-		case "--version", "-version":
-			fmt.Fprintln(out, "pf-client "+version)
+		case "--version", "-version", "version":
+			fmt.Fprintf(out, "pf-client %s (tunnel protocol %s)\n", version, tunnel.ProtoRange(tunnel.ProtoMin, tunnel.ProtoMax))
 			return nil, nil
 		default:
 			if strings.HasPrefix(a, "-") && a != "-" {
@@ -198,7 +208,9 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 	switch {
 	case o.command == "word" && len(pos) == 1 && configPath == "":
 		return o, nil
-	case o.command != "serve" && o.command != "connect":
+	case serverFlag != "" && o.command != "server-version":
+		return nil, fmt.Errorf("--server is for 'server-version'; '%s' takes the server as its first argument", o.command)
+	case o.command != "serve" && o.command != "connect" && o.command != "server-version":
 		return nil, errUsage
 	case configPath != "":
 		// As with pf-simple -c, the file is the whole configuration.
@@ -208,6 +220,12 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 		if err := o.load(configPath); err != nil {
 			return nil, err
 		}
+	case o.command == "server-version" && len(pos) == 1 && serverFlag != "":
+		o.server = serverFlag
+	case o.command == "server-version" && len(pos) == 2 && serverFlag == "":
+		o.server = pos[1]
+	case o.command == "server-version":
+		return nil, errors.New("usage: pf-client server-version --server <server> --token <serve-token>")
 	case o.command == "serve" && len(pos) == 3:
 		o.server, o.endpoint = pos[1], pos[2]
 	case len(pos) == 4:
@@ -218,6 +236,24 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 
 	o.name = strings.TrimSpace(o.name)
 	var err error
+	if o.command == "server-version" {
+		if o.serveToken == "" {
+			return nil, errors.New("server-version needs a serve token of that server: give --token, set $PF_SERVE_TOKEN, or put serve_token in the config file. Without one a server says nothing about itself")
+		}
+		if err := tunnel.CheckSecret("serve token", o.serveToken); err != nil {
+			return nil, err
+		}
+		if o.ca != "" && o.insecure {
+			return nil, errors.New("--ca and -k contradict each other: trust the CA, or skip the check")
+		}
+		if o.word, err = tunnel.NewWord(); err != nil { // not sent; a client is made with one
+			return nil, err
+		}
+		if _, err := tunnel.NewClient(o.server, o.word, nil); err != nil {
+			return nil, err
+		}
+		return o, nil
+	}
 	if o.command == "serve" {
 		if o.name == "" {
 			return nil, errors.New("serve needs a name for the tunnel, shown in the server's console: --name \"Office SSH\", or name = \"...\" in the config file")
@@ -291,6 +327,12 @@ func (o *options) load(path string) error {
 			fmt.Fprintf(os.Stderr, "warning: %s holds a token and is readable by every user; consider chmod 600\n", path)
 		}
 	}
+	if o.command == "server-version" {
+		if o.server == "" {
+			return fmt.Errorf("config %s: server is missing; 'server-version' needs it", path)
+		}
+		return nil
+	}
 	o.endpoint = fc.Listen
 	what := "listen"
 	if o.command == "serve" {
@@ -332,11 +374,28 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	client.Name, client.ClientToken = o.name, o.clientToken
+	client.Name, client.ClientToken, client.Version = o.name, o.clientToken, version
 	if o.command == "serve" {
 		client.ServeToken = o.serveToken
 	}
 
+	if o.command == "server-version" {
+		client.ServeToken = o.serveToken
+		info, err := client.Probe(ctx)
+		if err != nil {
+			return err
+		}
+		mine := tunnel.ProtoRange(tunnel.ProtoMin, tunnel.ProtoMax)
+		fmt.Printf("server:  pf-simple %s, tunnel protocol %s\n", info.Version, tunnel.ProtoRange(info.ProtoMin, info.ProtoMax))
+		fmt.Printf("client:  pf-client %s, tunnel protocol %s\n", version, mine)
+		if proto, ok := tunnel.Negotiate(info.ProtoMin, info.ProtoMax); ok && proto >= info.ProtoMin {
+			fmt.Printf("in use:  tunnel protocol %d\n", proto)
+		} else {
+			fmt.Printf("in use:  none: the two share no tunnel protocol\n")
+		}
+		fmt.Printf("token:   %s\n", info.Token)
+		return nil
+	}
 	if o.command == "serve" {
 		if o.generated {
 			listen := "<listen>"
@@ -382,6 +441,13 @@ func run(args []string) error {
 	// it goes away: each connection is carried if it can be at that moment.
 	ln, err := net.Listen("tcp", o.endpoint)
 	if err != nil {
+		return err
+	}
+	// A server too old for what was asked is a mistake to report now, not
+	// something to wait out.
+	var tooOld *tunnel.ProtoError
+	if err := client.Check(ctx); errors.As(err, &tooOld) {
+		_ = ln.Close()
 		return err
 	}
 	log.Printf("listening on %s", ln.Addr())

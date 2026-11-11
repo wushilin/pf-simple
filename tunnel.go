@@ -92,6 +92,10 @@ type tunnelHub struct {
 	// from the command line, and the switches are fixed then.
 	persistSettings func(enabled, anonymous bool) error
 
+	// silent makes the hub answer like a server from before 0.14.0, which
+	// announced no tunnel protocol. Tests only.
+	silent bool
+
 	guesses  guessLimiter
 	maxWords int // maxWordsPerToken; tests lower it
 
@@ -132,10 +136,14 @@ type relayTunnel struct {
 	// clientHash is the SHA-256 of the client token the serving side asks
 	// of whoever connects; nil when it asks for none.
 	clientHash *secretHash
-	stats      *listenerStats // counters, and the "listener" its pipes belong to
-	started    time.Time
-	ctl        *wsConn // the serving side's control channel
-	serveAddr  string
+	// peer is the serving side's program and version, and proto the tunnel
+	// protocol chosen with it; for the log and the console.
+	peer      string
+	proto     int
+	stats     *listenerStats // counters, and the "listener" its pipes belong to
+	started   time.Time
+	ctl       *wsConn // the serving side's control channel
+	serveAddr string
 
 	mu      sync.Mutex
 	why     string                // why the tunnel was closed, once it is
@@ -450,6 +458,7 @@ func (h *tunnelHub) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+tunnel.Path+"/check", h.guard(h.handleCheck))
 	mux.HandleFunc("GET "+tunnel.Path+"/connect", h.guard(h.handleConnect))
 	mux.HandleFunc("GET "+tunnel.Path+"/accept", h.guard(h.handleAccept))
+	mux.HandleFunc("GET "+tunnel.Path+"/version", h.guard(h.handleVersion))
 }
 
 // guessLimiter counts refusals per source address.
@@ -540,6 +549,24 @@ func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "tunnels are only served over https: the word and the tokens must not travel in the clear")
 			return
 		}
+		// Every answer from here on, refusals included, says which tunnel
+		// protocol this server chose, and with that that it knows of them.
+		min, max, err := tunnel.ParseProtoRange(r.Header.Get(tunnel.HeaderProto))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		proto, ok := tunnel.Negotiate(min, max)
+		if h.silent {
+			next(w, r)
+			return
+		}
+		if !ok {
+			w.Header().Set(tunnel.HeaderProto, strconv.Itoa(tunnel.ProtoMax))
+			writeError(w, http.StatusUpgradeRequired, tunnel.ProtoMismatch(min, max))
+			return
+		}
+		w.Header().Set(tunnel.HeaderProto, strconv.Itoa(proto))
 		if h.guesses.blocked(sourceKey(r)) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(guessWindow/time.Second)))
 			writeError(w, http.StatusTooManyRequests, "too many refused attempts from your address; try again in a minute")
@@ -582,6 +609,25 @@ func (h *tunnelHub) find(r *http.Request) *relayTunnel {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.tunnels[sha256.Sum256([]byte(word))]
+}
+
+// peerVersion is the program and version a pf-client says it is. One from
+// before it said so is older than 0.14.0.
+func peerVersion(r *http.Request) string {
+	v := cleanHeader(r.Header.Get(tunnel.HeaderVersion))
+	if len(v) > 40 {
+		v = v[:40]
+	}
+	if v == "" {
+		return "pf-client before 0.14.0"
+	}
+	return v
+}
+
+// chosenProto is the tunnel protocol guard picked for this request.
+func chosenProto(w http.ResponseWriter) int {
+	n, _ := strconv.Atoi(w.Header().Get(tunnel.HeaderProto))
+	return n
 }
 
 // admit returns the tunnel a connecting side may use: the one its word
@@ -635,6 +681,24 @@ func cleanHeader(s string) string {
 		return r
 	}, s)
 	return s[:min(len(s), 128)]
+}
+
+// handleVersion tells a holder of a serve token which pf-simple this is and
+// which tunnel protocols it speaks. Nobody else is told: a wrong or missing
+// token is refused like any other wrong guess, also where serving needs no
+// token.
+func (h *tunnelHub) handleVersion(w http.ResponseWriter, r *http.Request) {
+	var holder *tenant
+	if token := r.Header.Get(tunnel.HeaderServe); token != "" {
+		h.mu.Lock()
+		holder = h.tenantOfLocked(token)
+		h.mu.Unlock()
+	}
+	if holder == nil {
+		h.deny(w, r)
+		return
+	}
+	writeJSON(w, tunnel.ServerInfo{Version: version, ProtoMin: tunnel.ProtoMin, ProtoMax: tunnel.ProtoMax, Token: holder.name})
 }
 
 // handleServe registers a word and holds its control channel until the
@@ -733,6 +797,7 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	stats.name = name
 	t := &relayTunnel{
 		key: key, word: word, name: name, owner: owner, clientHash: clientHash, stats: stats, started: time.Now(),
+		peer: peerVersion(r), proto: chosenProto(w),
 		ctl: ws, serveAddr: peerAddr(r),
 		pending: make(map[string]*relayConn), connIDs: make(map[uint64]string),
 	}
@@ -749,7 +814,7 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 		h.drop(old, "served again from "+peerAddr(r))
 	}
 	changes.notify()
-	log.Printf("relay: %s (%s) serves %q as %s -> %s", owner, peerAddr(r), name, wordLabel(word), target)
+	log.Printf("relay: %s (%s, %s, tunnel protocol %d) serves %q as %s -> %s", owner, peerAddr(r), t.peer, t.proto, name, wordLabel(word), target)
 
 	_ = ws.ReadLoop() // until the serving side leaves or falls silent
 	h.drop(t, "the serving side disconnected")
@@ -1146,14 +1211,18 @@ type relayWordSnapshot struct {
 
 	// ClientToken: whoever connects must also give the serving side's
 	// client token.
-	ClientToken bool   `json:"clientToken,omitempty"`
-	ServeAddr   string `json:"serveAddr,omitempty"`
-	Target      string `json:"target,omitempty"`
-	Since       int64  `json:"since,omitempty"` // served since, unix milliseconds
-	Accepted    uint64 `json:"accepted"`
-	Failed      uint64 `json:"failed"`
-	BytesUp     uint64 `json:"bytesUp"` // towards the serving side, closed + live
-	BytesDown   uint64 `json:"bytesDown"`
+	ClientToken bool `json:"clientToken,omitempty"`
+	// Client is the serving side's program and version, and Proto the
+	// tunnel protocol in use with it.
+	Client    string `json:"client,omitempty"`
+	Proto     int    `json:"proto,omitempty"`
+	ServeAddr string `json:"serveAddr,omitempty"`
+	Target    string `json:"target,omitempty"`
+	Since     int64  `json:"since,omitempty"` // served since, unix milliseconds
+	Accepted  uint64 `json:"accepted"`
+	Failed    uint64 `json:"failed"`
+	BytesUp   uint64 `json:"bytesUp"` // towards the serving side, closed + live
+	BytesDown uint64 `json:"bytesDown"`
 	// Conns counts every open connection; Sessions lists at most the newest
 	// maxSnapshotPipes.
 	Conns    int            `json:"conns"`
@@ -1218,6 +1287,7 @@ func (h *tunnelHub) snapshot() relayState {
 			ls := live[next]
 			next++
 			ws.Live, ws.ClientToken = true, t.clientHash != nil
+			ws.Client, ws.Proto = t.peer, t.proto
 			ws.ServeAddr, ws.Target, ws.Since = t.serveAddr, ls.Target, t.started.UnixMilli()
 			ws.Accepted, ws.Failed, ws.BytesUp, ws.BytesDown, ws.Conns = ls.Accepted, ls.Failed, ls.BytesUp, ls.BytesDown, ls.PipeCount
 			t.mu.Lock()

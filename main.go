@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/wushilin/pf-simple/internal/tunnel"
 )
 
 const halfCloseIdleTimeout = 30 * time.Second
@@ -39,7 +41,7 @@ func parseForward(value string) (forwarding, error) {
 
 func main() {
 	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
-		fmt.Println("pf-simple " + version)
+		fmt.Printf("pf-simple %s (tunnel protocol %s)\n", version, tunnel.ProtoRange(tunnel.ProtoMin, tunnel.ProtoMax))
 		return
 	}
 	log.Printf("pf-simple %s", version)

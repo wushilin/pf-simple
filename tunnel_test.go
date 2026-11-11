@@ -718,6 +718,112 @@ func TestRelayClientToken(t *testing.T) {
 	}
 }
 
+// Client and server agree on a tunnel protocol, and a client that depends
+// on something a server is too old for is told so instead of going
+// unprotected.
+func TestRelayProtocolNegotiation(t *testing.T) {
+	f := newRelayFixture(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A current pair: the tunnel records who serves it and how.
+	server := f.client(t, testWord, testServeToken)
+	server.Version, server.ClientToken = "9.9.9", "open-sesame"
+	go func() { _ = server.Serve(ctx, echoTarget(t)) }()
+	connector := f.client(t, testWord, "")
+	connector.ClientToken = "open-sesame"
+	waitFor(t, "the word to be served", func() bool { return connector.Check(ctx) == nil })
+	if w := f.hub.snapshot().Words[0]; w.Client != "pf-client 9.9.9" || w.Proto != tunnel.ProtoMax {
+		t.Fatalf("word = %+v", w)
+	}
+
+	// Every answer names the protocol, refusals too.
+	request := func(endpoint, proto string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, f.srv.URL+tunnel.Path+"/"+endpoint, nil)
+		req.Header.Set(tunnel.HeaderWord, otherWord)
+		if proto != "" {
+			req.Header.Set(tunnel.HeaderProto, proto)
+		}
+		resp, err := f.srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+	// The server's version is not: that is only told to a serve token.
+	if resp := request("check", "0-1"); resp.StatusCode != http.StatusForbidden || resp.Header.Get(tunnel.HeaderProto) != "1" || resp.Header.Get(tunnel.HeaderVersion) != "" {
+		t.Fatalf("a refused check = %d, protocol %q, version %q", resp.StatusCode, resp.Header.Get(tunnel.HeaderProto), resp.Header.Get(tunnel.HeaderVersion))
+	}
+
+	// A holder of a serve token can ask which server this is.
+	info, err := f.client(t, otherWord, testServeToken).Probe(ctx)
+	if err != nil || info.Version != version || info.ProtoMin != tunnel.ProtoMin || info.ProtoMax != tunnel.ProtoMax || info.Token != "alice" {
+		t.Fatalf("probe = %+v, %v", info, err)
+	}
+	// Nobody else can: not with a wrong token, not without one, and not
+	// where serving needs no token either.
+	for name, token := range map[string]string{"a wrong": "not-a-serve-token-0123456789abcdefgh", "no": ""} {
+		if _, err := f.client(t, otherWord, token).Probe(ctx); err == nil || err.Error() != "access denied" {
+			t.Fatalf("probe with %s token = %v, want access denied", name, err)
+		}
+	}
+	f.hub.mu.Lock()
+	f.hub.anonymous = true
+	f.hub.mu.Unlock()
+	if _, err := f.client(t, otherWord, "").Probe(ctx); err == nil || err.Error() != "access denied" {
+		t.Fatalf("probe without a token on a hub that allows anonymous serving = %v", err)
+	}
+	f.hub.mu.Lock()
+	f.hub.anonymous = false
+	f.hub.mu.Unlock()
+	// A client from before versions is still answered, as protocol 0.
+	if resp := request("check", ""); resp.StatusCode != http.StatusForbidden || resp.Header.Get(tunnel.HeaderProto) != "0" {
+		t.Fatalf("an old client's check = %d, protocol %q", resp.StatusCode, resp.Header.Get(tunnel.HeaderProto))
+	}
+	// One that needs a protocol this server does not have is told so.
+	if resp := request("check", "7-9"); resp.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("a check needing protocol 7 = %d, want 426", resp.StatusCode)
+	}
+	if resp := request("check", "nonsense"); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a malformed protocol range = %d, want 400", resp.StatusCode)
+	}
+
+	// Against a server from before 0.14.0, which announces nothing.
+	f.hub.silent = true
+	// A plain tunnel still works.
+	plain := f.client(t, otherWord, testServeToken)
+	plainCtx, stopPlain := context.WithCancel(ctx)
+	go func() { _ = plain.Serve(plainCtx, echoTarget(t)) }()
+	plainConnector := f.client(t, otherWord, "")
+	waitFor(t, "a plain word to be served by an old server", func() bool { return plainConnector.Check(ctx) == nil })
+	stopPlain()
+	waitFor(t, "the plain word to go", func() bool { return plainConnector.Check(ctx) != nil })
+	// A client token would be ignored there, so both sides refuse.
+	guarded := f.client(t, otherWord, testServeToken)
+	guarded.ClientToken = "open-sesame"
+	if err := guarded.Serve(ctx, "127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "too old for a client token") {
+		t.Fatalf("serve with a client token against an old server = %v", err)
+	}
+	if err := connector.Check(ctx); err == nil || !strings.Contains(err.Error(), "too old for a client token") {
+		t.Fatalf("check with a client token against an old server = %v", err)
+	}
+	if err := connector.ConnectOne(ctx, tunnel.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || !strings.Contains(err.Error(), "too old for a client token") {
+		t.Fatalf("connect with a client token against an old server = %v", err)
+	}
+	// So does serving without a serve token.
+	if err := f.client(t, otherWord, "").Serve(ctx, "127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "too old for serving without a serve token") {
+		t.Fatalf("anonymous serve against an old server = %v", err)
+	}
+	// It did not leave a tunnel behind.
+	for _, w := range f.hub.snapshot().Words {
+		if w.Word == otherWord && w.Live {
+			t.Fatal("a refused serve left its tunnel registered")
+		}
+	}
+}
+
 // The tunnel endpoints answer over https only: directly, or behind a proxy
 // that says so.
 func TestRelayHTTPSOnly(t *testing.T) {

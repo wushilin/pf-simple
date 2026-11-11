@@ -167,6 +167,7 @@ function relayCard(w) {
     card, chip, locked, title, arrow, target, reset, clear, sessions: new Map(),
     owner: relayFact(meta, "Token"),
     from: relayFact(meta, "Served from"),
+    client: relayFact(meta, "By"),
     since: relayFact(meta, ""),
     conns: relayFact(meta, "Connections"),
     tx: relayFact(meta, "To serving side", "tx"),
@@ -231,6 +232,9 @@ function paintRelayWord(c, w, now) {
   setText(c.owner.value, `${w.owner} (deleted)`);
   c.from.wrap.hidden = !w.live;
   setText(c.from.value, w.live ? w.serveAddr : "");
+  c.client.wrap.hidden = !w.live || !w.client;
+  setText(c.client.value, w.live && w.client ? `${w.client} · protocol ${w.proto}` : "");
+  c.client.wrap.title = "The serving side's program, and the tunnel protocol version in use with it";
   setText(c.since.wrap.firstChild, w.live ? "Up " : "Last served ");
   setText(c.since.value, w.live ? fmtAge(now - w.since) : fmtClock(w.lastServed));
   for (const f of [c.conns, c.tx, c.rx, c.up, c.down]) f.wrap.hidden = !w.live;
