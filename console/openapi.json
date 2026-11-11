@@ -1163,6 +1163,14 @@
              "clientToken": {
               "type": "boolean",
               "description": "The serving side asks for a client token: connecting needs it as well as the word"
+             },
+             "client": {
+              "type": "string",
+              "description": "The serving side's program and version, e.g. `pf-client 0.14.0`"
+             },
+             "proto": {
+              "type": "integer",
+              "description": "The tunnel protocol version in use with the serving side; 0 for a pf-client from before 0.14.0"
              }
             }
            }

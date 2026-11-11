@@ -140,6 +140,15 @@ func Upgrade(w http.ResponseWriter, r *http.Request, extra http.Header) (*Conn, 
 			b.WriteString(name + ": " + v + "\r\n")
 		}
 	}
+	// What the handler set for the tunnel protocol goes out with the 101
+	// as it would with any other response.
+	for name, values := range w.Header() {
+		if strings.HasPrefix(name, "X-Pf-") && len(extra.Values(name)) == 0 {
+			for _, v := range values {
+				b.WriteString(name + ": " + v + "\r\n")
+			}
+		}
+	}
 	b.WriteString("\r\n")
 	_ = conn.SetWriteDeadline(time.Now().Add(WriteTimeout))
 	if _, err = conn.Write([]byte(b.String())); err != nil {
@@ -153,8 +162,9 @@ func Upgrade(w http.ResponseWriter, r *http.Request, extra http.Header) (*Conn, 
 // StatusError is a handshake the server answered with something other than
 // 101.
 type StatusError struct {
-	Code int
-	Msg  string
+	Code   int
+	Msg    string
+	Header http.Header // the response's headers
 }
 
 func (e *StatusError) Error() string {
@@ -251,7 +261,7 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 		msg := errorText(resp.Body)
 		resp.Body.Close()
 		conn.Close()
-		return nil, &StatusError{Code: resp.StatusCode, Msg: msg}
+		return nil, &StatusError{Code: resp.StatusCode, Msg: msg, Header: resp.Header}
 	}
 	if resp.Header.Get("Sec-WebSocket-Accept") != acceptKey(key) {
 		conn.Close()
