@@ -52,7 +52,8 @@ import (
 //
 // To add protocol N+1: raise ProtoMax; describe it here as protocol 1 is
 // described; add it to protoRelease; give each new feature an entry in
-// featureProto and have Client.needs name it; make the server honor it
+// featureProto and have Client.needs (pfrelay/client.go) and the other
+// SDKs name it; describe it in docs/PROTOCOL.md; make the server honor it
 // only when the chosen version allows. Raise ProtoMin only to stop
 // speaking to old peers, which is a decision for the project's owner.
 const (
@@ -158,11 +159,14 @@ func (e *ProtoError) Error() string {
 		f.name, speaks, f.proto, releaseOf(f.proto))
 }
 
-// serverProto reads the protocol a server chose from its response. One
+// ServerProto reads the protocol a server chose from its response. One
 // that says nothing speaks protocol 0.
-func serverProto(h http.Header) int {
+func ServerProto(h http.Header) int {
 	if n, err := strconv.Atoi(strings.TrimSpace(h.Get(HeaderProto))); err == nil && n >= 0 {
 		return n
 	}
 	return 0
 }
+
+// FeatureProto is the protocol that first has f.
+func FeatureProto(f Feature) int { return featureProto[f].proto }

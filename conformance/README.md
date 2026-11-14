@@ -1,0 +1,121 @@
+# Conformance suite
+
+The suite checks a client implementation of the tunnel protocol
+([`docs/PROTOCOL.md`](../docs/PROTOCOL.md)) against a real pf-simple hub. It
+puts the implementation on one side or both sides of a tunnel, and the Go
+SDK ([`pfrelay`](../pfrelay)) on the other. It also uses hub settings that
+cannot be reached from outside: a hub that answers like protocol 0,
+anonymous serving switched on and off, and a short idle timeout.
+
+## Running it
+
+```sh
+# the Go SDK's own driver (built on the fly)
+go test -run TestConformance .
+
+# another SDK's driver: the command line that starts it
+PF_CONFORMANCE_DRIVER="python3 -I sdk/python/driver.py" go test -run TestConformance .
+
+# also the cases that take a minute (keepalive)
+PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="..." go test -run TestConformance .
+```
+
+Run it from the repository root. It needs Go, and whatever the driver
+needs.
+
+## The driver
+
+Each SDK ships a small program, its **driver**, that the suite starts once
+for each step. The driver MUST use the SDK's public API in the way an
+application would. Serving goes through the SDK's listen/accept API and
+connecting through its dial API, so the suite tests what users get.
+
+```
+driver serve   --server URL --ca FILE --word WORD --target HOST:PORT
+               [--serve-token T] [--client-token T] [--name NAME]
+driver connect --server URL --ca FILE --word WORD --listen HOST:PORT
+               [--client-token T]
+driver check   --server URL --ca FILE --word WORD [--client-token T]
+driver version --server URL --ca FILE --serve-token T
+```
+
+Flags may come in any order. Rules that apply to every command:
+
+- **TLS.** `--ca` is a PEM file holding the hub's certificate, which is
+  self-signed for `127.0.0.1`. The driver MUST trust that certificate and
+  verify the hub against it. It MUST NOT turn verification off.
+- **Agent.** The driver SHOULD send an `X-PF-Version` that names the SDK,
+  such as `pfrelay-py 0.1.0 conformance`.
+- **Output.** Diagnostics go to stderr. Stdout carries only the lines below.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | success |
+  | 1 | any other failure |
+  | 2 | wrong usage |
+  | 3 | protocol error: the hub is too old for what was asked (PROTOCOL.md §5.3) |
+  | 4 | access denied: the hub answered 403 |
+
+### `serve`
+
+1. Register the tunnel (the SDK's listen). On success, print `ready` and
+   flush stdout. On a refusal that waiting cannot cure, exit with the code
+   above.
+2. For each accepted connection, dial `--target` over TCP. If the dial
+   fails, fail the connection with a reason; any text will do, such as
+   `the serving side could not reach its target`. Otherwise copy both ways
+   until both directions finish:
+   - pass a half-close on in each direction: end of the tunnel stream
+     becomes a TCP shutdown of the write side, and TCP EOF becomes the
+     stream's half-close;
+   - if either side fails, fail the stream with a reason and close both
+     ends.
+3. Keep serving, and register again after losing the hub, until it gets
+   SIGTERM. Then exit 0.
+
+### `connect`
+
+1. Listen on `--listen` over TCP; port 0 means any port. Print
+   `listening HOST:PORT` with the address actually bound, and flush stdout.
+2. For each accepted TCP connection, open a connection through the tunnel
+   (the SDK's dial), and copy both ways as `serve` does. If the dial fails,
+   close the TCP connection and say why on stderr.
+3. Run until SIGTERM, then exit 0.
+
+### `check`
+
+Ask whether the tunnel is up. Exit 0 if it is, 4 on a 403, 3 on a protocol
+error, and 1 otherwise.
+
+### `version`
+
+Probe the hub's version. Print the answer as one line of JSON with at
+least `version`, `protoMin`, `protoMax` and `token`, then exit 0. Exit 4 on
+a 403.
+
+## The cases
+
+| Case | What it shows |
+|---|---|
+| serve/echo to a Go connector | data both ways, half-close, 8 parallel connections, 1 MiB each |
+| connect/echo through a Go server | the same, from the connecting side |
+| both sides/echo | the SDK talking to itself through the hub |
+| serve/the target speaks first, connect/the target speaks first | nothing waits for the application to speak first |
+| serve/the target cannot be reached | the connecting side hears a reason (§8.3, including a reason that arrives after a half-close) |
+| connect/nobody serves the word | the local connection ends at once |
+| check | 204 and 403 |
+| client token | registering a client token's hash, sending the token, refusal without it |
+| serve/a wrong serve token is final | 403 on the first registration ends the run |
+| serve/a word of another tenant is final | 409, with the hub's message shown |
+| serve/anonymous | serving without a token, off and on |
+| protocol 0 hub | features of protocol 1 are refused (§5.3); plain tunnels still work |
+| version | the probe, and its refusal |
+| serve/registers again after losing the hub | the retry loop (§9) |
+| idle connections stay up (slow) | pings on streams and on the control channel (§7, §8.5) |
+
+## Adding an SDK
+
+1. Put the SDK under `sdk/<language>/` with its driver.
+2. Run the suite until it passes, including the slow cases.
+3. Add the driver to CI, in `.github/workflows/ci.yml`.

@@ -38,11 +38,11 @@ const (
 
 	wsGUID         = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	MaxSmallFrame  = 4096    // control messages; the console never sends real data
-	maxDataFrame   = 1 << 20 // tunnels send at most chunkSize per frame
+	maxDataFrame   = 1 << 20 // tunnels send at most ChunkSize per frame
 	WriteTimeout   = 10 * time.Second
 	closeTimeout   = 3 * time.Second
-	dialTimeout    = 10 * time.Second
-	handshakeLimit = 15 * time.Second
+	DialTimeout    = 10 * time.Second
+	HandshakeLimit = 15 * time.Second
 )
 
 // Conn is one WebSocket connection.
@@ -67,6 +67,7 @@ type Conn struct {
 	// clear the closing deadline and then block forever.
 	dmu     sync.Mutex
 	closing bool
+	expired bool // ExpireWrites was called: every write fails at once
 }
 
 // SetTimeouts sets how long the peer may stay silent and how long one frame
@@ -179,9 +180,9 @@ func (e *StatusError) Final() bool {
 	return e.Code >= 400 && e.Code < 500 && e.Code != http.StatusTooManyRequests && e.Code != http.StatusRequestTimeout
 }
 
-// errorText reads the message out of an error response: pf-simple sends
+// ErrorText reads the message out of an error response: pf-simple sends
 // {"error": "..."}, a proxy in front of it may send anything.
-func errorText(body io.Reader) string {
+func ErrorText(body io.Reader) string {
 	raw, _ := io.ReadAll(io.LimitReader(body, 2048))
 	var parsed struct {
 		Error string `json:"error"`
@@ -208,9 +209,9 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 	if u.Port() == "" {
 		addr = net.JoinHostPort(u.Hostname(), "443")
 	}
-	ctx, cancel := context.WithTimeout(ctx, handshakeLimit)
+	ctx, cancel := context.WithTimeout(ctx, HandshakeLimit)
 	defer cancel()
-	raw, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", addr)
+	raw, err := (&net.Dialer{Timeout: DialTimeout}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +247,7 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 	req.Header.Set("Sec-WebSocket-Key", key)
 	req.Header.Set("Sec-WebSocket-Version", "13")
 	req.Header.Set("User-Agent", "pf-client")
-	_ = conn.SetDeadline(time.Now().Add(handshakeLimit))
+	_ = conn.SetDeadline(time.Now().Add(HandshakeLimit))
 	if err := req.Write(conn); err != nil {
 		conn.Close()
 		return nil, err
@@ -258,7 +259,7 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		msg := errorText(resp.Body)
+		msg := ErrorText(resp.Body)
 		resp.Body.Close()
 		conn.Close()
 		return nil, &StatusError{Code: resp.StatusCode, Msg: msg, Header: resp.Header}
@@ -304,6 +305,8 @@ func (c *Conn) WriteFrame(op byte, payload []byte) error {
 
 	c.dmu.Lock()
 	switch {
+	case c.expired:
+		_ = c.conn.SetWriteDeadline(time.Unix(1, 0))
 	case c.closing:
 		_ = c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
 	case c.writeTimeout > 0:
@@ -321,6 +324,15 @@ func (c *Conn) BeginClose() {
 	c.dmu.Lock()
 	c.closing = true
 	_ = c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
+	c.dmu.Unlock()
+}
+
+// ExpireWrites fails every write from now on, including one already
+// blocked, as a write deadline that has passed does.
+func (c *Conn) ExpireWrites() {
+	c.dmu.Lock()
+	c.expired = true
+	_ = c.conn.SetWriteDeadline(time.Unix(1, 0))
 	c.dmu.Unlock()
 }
 

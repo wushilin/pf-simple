@@ -1,6 +1,8 @@
-package tunnel
+package pfrelay
 
 import (
+	"github.com/wushilin/pf-simple/internal/tunnel"
+
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -40,7 +42,7 @@ func TestServeBackoff(t *testing.T) {
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 			return
 		}
-		ws, err := Upgrade(w, r, nil)
+		ws, err := tunnel.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
@@ -58,7 +60,7 @@ func TestServeBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.ServeToken, c.Name = strings.Repeat("t", MinSecret), "test"
+	c.ServeToken, c.Name = strings.Repeat("t", tunnel.MinSecret), "test"
 	c.Logf = func(string, ...any) {}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -113,7 +115,7 @@ func TestServeFirstRefusalIsFinal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.ServeToken, c.Name = strings.Repeat("t", MinSecret), "test"
+	c.ServeToken, c.Name = strings.Repeat("t", tunnel.MinSecret), "test"
 	c.Logf = func(string, ...any) {}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

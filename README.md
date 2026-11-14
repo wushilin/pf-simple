@@ -624,6 +624,38 @@ and its connections (the serving side comes back on its own), and **Clear
 binding** frees a word for whichever token registers it next. The tab shows
 the words in full, so treat console access as access to every tunnel.
 
+### SDKs: serve and connect from your own program
+
+A program can serve a tunnel, or connect through one, without running
+`pf-client`. The Go SDK is [`pfrelay`](pfrelay), and `pf-client` itself is
+built on it. Serving gives you a `net.Listener`, and connecting gives you a
+`net.Conn`:
+
+```go
+import "github.com/wushilin/pf-simple/pfrelay"
+
+// machine B: serve
+c, _ := pfrelay.NewClient("https://relay.example.com/", "k3f9-x2mq-7hpa", nil)
+c.ServeToken, c.Name = os.Getenv("PF_SERVE_TOKEN"), "My service"
+ln, _ := c.Listen(ctx)             // registered; re-registers on its own
+http.Serve(ln, handler)            // or ln.Accept() in a loop
+
+// machine A: connect
+c, _ := pfrelay.NewClient("https://relay.example.com/", "k3f9-x2mq-7hpa", nil)
+conn, _ := c.Dial(ctx)             // one connection through the tunnel
+```
+
+A `*pfrelay.Conn` also has `CloseWrite` (half-close), `Fail(reason)` (drop
+the connection, telling the far end why) and `Err()` (why the far end
+dropped it). `Client.Stats()` and `Client.Conns()` report the client's own
+connections and byte counts.
+
+SDKs for other languages are under [`sdk/`](sdk). All of them speak the
+same protocol, which is specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+Every SDK has to pass the conformance suite in
+[`conformance/`](conformance/README.md), which runs it against a real hub
+and against the Go SDK.
+
 ## Running under systemd
 
 ```ini

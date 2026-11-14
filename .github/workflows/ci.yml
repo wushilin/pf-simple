@@ -17,6 +17,44 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
+  sdk:
+    name: SDK conformance (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: python
+            setup: python3 -I -m unittest discover -s sdk/python/tests
+            driver: python3 -I sdk/python/driver.py
+          - sdk: rust
+            setup: cargo test --manifest-path sdk/rust/Cargo.toml && cargo build --release --manifest-path sdk/rust/Cargo.toml
+            driver: sdk/rust/target/release/driver
+          - sdk: java
+            setup: sdk/java/build.sh
+            driver: sdk/java/driver.sh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - if: matrix.sdk == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - if: matrix.sdk == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Build and unit-test the SDK
+        run: ${{ matrix.setup }}
+      - name: Conformance suite
+        env:
+          PF_CONFORMANCE_DRIVER: ${{ matrix.driver }}
+          PF_CONFORMANCE_SLOW: "1"
+        run: go test -count=1 -run TestConformance -v .
+
   build:
     name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest

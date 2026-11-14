@@ -539,7 +539,7 @@ func sourceKey(r *http.Request) string {
 func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
-		on := h.enabled
+		on, silent := h.enabled, h.silent
 		h.mu.Unlock()
 		if !on { // as on a server without a hub
 			w.WriteHeader(http.StatusNotFound)
@@ -557,7 +557,7 @@ func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		proto, ok := tunnel.Negotiate(min, max)
-		if h.silent {
+		if silent {
 			next(w, r)
 			return
 		}

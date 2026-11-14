@@ -1,8 +1,7 @@
-package tunnel
+package pfrelay
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -10,142 +9,44 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/wushilin/pf-simple/internal/tunnel"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-// The relay's endpoints and headers. Everything secret travels in headers,
-// which reverse proxies do not log by default; URLs they do.
-const (
-	Path         = "/pf/api/tunnel"   // + "/serve", "/connect", "/accept", "/check"
-	HeaderWord   = "X-PF-Tunnel-Word" // the tunnel's secret word
-	HeaderServe  = "X-PF-Serve-Token" // permission to register; only "serve" sends it
-	HeaderConn   = "X-PF-Tunnel-Conn"
-	HeaderName   = "X-PF-Tunnel-Name" // what the tunnel is called in the console; URL-escaped
-	HeaderTarget = "X-PF-Tunnel-Target"
-	HeaderError  = "X-PF-Tunnel-Error"
-	// A serving side may ask for a client token on top of the word. It
-	// registers the token's SHA-256, and the connecting side sends the token.
-	HeaderClientHash  = "X-PF-Client-Token-SHA256"
-	HeaderClientToken = "X-PF-Client-Token"
-
-	MinSecret = 32
-	MaxSecret = 128
-	// A client token is typed by people, like a password.
-	MinClientToken = 8
-
-	// The serving side pings its control channel; either end gives up on it
-	// after ControlSilence.
-	controlPing    = 20 * time.Second
-	ControlSilence = 60 * time.Second
-)
-
-// A word names one tunnel and is typed on both sides, so it is short and
-// easy to read out: three groups of four letters or digits, in any case.
-// A generated word leaves out the characters that are mistaken for one
-// another (0 and o, 1, i and l); it carries 59 bits, and can only be guessed
-// against the live server, one request at a time. A typed word may use any
-// letter or digit.
-const (
-	wordAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
-	wordExample  = "k3f9-x2mq-7hpa"
-)
-
-var wordPattern = regexp.MustCompile(`^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$`)
-
-// NormalizeWord checks a word and returns it in the lower case both ends
-// use from then on.
-func NormalizeWord(word string) (string, error) {
-	word = strings.ToLower(strings.TrimSpace(word))
-	if !wordPattern.MatchString(word) {
-		return "", fmt.Errorf("the word must be three groups of four letters or digits, like %s (case does not matter); leave it out and 'pf-client serve' makes a random one", wordExample)
-	}
-	return word, nil
-}
-
-// NewWord returns a random word that is easy to read out.
-func NewWord() (string, error) {
-	out := make([]byte, 0, 14)
-	var b [1]byte
-	for len(out) < 14 {
-		if len(out) == 4 || len(out) == 9 {
-			out = append(out, '-')
-			continue
-		}
-		if _, err := rand.Read(b[:]); err != nil {
-			return "", err
-		}
-		if n := len(wordAlphabet); int(b[0]) < 256/n*n { // no modulo bias
-			out = append(out, wordAlphabet[int(b[0])%n])
-		}
-	}
-	return string(out), nil
-}
-
-// CheckSecret applies the rules for serve tokens: long enough to be a
-// secret, and plain enough to travel in a header. what names the secret in
-// the error.
-func CheckSecret(what, secret string) error {
-	if len(secret) < MinSecret {
-		return fmt.Errorf("the %s must be at least %d characters long (got %d)", what, MinSecret, len(secret))
-	}
-	if len(secret) > MaxSecret {
-		return fmt.Errorf("the %s must be at most %d characters long", what, MaxSecret)
-	}
-	for _, c := range secret {
-		if c <= ' ' || c > '~' {
-			return fmt.Errorf("the %s may only use printable ASCII characters, without spaces", what)
-		}
-	}
-	return nil
-}
-
-// CheckClientToken applies the rules for client tokens: 8 to 128 printable
-// ASCII characters, without spaces.
-func CheckClientToken(token string) error {
-	if len(token) < MinClientToken {
-		return fmt.Errorf("the client token must be at least %d characters long (got %d)", MinClientToken, len(token))
-	}
-	if len(token) > MaxSecret {
-		return fmt.Errorf("the client token must be at most %d characters long", MaxSecret)
-	}
-	for _, c := range token {
-		if c <= ' ' || c > '~' {
-			return errors.New("the client token may only use printable ASCII characters, without spaces")
-		}
-	}
-	return nil
-}
-
-// ControlMessage is what the relay sends down a serving side's control
-// channel: open a connection to your target and bring it to /accept.
-type ControlMessage struct {
-	Open string `json:"open"`
-}
-
-// Client is the pf-client side of a relay.
+// Client talks to one relay hub about one tunnel (one word). It can serve
+// the tunnel (Listen, Serve, ServeOne) or connect through it (Dial,
+// Connect, ConnectOne, Check, Watch). Set its fields before first use; a
+// Client is safe for concurrent use after that.
 type Client struct {
 	base string // https://host[:port]
 	word string
 	tls  *tls.Config
 	http *http.Client
+	// Logf receives what the client has to say about registrations,
+	// retries and connections. Nil (the default) discards it; pf-client
+	// sets log.Printf.
 	Logf func(format string, args ...any)
 	// ServeToken is a serve token of the server, and Name what the tunnel is
 	// called in the server's console. Only Serve uses them; without a serve
 	// token the registration is anonymous, which the server must allow.
 	ServeToken string
 	Name       string
-	// Version is this program's version, sent to the server for its logs
-	// and console.
-	Version string
+	// Agent is what this program calls itself in the server's log and
+	// console, such as "pf-client 0.15.0". Nothing is decided from it.
+	// Empty means DefaultAgent.
+	Agent string
+	reg   registry // connections and totals
+
+	// Target is what Listen tells the server's console the tunnel leads
+	// to. Empty means "listener". Serve sends its own target instead.
+	Target string
 	// ClientToken is a second secret the serving side may ask of whoever
 	// connects. Serve registers it, and the connecting side must send it.
 	ClientToken string
@@ -157,15 +58,14 @@ func NewClient(base, word string, tlsConfig *tls.Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	word, err = NormalizeWord(word)
+	word, err = tunnel.NormalizeWord(word)
 	if err != nil {
 		return nil, err
 	}
 	transport := &http.Transport{TLSClientConfig: tlsConfig}
 	return &Client{
 		base: base, word: word, tls: tlsConfig,
-		http: &http.Client{Timeout: handshakeLimit, Transport: transport},
-		Logf: log.Printf,
+		http: &http.Client{Timeout: tunnel.HandshakeLimit, Transport: transport},
 	}, nil
 }
 
@@ -186,19 +86,19 @@ func normalizeBase(raw string) (string, error) {
 }
 
 // needs lists what a request to endpoint depends on beyond protocol 0.
-func (c *Client) needs(endpoint string) []Feature {
-	var out []Feature
+func (c *Client) needs(endpoint string) []tunnel.Feature {
+	var out []tunnel.Feature
 	switch endpoint {
 	case "serve":
 		if c.ClientToken != "" {
-			out = append(out, FeatureClientToken)
+			out = append(out, tunnel.FeatureClientToken)
 		}
 		if c.ServeToken == "" {
-			out = append(out, FeatureAnonymousServe)
+			out = append(out, tunnel.FeatureAnonymousServe)
 		}
 	case "connect", "check":
 		if c.ClientToken != "" {
-			out = append(out, FeatureClientToken)
+			out = append(out, tunnel.FeatureClientToken)
 		}
 	}
 	return out
@@ -208,26 +108,28 @@ func (c *Client) needs(endpoint string) []Feature {
 // from the newest protocol it depends on, so a server that knows about
 // protocols refuses one it cannot honor.
 func (c *Client) offer(endpoint string, h http.Header) {
-	min := ProtoMin
+	min := tunnel.ProtoMin
 	for _, f := range c.needs(endpoint) {
-		if p := featureProto[f].proto; p > min {
+		if p := tunnel.FeatureProto(f); p > min {
 			min = p
 		}
 	}
-	h.Set(HeaderProto, ProtoRange(min, ProtoMax))
-	if c.Version != "" {
-		h.Set(HeaderVersion, "pf-client "+c.Version)
+	h.Set(tunnel.HeaderProto, tunnel.ProtoRange(min, tunnel.ProtoMax))
+	agent := c.Agent
+	if agent == "" {
+		agent = DefaultAgent
 	}
+	h.Set(tunnel.HeaderVersion, agent)
 }
 
 // answered checks a response to endpoint: a server from before protocols
 // were negotiated ignores what it does not know, so it is for this side to
 // refuse when the run depends on something that server would not do.
 func (c *Client) answered(endpoint string, h http.Header) error {
-	proto := serverProto(h)
+	proto := tunnel.ServerProto(h)
 	for _, f := range c.needs(endpoint) {
-		if proto < featureProto[f].proto {
-			return &ProtoError{Server: proto, Need: f}
+		if proto < tunnel.FeatureProto(f) {
+			return &tunnel.ProtoError{Server: proto, Need: f}
 		}
 	}
 	return nil
@@ -235,9 +137,9 @@ func (c *Client) answered(endpoint string, h http.Header) error {
 
 func (c *Client) header(conn string) http.Header {
 	h := http.Header{}
-	h.Set(HeaderWord, c.word)
+	h.Set(tunnel.HeaderWord, c.word)
 	if conn != "" {
-		h.Set(HeaderConn, conn)
+		h.Set(tunnel.HeaderConn, conn)
 	}
 	return h
 }
@@ -247,15 +149,15 @@ func (c *Client) header(conn string) http.Header {
 func (c *Client) connectHeader() http.Header {
 	h := c.header("")
 	if c.ClientToken != "" {
-		h.Set(HeaderClientToken, c.ClientToken)
+		h.Set(tunnel.HeaderClientToken, c.ClientToken)
 	}
 	return h
 }
 
-func (c *Client) dial(ctx context.Context, endpoint string, h http.Header) (*Conn, error) {
+func (c *Client) dial(ctx context.Context, endpoint string, h http.Header) (*tunnel.Conn, error) {
 	c.offer(endpoint, h)
-	ws, err := Dial(ctx, c.base+Path+"/"+endpoint, h, c.tls)
-	var se *StatusError
+	ws, err := tunnel.Dial(ctx, c.base+tunnel.Path+"/"+endpoint, h, c.tls)
+	var se *tunnel.StatusError
 	switch {
 	case err == nil:
 		if perr := c.answered(endpoint, ws.Header); perr != nil {
@@ -273,7 +175,7 @@ func (c *Client) dial(ctx context.Context, endpoint string, h http.Header) (*Con
 
 // get makes a plain request; anything but 2xx is a *StatusError.
 func (c *Client) get(ctx context.Context, endpoint string, h http.Header) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+Path+"/"+endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+tunnel.Path+"/"+endpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -290,20 +192,20 @@ func (c *Client) get(ctx context.Context, endpoint string, h http.Header) error 
 		}
 	}
 	if resp.StatusCode/100 != 2 {
-		return &StatusError{Code: resp.StatusCode, Msg: errorText(resp.Body), Header: resp.Header}
+		return &tunnel.StatusError{Code: resp.StatusCode, Msg: tunnel.ErrorText(resp.Body), Header: resp.Header}
 	}
 	return nil
 }
 
 // explain turns the relay's refusals into something to act on.
 func explain(err error) error {
-	var se *StatusError
+	var se *tunnel.StatusError
 	if !errors.As(err, &se) {
 		return err
 	}
 	switch se.Code {
 	case http.StatusForbidden:
-		return errors.New("access denied")
+		return ErrAccessDenied
 	case http.StatusConflict:
 		if se.Msg != "" {
 			return errors.New(se.Msg)
@@ -327,11 +229,11 @@ var ErrNoProbe = errors.New("this server does not answer a version probe: it is 
 // speaks. It needs a valid serve token: without one the server says
 // nothing about itself.
 func (c *Client) Probe(ctx context.Context) (*ServerInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+Path+"/version", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+tunnel.Path+"/version", nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set(HeaderServe, c.ServeToken)
+	req.Header.Set(tunnel.HeaderServe, c.ServeToken)
 	c.offer("version", req.Header)
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -342,7 +244,7 @@ func (c *Client) Probe(ctx context.Context) (*ServerInfo, error) {
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, ErrNoProbe
 	case resp.StatusCode/100 != 2:
-		return nil, explain(&StatusError{Code: resp.StatusCode, Msg: errorText(resp.Body), Header: resp.Header})
+		return nil, explain(&tunnel.StatusError{Code: resp.StatusCode, Msg: tunnel.ErrorText(resp.Body), Header: resp.Header})
 	}
 	var info ServerInfo
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&info); err != nil || info.Version == "" {
@@ -388,19 +290,15 @@ var (
 // start, is retried with a growing pause. The connections that were open
 // end with a lost relay, and the connecting side opens new ones.
 func (c *Client) Serve(ctx context.Context, target string) error {
-	return c.serve(ctx, target, func(id string) { c.serveConn(ctx, id, target) })
+	return c.serve(ctx, target, func(id string) { c.serveConn(ctx, id, target) }, nil)
 }
-
-// StdioTarget is the target a serving side names when it offers its own
-// stdin/stdout instead of a TCP port.
-const StdioTarget = "stdio"
 
 // ServeOne offers local, such as stdin/stdout, as the tunnel's only
 // connection: it registers and waits like Serve, carries the first
 // connection that arrives, and returns when that one ends, with nil if it
 // ended cleanly. local can be read once, so nothing is retried after the
 // connection has started, and others arriving meanwhile are refused.
-func (c *Client) ServeOne(ctx context.Context, local localConn) error {
+func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var taken atomic.Bool
@@ -408,24 +306,26 @@ func (c *Client) ServeOne(ctx context.Context, local localConn) error {
 	open := func(id string) {
 		h := c.header(id)
 		if !taken.CompareAndSwap(false, true) {
-			c.Logf("connection %s refused: this side carries one connection, and has one", short(id))
-			h.Set(HeaderError, "the serving side carries a single connection and already has one")
+			c.logf("connection %s refused: this side carries one connection, and has one", short(id))
+			h.Set(tunnel.HeaderError, "the serving side carries a single connection and already has one")
 			_ = c.get(ctx, "accept", h)
 			return
 		}
 		ws, err := c.dial(ctx, "accept", h)
 		if err != nil {
 			// Nothing was read from local yet, so the next one may have it.
-			c.Logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
+			c.logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
 			taken.Store(false)
 			return
 		}
-		c.Logf("connection %s open: tunnel -> stdin/stdout", short(id))
+		c.logf("connection %s open: tunnel -> stdin/stdout", short(id))
 		started := time.Now()
-		stream := NewStream(ws)
+		stream := tunnel.NewStream(ws)
 		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 		defer stop()
-		e := bridge(ctx, stream, local, partyServeStdio)
+		rec := c.reg.add(id, SideServe, stream)
+		e := bridge(ctx, stream, local, partyServeStdio, rec)
+		c.reg.finish(rec, e.err != nil)
 		c.logEnd(short(id), started, e, true)
 		if e.err != nil {
 			done <- &endError{e.reason, e.err}
@@ -434,7 +334,7 @@ func (c *Client) ServeOne(ctx context.Context, local localConn) error {
 		done <- nil
 	}
 	failed := make(chan error, 1)
-	go func() { failed <- c.serve(ctx, StdioTarget, open) }()
+	go func() { failed <- c.serve(ctx, tunnel.StdioTarget, open, nil) }()
 	select {
 	case err := <-done:
 		return err
@@ -445,18 +345,20 @@ func (c *Client) ServeOne(ctx context.Context, local localConn) error {
 }
 
 // serve keeps a control channel registered and calls open, on its own
-// goroutine, for each connection the relay asks for.
-func (c *Client) serve(ctx context.Context, target string, open func(id string)) error {
+// goroutine, for each connection the relay asks for. up, if not nil, is
+// called each time a registration succeeds (true) or its control channel is
+// lost (false).
+func (c *Client) serve(ctx context.Context, target string, open func(id string), up func(bool)) error {
 	h := c.header("")
-	h.Set(HeaderTarget, target)
+	h.Set(tunnel.HeaderTarget, target)
 	if c.ServeToken != "" {
-		h.Set(HeaderServe, c.ServeToken)
+		h.Set(tunnel.HeaderServe, c.ServeToken)
 	}
 	if c.ClientToken != "" {
 		sum := sha256.Sum256([]byte(c.ClientToken))
-		h.Set(HeaderClientHash, hex.EncodeToString(sum[:]))
+		h.Set(tunnel.HeaderClientHash, hex.EncodeToString(sum[:]))
 	}
-	h.Set(HeaderName, url.QueryEscape(c.Name))
+	h.Set(tunnel.HeaderName, url.QueryEscape(c.Name))
 	backoff, served := retryMin, false
 	for attempt := 1; ; attempt++ {
 		ws, err := c.dial(ctx, "serve", h)
@@ -467,31 +369,37 @@ func (c *Client) serve(ctx context.Context, target string, open func(id string))
 			return nil
 		}
 		if err != nil {
-			var se *StatusError
-			var pe *ProtoError
+			var se *tunnel.StatusError
+			var pe *tunnel.ProtoError
 			if errors.As(err, &pe) { // the server cannot do what was asked: waiting will not change it
 				return err
 			}
 			if !served && errors.As(err, &se) && se.Final() {
 				return explain(err)
 			}
-			c.Logf("cannot register with %s (%v); attempt %d, trying again in %s", c.base, explain(err), attempt, backoff)
+			c.logf("cannot register with %s (%v); attempt %d, trying again in %s", c.base, explain(err), attempt, backoff)
 		} else {
 			if served {
-				c.Logf("registered again with %s after %d attempt(s): serving %q, tunnel %s -> %s", c.base, attempt, c.Name, c.wordLabel(), target)
+				c.logf("registered again with %s after %d attempt(s): serving %q, tunnel %s -> %s", c.base, attempt, c.Name, c.wordLabel(), target)
 			} else {
-				c.Logf("registered with %s: serving %q, tunnel %s -> %s", c.base, c.Name, c.wordLabel(), target)
+				c.logf("registered with %s: serving %q, tunnel %s -> %s", c.base, c.Name, c.wordLabel(), target)
 			}
 			served, attempt = true, 0
 			started := time.Now()
+			if up != nil {
+				up(true)
+			}
 			err = c.control(ctx, ws, open)
+			if up != nil {
+				up(false)
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
 			if time.Since(started) >= settled {
 				backoff = retryMin
 			}
-			c.Logf("lost the server after %s (%v); its connections are closed; registering again in %s", fmtAge(time.Since(started)), err, backoff)
+			c.logf("lost the server after %s (%v); its connections are closed; registering again in %s", fmtAge(time.Since(started)), err, backoff)
 		}
 		if !sleep(ctx, backoff) {
 			return nil
@@ -515,18 +423,18 @@ func (c *Client) Watch(ctx context.Context) {
 		switch {
 		case err == nil:
 			if !up {
-				c.Logf("the tunnel is up")
+				c.logf("the tunnel is up")
 			}
 			up, backoff = true, retryMin
-		case errors.As(err, new(*ProtoError)):
+		case errors.As(err, new(*tunnel.ProtoError)):
 			if up || first {
-				c.Logf("%v; connections are refused meanwhile, and this keeps checking", err)
+				c.logf("%v; connections are refused meanwhile, and this keeps checking", err)
 			}
 			up, wait = false, backoff
 			backoff = min(backoff*2, retryMax)
 		default:
 			if up || first {
-				c.Logf("the tunnel is not available (%v): the word is wrong, nobody is serving it yet, or it asks for a client token that was not given; connections are refused until it is, and this keeps checking", err)
+				c.logf("the tunnel is not available (%v): the word is wrong, nobody is serving it yet, or it asks for a client token that was not given; connections are refused until it is, and this keeps checking", err)
 			}
 			up, wait = false, backoff
 			backoff = min(backoff*2, retryMax)
@@ -538,24 +446,24 @@ func (c *Client) Watch(ctx context.Context) {
 }
 
 // control runs one control channel until it fails.
-func (c *Client) control(ctx context.Context, ws *Conn, open func(id string)) error {
+func (c *Client) control(ctx context.Context, ws *tunnel.Conn, open func(id string)) error {
 	defer ws.Close()
-	ws.SetTimeouts(ControlSilence, WriteTimeout)
+	ws.SetTimeouts(tunnel.ControlSilence, tunnel.WriteTimeout)
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
-		t := time.NewTicker(controlPing)
+		t := time.NewTicker(tunnel.ControlPing)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				_ = ws.WriteFrame(OpClose, nil)
+				_ = ws.WriteFrame(tunnel.OpClose, nil)
 				_ = ws.Close()
 				return
 			case <-stop:
 				return
 			case <-t.C:
-				if ws.WriteFrame(OpPing, nil) != nil {
+				if ws.WriteFrame(tunnel.OpPing, nil) != nil {
 					_ = ws.Close()
 					return
 				}
@@ -563,12 +471,12 @@ func (c *Client) control(ctx context.Context, ws *Conn, open func(id string)) er
 		}
 	}()
 	for {
-		op, payload, err := ws.Next(MaxSmallFrame)
+		op, payload, err := ws.Next(tunnel.MaxSmallFrame)
 		if err != nil {
 			return err
 		}
-		var msg ControlMessage
-		if op == OpText && json.Unmarshal(payload, &msg) == nil && msg.Open != "" {
+		var msg tunnel.ControlMessage
+		if op == tunnel.OpText && json.Unmarshal(payload, &msg) == nil && msg.Open != "" {
 			go open(msg.Open)
 		}
 	}
@@ -579,24 +487,27 @@ func (c *Client) serveConn(ctx context.Context, id, target string) {
 	h := c.header(id)
 	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", target)
 	if err != nil {
-		c.Logf("connection %s failed: cannot reach the target %s: %v", short(id), target, err)
-		h.Set(HeaderError, "the serving side could not reach its target")
+		c.logf("connection %s failed: cannot reach the target %s: %v", short(id), target, err)
+		h.Set(tunnel.HeaderError, "the serving side could not reach its target")
 		if err := c.get(ctx, "accept", h); err != nil {
-			c.Logf("connection %s: could not tell the server: %v", short(id), explain(err))
+			c.logf("connection %s: could not tell the server: %v", short(id), explain(err))
 		}
 		return
 	}
 	ws, err := c.dial(ctx, "accept", h)
 	if err != nil {
-		c.Logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
+		c.logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
 		_ = conn.Close()
 		return
 	}
-	c.Logf("connection %s open: tunnel -> %s", short(id), target)
-	stream := NewStream(ws)
+	c.logf("connection %s open: tunnel -> %s", short(id), target)
+	stream := tunnel.NewStream(ws)
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
-	c.logEnd(short(id), time.Now(), bridge(ctx, stream, conn.(*net.TCPConn), partyServe), true)
+	rec := c.reg.add(id, SideServe, stream)
+	e := bridge(ctx, stream, conn.(*net.TCPConn), partyServe, rec)
+	c.reg.finish(rec, e.err != nil)
+	c.logEnd(short(id), rec.opened, e, true)
 }
 
 func short(id string) string { return id[:min(len(id), 8)] }
@@ -628,17 +539,25 @@ func fmtAge(d time.Duration) string {
 // logEnd reports a finished connection: how long it lasted, what it carried
 // each way, and why it ended. The directions are named from the two ends of
 // the whole tunnel, so both clients' logs read the same.
+func (c *Client) logf(format string, args ...any) {
+	if c.Logf != nil {
+		c.Logf(format, args...)
+	}
+}
+
 func (c *Client) logEnd(id string, started time.Time, e ended, serving bool) {
 	toTarget, toApp := e.toFar, e.toLocal
 	if serving { // here "local" is the target
 		toTarget, toApp = e.toLocal, e.toFar
 	}
-	c.Logf("connection %s closed after %s: app->target %s, target->app %s; %s",
+	c.logf("connection %s closed after %s: app->target %s, target->app %s; %s",
 		id, fmtAge(time.Since(started)), fmtBytes(toTarget), fmtBytes(toApp), e.reason)
 }
 
-// localConn is the application's end: a TCP connection, or stdin/stdout.
-type localConn interface {
+// HalfCloser is the application's end of a forwarded connection: a TCP
+// connection, stdin/stdout (Stdio), or anything else that can close its
+// sending half on its own.
+type HalfCloser interface {
 	io.ReadWriteCloser
 	CloseWrite() error
 }
@@ -654,7 +573,7 @@ func (e copyEnd) clean() bool { return e.readErr == nil && e.writeErr == nil }
 // becomes one WebSocket frame, so a busy stream, whose reads come back
 // full, travels in few large frames; nothing waits to be merged.
 func copyChunks(dst io.Writer, src io.Reader, count *atomic.Int64) copyEnd {
-	buf := make([]byte, chunkSize)
+	buf := make([]byte, tunnel.ChunkSize)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
@@ -700,15 +619,15 @@ var (
 // the cause as the server or the other pf-client reported it, and is
 // already specific.
 func (p party) linkReason(err error) string {
-	var remote *RemoteError
+	var remote *tunnel.RemoteError
 	var netErr net.Error
 	switch {
 	case errors.As(err, &remote):
 		return remote.Reason
-	case errors.Is(err, ErrPeerClosed):
+	case errors.Is(err, tunnel.ErrPeerClosed):
 		return "the server closed the connection"
 	case errors.As(err, &netErr) && netErr.Timeout():
-		return fmt.Sprintf("the link between %s and the server was silent for %s", p.self, linkSilence)
+		return fmt.Sprintf("the link between %s and the server was silent for %s", p.self, tunnel.LinkSilence())
 	}
 	return fmt.Sprintf("the link between %s and the server was lost (%v)", p.self, err)
 }
@@ -724,7 +643,7 @@ func (p party) localReason(err error) string {
 // bridge copies both ways until both directions finish cleanly or either
 // fails, then closes both ends. When this end is the one that saw the
 // break, it tells the far end why, so both logs name the same cause.
-func bridge(ctx context.Context, sess *Stream, local localConn, p party) ended {
+func bridge(ctx context.Context, sess *tunnel.Stream, local HalfCloser, p party, rec *connRecord) ended {
 	// If this program is stopped, whoever closes the stream says so.
 	sess.CloseReason = func() string {
 		if ctx.Err() != nil {
@@ -732,21 +651,21 @@ func bridge(ctx context.Context, sess *Stream, local localConn, p party) ended {
 		}
 		return ""
 	}
-	var toFar, toLocal atomic.Int64
+	toFar, toLocal := &rec.sent, &rec.received
 	type result struct {
 		outbound bool // local -> tunnel
 		end      copyEnd
 	}
 	results := make(chan result, 2)
 	go func() {
-		end := copyChunks(sess, local, &toFar)
+		end := copyChunks(sess, local, toFar)
 		if end.clean() {
 			end.writeErr = sess.CloseWrite()
 		}
 		results <- result{true, end}
 	}()
 	go func() {
-		end := copyChunks(local, sess, &toLocal)
+		end := copyChunks(local, sess, toLocal)
 		if end.clean() {
 			_ = local.CloseWrite()
 		}
@@ -795,7 +714,7 @@ func bridge(ctx context.Context, sess *Stream, local localConn, p party) ended {
 			case second := <-results:
 				then(second)
 			case <-time.After(200 * time.Millisecond):
-				mine, err = false, ErrPeerClosed
+				mine, err = false, tunnel.ErrPeerClosed
 				if reason = sess.GoneReason(); reason == "" {
 					reason = "the server closed the connection"
 				}
@@ -834,7 +753,7 @@ func (c *Client) Connect(ctx context.Context, ln net.Listener) error {
 
 // ConnectOne carries a single connection, and logs how it went. An error
 // it returns reads as the reason the connection ended, naming the hop.
-func (c *Client) ConnectOne(ctx context.Context, local localConn) error {
+func (c *Client) ConnectOne(ctx context.Context, local HalfCloser) error {
 	return c.carry(ctx, local, "stdin/stdout")
 }
 
@@ -848,20 +767,23 @@ type endError struct {
 func (e *endError) Error() string { return e.reason }
 func (e *endError) Unwrap() error { return e.err }
 
-func (c *Client) carry(ctx context.Context, local localConn, from string) error {
+func (c *Client) carry(ctx context.Context, local HalfCloser, from string) error {
 	ws, err := c.dial(ctx, "connect", c.connectHeader())
 	if err != nil {
 		_ = local.Close()
 		err = explain(err)
-		c.Logf("connection from %s refused: %v", from, err)
+		c.logf("connection from %s refused: %v", from, err)
 		return err
 	}
-	id, started := short(ws.Header.Get(HeaderConn)), time.Now()
-	c.Logf("connection %s open: %s -> tunnel %s", id, from, c.wordLabel())
-	stream := NewStream(ws)
+	fullID := ws.Header.Get(tunnel.HeaderConn)
+	id, started := short(fullID), time.Now()
+	c.logf("connection %s open: %s -> tunnel %s", id, from, c.wordLabel())
+	stream := tunnel.NewStream(ws)
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
-	e := bridge(ctx, stream, local, partyConnect)
+	rec := c.reg.add(fullID, SideConnect, stream)
+	e := bridge(ctx, stream, local, partyConnect, rec)
+	c.reg.finish(rec, e.err != nil)
 	c.logEnd(id, started, e, false)
 	if e.err != nil {
 		return &endError{e.reason, e.err}
@@ -895,9 +817,9 @@ func ProbeCert(ctx context.Context, base string) (leaf *x509.Certificate, verify
 	if u.Port() == "" {
 		addr = net.JoinHostPort(u.Hostname(), "443")
 	}
-	ctx, cancel := context.WithTimeout(ctx, handshakeLimit)
+	ctx, cancel := context.WithTimeout(ctx, tunnel.HandshakeLimit)
 	defer cancel()
-	raw, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", addr)
+	raw, err := (&net.Dialer{Timeout: tunnel.DialTimeout}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -919,18 +841,7 @@ func ProbeCert(ctx context.Context, base string) (leaf *x509.Certificate, verify
 }
 
 // Fingerprint is the certificate's SHA-256, as AA:BB:...
-func Fingerprint(cert *x509.Certificate) string {
-	sum := sha256.Sum256(cert.Raw)
-	text := strings.ToUpper(hex.EncodeToString(sum[:]))
-	var b strings.Builder
-	for i := 0; i < len(text); i += 2 {
-		if i > 0 {
-			b.WriteByte(':')
-		}
-		b.WriteString(text[i : i+2])
-	}
-	return b.String()
-}
+func Fingerprint(cert *x509.Certificate) string { return tunnel.Fingerprint(cert) }
 
 // PinnedTLS accepts exactly this certificate and nothing else.
 func PinnedTLS(cert *x509.Certificate) *tls.Config {

@@ -1,0 +1,974 @@
+//! One connection through a tunnel: a stream (PROTOCOL.md §8) over its own
+//! WebSocket, and the client's bookkeeping of its connections.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime};
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::Instant;
+use tokio_util::sync::PollSender;
+
+use crate::error::{Error, RemoteError, Result};
+use crate::http::{Stream as Tls, Upgraded};
+use crate::values::clean_reason;
+use crate::ws::{self, FrameReader, CHUNK, OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_TEXT, STREAM_LIMITS};
+
+/// Each end of a stream pings this often, on its own timer.
+pub const PING_EVERY: Duration = Duration::from_secs(10);
+/// A stream that hears nothing for this long is dead.
+pub const LINK_SILENCE: Duration = Duration::from_secs(30);
+/// How long a close waits for the far end's close, and bounds each write
+/// once closing has begun.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Frames queued for the writer.
+const WRITE_QUEUE: usize = 8;
+/// Frames read ahead of the application.
+const READ_QUEUE: usize = 4;
+const CLOSE_NORMAL: [u8; 2] = [0x03, 0xE8];
+
+/// Which end of the tunnel a connection belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    /// Opened by [`Client::dial`](crate::Client::dial).
+    Connect,
+    /// Brought in by a [`Listener`](crate::Listener).
+    Serve,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Connect => "connect",
+            Side::Serve => "serve",
+        }
+    }
+}
+
+/// A snapshot of one connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnInfo {
+    /// The hub's connection id.
+    pub id: String,
+    pub side: Side,
+    /// When the connection was opened.
+    pub opened: SystemTime,
+    /// Bytes sent into the tunnel.
+    pub sent: i64,
+    /// Bytes received from the tunnel.
+    pub received: i64,
+    /// This end has half-closed.
+    pub wrote_eof: bool,
+    /// The far end has half-closed.
+    pub read_eof: bool,
+}
+
+/// A client's connections, open and closed, since it was made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Connections opened.
+    pub opened: u64,
+    /// Connections open now.
+    pub active: u64,
+    /// Connections that ended with an error.
+    pub failed: u64,
+    /// Bytes sent into the tunnel.
+    pub sent: i64,
+    /// Bytes received from the tunnel.
+    pub received: i64,
+}
+
+pub(crate) struct Record {
+    key: u64,
+    id: String,
+    side: Side,
+    opened: SystemTime,
+    sent: AtomicI64,
+    received: AtomicI64,
+    wrote_eof: AtomicBool,
+    read_eof: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl Record {
+    fn info(&self) -> ConnInfo {
+        ConnInfo {
+            id: self.id.clone(),
+            side: self.side,
+            opened: self.opened,
+            sent: self.sent.load(Ordering::Relaxed),
+            received: self.received.load(Ordering::Relaxed),
+            wrote_eof: self.wrote_eof.load(Ordering::Relaxed),
+            read_eof: self.read_eof.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Totals {
+    live: BTreeMap<u64, Arc<Record>>,
+    opened: u64,
+    failed: u64,
+    sent: i64,
+    received: i64,
+}
+
+/// A client's live connections and its totals.
+#[derive(Default)]
+pub(crate) struct Registry {
+    next: AtomicU64,
+    totals: Mutex<Totals>,
+}
+
+impl Registry {
+    fn add(&self, id: String, side: Side) -> Arc<Record> {
+        let rec = Arc::new(Record {
+            key: self.next.fetch_add(1, Ordering::Relaxed),
+            id,
+            side,
+            opened: SystemTime::now(),
+            sent: AtomicI64::new(0),
+            received: AtomicI64::new(0),
+            wrote_eof: AtomicBool::new(false),
+            read_eof: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
+        let mut t = self.totals.lock().unwrap();
+        t.live.insert(rec.key, rec.clone());
+        t.opened += 1;
+        rec
+    }
+
+    fn finish(&self, rec: &Record, failed: bool) {
+        if rec.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut t = self.totals.lock().unwrap();
+        t.live.remove(&rec.key);
+        if failed {
+            t.failed += 1;
+        }
+        t.sent += rec.sent.load(Ordering::Relaxed);
+        t.received += rec.received.load(Ordering::Relaxed);
+    }
+
+    pub(crate) fn stats(&self) -> Stats {
+        let t = self.totals.lock().unwrap();
+        let mut st = Stats {
+            opened: t.opened,
+            active: t.live.len() as u64,
+            failed: t.failed,
+            sent: t.sent,
+            received: t.received,
+        };
+        for rec in t.live.values() {
+            st.sent += rec.sent.load(Ordering::Relaxed);
+            st.received += rec.received.load(Ordering::Relaxed);
+        }
+        st
+    }
+
+    /// Open connections, oldest first.
+    pub(crate) fn conns(&self) -> Vec<ConnInfo> {
+        self.totals.lock().unwrap().live.values().map(|r| r.info()).collect()
+    }
+}
+
+/// Why a stream broke, as its reader saw it.
+#[derive(Debug, Clone)]
+enum Failure {
+    Remote(String),
+    PeerClosed,
+    Silent,
+    Lost(String),
+    Protocol(String),
+    Closed,
+}
+
+impl Failure {
+    fn to_error(&self) -> Error {
+        match self {
+            Failure::Remote(r) => Error::Remote(RemoteError { reason: r.clone() }),
+            Failure::PeerClosed => Error::Link("the server closed the connection".into()),
+            Failure::Silent => Error::Link(format!(
+                "the link to the server was silent for {}s",
+                LINK_SILENCE.as_secs()
+            )),
+            Failure::Lost(why) => Error::Link(format!("the link to the server was lost ({why})")),
+            Failure::Protocol(why) => Error::Protocol(why.clone()),
+            Failure::Closed => Error::Closed,
+        }
+    }
+
+    fn to_io(&self) -> io::Error {
+        let kind = match self {
+            Failure::Remote(_) => io::ErrorKind::ConnectionAborted,
+            Failure::PeerClosed | Failure::Lost(_) => io::ErrorKind::ConnectionReset,
+            Failure::Silent => io::ErrorKind::TimedOut,
+            Failure::Protocol(_) => io::ErrorKind::InvalidData,
+            Failure::Closed => io::ErrorKind::NotConnected,
+        };
+        io::Error::new(kind, self.to_error())
+    }
+
+    fn of(err: &io::Error) -> Failure {
+        match err.kind() {
+            io::ErrorKind::TimedOut => Failure::Silent,
+            io::ErrorKind::UnexpectedEof => Failure::Lost("it ended without a close".into()),
+            io::ErrorKind::InvalidData => Failure::Protocol(err.to_string()),
+            _ => Failure::Lost(err.to_string()),
+        }
+    }
+}
+
+/// What the reader, the writer and the application share.
+struct Shared {
+    rec: Arc<Record>,
+    /// The first error that broke reading.
+    failure: Mutex<Option<Failure>>,
+    /// What broke writing.
+    write_error: Mutex<Option<Failure>>,
+    /// An `err:` that arrived after the far end's half-close.
+    gone_reason: Mutex<Option<String>>,
+    /// The reader has stopped: the far end closed, or the link died.
+    gone: watch::Sender<bool>,
+    /// Closing has begun: bound every write from now on.
+    closing: watch::Sender<bool>,
+    /// The far end sent a close frame, which must be answered.
+    peer_close: Notify,
+    /// This end failed: a broken read or write, or `fail`.
+    failed: AtomicBool,
+}
+
+impl Shared {
+    fn set_failure(&self, f: Failure) {
+        self.failed.store(true, Ordering::Release);
+        self.failure.lock().unwrap().get_or_insert(f);
+    }
+}
+
+enum Event {
+    Data(Vec<u8>),
+    Eof,
+    Failed(Failure),
+}
+
+enum Cmd {
+    Data(Vec<u8>),
+    Eof,
+}
+
+enum Ctl {
+    Close,
+    Fail(String),
+}
+
+struct ReadState {
+    rx: mpsc::Receiver<Event>,
+    pending: Vec<u8>,
+    pos: usize,
+    /// How reading ended: `Ok` for the far end's half-close.
+    end: Option<std::result::Result<(), Failure>>,
+}
+
+struct WriteState {
+    tx: PollSender<Cmd>,
+    eof: bool,
+}
+
+/// One connection through a tunnel.
+///
+/// It is an [`AsyncRead`] + [`AsyncWrite`], and so is `&Conn`, so one task
+/// can read while another writes:
+///
+/// - a read returns 0 bytes when the far end half-closes; it fails with an
+///   [`Error::Remote`] (inside the `io::Error`; see [`Error::from_io`]) when
+///   the far end or the hub dropped the connection with a reason;
+/// - `shutdown` half-closes: the far end reads the end of the stream after
+///   what was written so far, and may go on sending;
+/// - [`Conn::fail`] drops the connection with a reason for the far end;
+/// - [`Conn::close`] ends it, half-closing first if that was not done.
+///
+/// Writes are handed to a task that puts them on the wire in order; `close`
+/// waits until they are sent. Dropping a `Conn` closes it the same way, in
+/// the background.
+pub struct Conn {
+    shared: Arc<Shared>,
+    registry: Arc<Registry>,
+    rd: Mutex<ReadState>,
+    wr: Mutex<WriteState>,
+    ctl: mpsc::UnboundedSender<Ctl>,
+    writer: Mutex<Option<JoinHandle<()>>>,
+    closed: AtomicBool,
+}
+
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Conn").field("id", &self.shared.rec.id).field("side", &self.shared.rec.side).finish()
+    }
+}
+
+impl Conn {
+    pub(crate) fn start(up: Upgraded, id: String, side: Side, registry: Arc<Registry>) -> Conn {
+        let rec = registry.add(id, side);
+        let shared = Arc::new(Shared {
+            rec,
+            failure: Mutex::new(None),
+            write_error: Mutex::new(None),
+            gone_reason: Mutex::new(None),
+            gone: watch::channel(false).0,
+            closing: watch::channel(false).0,
+            peer_close: Notify::new(),
+            failed: AtomicBool::new(false),
+        });
+        let (r, w) = tokio::io::split(up.stream);
+        let (ev_tx, ev_rx) = mpsc::channel(READ_QUEUE);
+        let (cmd_tx, cmd_rx) = mpsc::channel(WRITE_QUEUE);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let frames = FrameReader::new(r, up.leftover, STREAM_LIMITS, LINK_SILENCE);
+        let reader = tokio::spawn(read_loop(frames, ev_tx, shared.clone())).abort_handle();
+        let writer = tokio::spawn(write_loop(w, cmd_rx, ctl_rx, shared.clone(), reader));
+        Conn {
+            shared,
+            registry,
+            rd: Mutex::new(ReadState { rx: ev_rx, pending: Vec::new(), pos: 0, end: None }),
+            wr: Mutex::new(WriteState { tx: PollSender::new(cmd_tx), eof: false }),
+            ctl: ctl_tx,
+            writer: Mutex::new(Some(writer)),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// The hub's id for this connection.
+    pub fn id(&self) -> &str {
+        &self.shared.rec.id
+    }
+
+    /// Which end of the tunnel this is.
+    pub fn side(&self) -> Side {
+        self.shared.rec.side
+    }
+
+    /// A snapshot of this connection.
+    pub fn info(&self) -> ConnInfo {
+        self.shared.rec.info()
+    }
+
+    /// Why the connection failed, once that is known: the far end's or the
+    /// hub's reason ([`Error::Remote`]), or a lost link. `None` while it is
+    /// fine, or after a clean finish.
+    ///
+    /// It can say more than a read did: the hub may pass a failure of the
+    /// far end on as a half-close first, so a read returns 0 and the reason
+    /// arrives just after it (PROTOCOL.md §8.3).
+    pub fn err(&self) -> Option<Error> {
+        if let Some(f) = self.shared.failure.lock().unwrap().as_ref() {
+            return Some(f.to_error());
+        }
+        self.shared
+            .gone_reason
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| Error::Remote(RemoteError { reason: r.clone() }))
+    }
+
+    /// Waits until the far end, having half-closed, is gone for good, or
+    /// the link died, and returns what [`Conn::err`] then says.
+    pub async fn finished(&self) -> Option<Error> {
+        let mut gone = self.shared.gone.subscribe();
+        let _ = gone.wait_for(|g| *g).await;
+        self.err()
+    }
+
+    /// Drops the connection and tells the far end why: its reads fail with
+    /// a [`RemoteError`] carrying `reason`.
+    pub async fn fail(&self, reason: &str) {
+        self.shared.failed.store(true, Ordering::Release);
+        let reason: String = reason.chars().filter(|c| !c.is_control()).collect();
+        self.end(Ctl::Fail(reason)).await;
+        self.registry.finish(&self.shared.rec, true);
+    }
+
+    /// Ends the connection, after sending what was written. If this end has
+    /// not half-closed, it does so first. When both ends had half-closed,
+    /// the close is clean; otherwise the far end sees the connection cut.
+    pub async fn close(&self) -> Result<()> {
+        self.end(Ctl::Close).await;
+        let failed = self.shared.failed.load(Ordering::Acquire) || self.err().is_some();
+        self.registry.finish(&self.shared.rec, failed);
+        Ok(())
+    }
+
+    async fn end(&self, how: Ctl) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.shared.closing.send_replace(true);
+        let _ = self.ctl.send(how);
+        let writer = self.writer.lock().unwrap().take();
+        if let Some(w) = writer {
+            let _ = w.await;
+        }
+    }
+
+    fn poll_read_inner(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut st = self.rd.lock().unwrap();
+        loop {
+            if st.pos < st.pending.len() {
+                let n = (st.pending.len() - st.pos).min(buf.remaining());
+                buf.put_slice(&st.pending[st.pos..st.pos + n]);
+                st.pos += n;
+                if st.pos == st.pending.len() {
+                    st.pending = Vec::new();
+                    st.pos = 0;
+                }
+                self.shared.rec.received.fetch_add(n as i64, Ordering::Relaxed);
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(end) = &st.end {
+                return Poll::Ready(end.clone().map_err(|f| f.to_io()));
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Poll::Ready(Err(Failure::Closed.to_io()));
+            }
+            match st.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Event::Data(v))) => {
+                    st.pending = v;
+                    st.pos = 0;
+                }
+                Poll::Ready(Some(Event::Eof)) => st.end = Some(Ok(())),
+                Poll::Ready(Some(Event::Failed(f))) => st.end = Some(Err(f)),
+                Poll::Ready(None) => {
+                    let f = self.shared.failure.lock().unwrap().clone().unwrap_or(Failure::Closed);
+                    st.end = Some(Err(f));
+                }
+            }
+        }
+    }
+
+    fn write_check(&self, st: &WriteState) -> io::Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Failure::Closed.to_io());
+        }
+        if let Some(f) = self.shared.write_error.lock().unwrap().as_ref() {
+            return Err(f.to_io());
+        }
+        if st.eof {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "write after half-close"));
+        }
+        Ok(())
+    }
+
+    fn poll_write_inner(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let mut st = self.wr.lock().unwrap();
+        self.write_check(&st)?;
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match st.tx.poll_reserve(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(self.writer_gone())),
+            Poll::Ready(Ok(())) => {
+                let n = buf.len().min(CHUNK);
+                if st.tx.send_item(Cmd::Data(buf[..n].to_vec())).is_err() {
+                    return Poll::Ready(Err(self.writer_gone()));
+                }
+                self.shared.rec.sent.fetch_add(n as i64, Ordering::Relaxed);
+                Poll::Ready(Ok(n))
+            }
+        }
+    }
+
+    fn poll_shutdown_inner(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut st = self.wr.lock().unwrap();
+        if st.eof {
+            return Poll::Ready(Ok(()));
+        }
+        self.write_check(&st)?;
+        match st.tx.poll_reserve(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(self.writer_gone())),
+            Poll::Ready(Ok(())) => {
+                if st.tx.send_item(Cmd::Eof).is_err() {
+                    return Poll::Ready(Err(self.writer_gone()));
+                }
+                st.eof = true;
+                self.shared.rec.wrote_eof.store(true, Ordering::Release);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    fn writer_gone(&self) -> io::Error {
+        self.shared.write_error.lock().unwrap().clone().unwrap_or(Failure::Closed).to_io()
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            // The writer sees its channels close and closes as `close` would.
+            self.shared.closing.send_replace(true);
+            let failed = self.shared.failed.load(Ordering::Acquire) || self.err().is_some();
+            self.registry.finish(&self.shared.rec, failed);
+        }
+    }
+}
+
+impl AsyncRead for &Conn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        self.poll_read_inner(cx, buf)
+    }
+}
+
+impl AsyncWrite for &Conn {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.poll_write_inner(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_shutdown_inner(cx)
+    }
+}
+
+impl AsyncRead for Conn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        self.poll_read_inner(cx, buf)
+    }
+}
+
+impl AsyncWrite for Conn {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.poll_write_inner(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_shutdown_inner(cx)
+    }
+}
+
+// ---------- the reader ----------
+
+async fn read_loop(mut frames: FrameReader<ReadHalf<Tls>>, tx: mpsc::Sender<Event>, sh: Arc<Shared>) {
+    if read_data(&mut frames, &tx, &sh).await {
+        watch_after_eof(&mut frames, &sh).await;
+    }
+    sh.gone.send_replace(true);
+}
+
+/// Reads the stream up to the far end's half-close (true) or its failure
+/// (false).
+async fn read_data(frames: &mut FrameReader<ReadHalf<Tls>>, tx: &mpsc::Sender<Event>, sh: &Shared) -> bool {
+    let failed = |f: Failure| {
+        sh.set_failure(f.clone());
+        Event::Failed(f)
+    };
+    loop {
+        let frame = match frames.next().await {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(failed(Failure::of(&e))).await;
+                return false;
+            }
+        };
+        match frame.op {
+            OP_BINARY | OP_CONT => {
+                if !frame.payload.is_empty() && tx.send(Event::Data(frame.payload)).await.is_err() {
+                    return false; // nobody reads any more
+                }
+            }
+            OP_TEXT => {
+                if !frame.fin {
+                    let _ = tx.send(failed(Failure::Protocol("a fragmented text frame".into()))).await;
+                    return false;
+                }
+                if frame.payload == b"eof" {
+                    sh.rec.read_eof.store(true, Ordering::Release);
+                    let _ = tx.send(Event::Eof).await;
+                    return true;
+                }
+                if let Some(reason) = frame.payload.strip_prefix(b"err:") {
+                    let reason = clean_reason(&String::from_utf8_lossy(reason));
+                    let _ = tx.send(failed(Failure::Remote(reason))).await;
+                    return false;
+                }
+                // any other text frame is ignored
+            }
+            OP_CLOSE => {
+                sh.peer_close.notify_one();
+                let _ = tx.send(failed(Failure::PeerClosed)).await;
+                return false;
+            }
+            _ => {} // pings are not answered; pongs are ignored
+        }
+    }
+}
+
+/// Keeps reading after the far end's half-close: an `err:` may still come
+/// (PROTOCOL.md §8.3), and the far end's close or a dead link must be seen.
+async fn watch_after_eof(frames: &mut FrameReader<ReadHalf<Tls>>, sh: &Shared) {
+    loop {
+        let Ok(frame) = frames.next().await else { return };
+        match frame.op {
+            OP_BINARY | OP_CONT => {
+                // Nothing may follow a half-close: a broken peer.
+                sh.set_failure(Failure::Protocol("data after the far end's half-close".into()));
+                return;
+            }
+            OP_TEXT => {
+                if let Some(reason) = frame.payload.strip_prefix(b"err:") {
+                    let reason = clean_reason(&String::from_utf8_lossy(reason));
+                    *sh.gone_reason.lock().unwrap() = Some(reason);
+                }
+            }
+            OP_CLOSE => {
+                sh.peer_close.notify_one();
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------- the writer ----------
+
+/// Writes one frame. Once closing has begun, the write may take at most
+/// CLOSE_TIMEOUT, also when it was already under way.
+async fn put(w: &mut WriteHalf<Tls>, closing: &mut watch::Receiver<bool>, op: u8, payload: &[u8]) -> io::Result<()> {
+    let fut = ws::write_frame(w, op, payload);
+    tokio::pin!(fut);
+    let bounded = |r: std::result::Result<io::Result<()>, _>| {
+        r.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out while closing")))
+    };
+    let already = *closing.borrow();
+    if already {
+        return bounded(tokio::time::timeout(CLOSE_TIMEOUT, fut).await);
+    }
+    tokio::select! {
+        r = &mut fut => return r,
+        r = closing.wait_for(|c| *c) => drop(r),
+    }
+    bounded(tokio::time::timeout(CLOSE_TIMEOUT, &mut fut).await)
+}
+
+async fn write_loop(
+    mut w: WriteHalf<Tls>,
+    mut data: mpsc::Receiver<Cmd>,
+    mut ctl: mpsc::UnboundedReceiver<Ctl>,
+    sh: Arc<Shared>,
+    reader: AbortHandle,
+) {
+    let mut closing = sh.closing.subscribe();
+    let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut eof_written = false;
+    let mut close_sent = false;
+    let mut broken = false;
+    let broke = |sh: &Shared, e: io::Error| {
+        sh.failed.store(true, Ordering::Release);
+        sh.write_error.lock().unwrap().get_or_insert(Failure::of(&e));
+    };
+
+    let how = loop {
+        tokio::select! {
+            biased;
+            c = ctl.recv() => break c.unwrap_or(Ctl::Close),
+            _ = sh.peer_close.notified(), if !close_sent => {
+                // Answer the far end's close, as RFC 6455 requires.
+                close_sent = true;
+                if !broken {
+                    let _ = put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await;
+                }
+                broken = true;
+                sh.write_error.lock().unwrap().get_or_insert(Failure::PeerClosed);
+            }
+            c = data.recv() => match c {
+                None => break Ctl::Close, // the Conn was dropped
+                Some(cmd) => {
+                    if broken {
+                        continue;
+                    }
+                    let r = match cmd {
+                        Cmd::Data(b) => put(&mut w, &mut closing, OP_BINARY, &b).await,
+                        Cmd::Eof => {
+                            eof_written = true;
+                            put(&mut w, &mut closing, OP_TEXT, b"eof").await
+                        }
+                    };
+                    if let Err(e) = r {
+                        broken = true;
+                        broke(&sh, e);
+                    }
+                }
+            },
+            _ = ping.tick() => {
+                if !broken {
+                    if let Err(e) = put(&mut w, &mut closing, OP_PING, &[]).await {
+                        broken = true;
+                        broke(&sh, e);
+                    }
+                }
+            }
+        }
+    };
+
+    match how {
+        Ctl::Fail(reason) => {
+            if !broken {
+                let msg = format!("err:{reason}");
+                let mut text = msg.as_bytes();
+                if text.len() > ws::MAX_TEXT_FRAME as usize {
+                    let mut cut = ws::MAX_TEXT_FRAME as usize;
+                    while !msg.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    text = &text[..cut];
+                }
+                if put(&mut w, &mut closing, OP_TEXT, text).await.is_ok() && !close_sent {
+                    let _ = put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await;
+                }
+            }
+        }
+        Ctl::Close => {
+            // What was written before the close goes out first.
+            while let Ok(cmd) = data.try_recv() {
+                if broken {
+                    break;
+                }
+                let r = match cmd {
+                    Cmd::Data(b) => put(&mut w, &mut closing, OP_BINARY, &b).await,
+                    Cmd::Eof => {
+                        eof_written = true;
+                        put(&mut w, &mut closing, OP_TEXT, b"eof").await
+                    }
+                };
+                if let Err(e) = r {
+                    broken = true;
+                    broke(&sh, e);
+                }
+            }
+            if !broken && !eof_written && !sh.failed.load(Ordering::Acquire) {
+                eof_written = true;
+                sh.rec.wrote_eof.store(true, Ordering::Release);
+                if let Err(e) = put(&mut w, &mut closing, OP_TEXT, b"eof").await {
+                    broken = true;
+                    broke(&sh, e);
+                }
+            }
+            let clean = eof_written && sh.rec.read_eof.load(Ordering::Acquire);
+            if clean && !sh.failed.load(Ordering::Acquire) {
+                // A clean finish: the closing handshake, then wait briefly
+                // for the far end's close so the last bytes are not reset.
+                if (close_sent || put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await.is_ok())
+                    && !broken
+                {
+                    let mut gone = sh.gone.subscribe();
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, gone.wait_for(|g| *g)).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(1), w.shutdown()).await;
+                } else if close_sent {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), w.shutdown()).await;
+                }
+            }
+            // Anything else cuts the stream: the socket is dropped.
+        }
+    }
+    reader.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::Head;
+    use crate::ws::OP_PONG;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+
+    /// The hub's end of a stream: sends unmasked frames, reads masked ones.
+    struct Hub(DuplexStream);
+
+    impl Hub {
+        async fn send(&mut self, op: u8, payload: &[u8]) {
+            let mut f = vec![0x80 | op];
+            let n = payload.len();
+            if n < 126 {
+                f.push(n as u8);
+            } else {
+                f.push(126);
+                f.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            f.extend_from_slice(payload);
+            self.0.write_all(&f).await.unwrap();
+        }
+
+        /// The next frame from the client, checked to be masked and final.
+        async fn recv(&mut self) -> (u8, Vec<u8>) {
+            let mut h = [0u8; 2];
+            self.0.read_exact(&mut h).await.unwrap();
+            assert_eq!(h[0] & 0xF0, 0x80, "FIN set, no RSV bits");
+            assert_eq!(h[1] & 0x80, 0x80, "masked");
+            let len = match h[1] & 0x7F {
+                126 => {
+                    let mut b = [0u8; 2];
+                    self.0.read_exact(&mut b).await.unwrap();
+                    u16::from_be_bytes(b) as usize
+                }
+                127 => {
+                    let mut b = [0u8; 8];
+                    self.0.read_exact(&mut b).await.unwrap();
+                    u64::from_be_bytes(b) as usize
+                }
+                n => n as usize,
+            };
+            let mut mask = [0u8; 4];
+            self.0.read_exact(&mut mask).await.unwrap();
+            let mut body = vec![0u8; len];
+            self.0.read_exact(&mut body).await.unwrap();
+            for (i, b) in body.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+            (h[0] & 0x0F, body)
+        }
+
+        /// The next frame that is not a ping.
+        async fn recv_data(&mut self) -> (u8, Vec<u8>) {
+            loop {
+                let f = self.recv().await;
+                if f.0 != OP_PING {
+                    return f;
+                }
+            }
+        }
+    }
+
+    fn pair() -> (Conn, Hub, Arc<Registry>) {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let reg = Arc::new(Registry::default());
+        let up = Upgraded { stream: Box::new(a), leftover: Vec::new(), head: Head::default() };
+        (Conn::start(up, "8f14e45fceea167a".into(), Side::Connect, reg.clone()), Hub(b), reg)
+    }
+
+    #[tokio::test]
+    async fn data_half_close_and_clean_close() {
+        let (conn, mut hub, reg) = pair();
+        let mut c = &conn;
+        let big = vec![7u8; 100_000];
+        c.write_all(&big).await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        loop {
+            match hub.recv_data().await {
+                (OP_BINARY, b) => {
+                    assert!(b.len() <= CHUNK);
+                    got.extend(b);
+                }
+                (OP_TEXT, t) => {
+                    assert_eq!(t, b"eof");
+                    break;
+                }
+                f => panic!("unexpected frame {f:?}"),
+            }
+        }
+        assert_eq!(got, big);
+        assert!(c.write_all(b"x").await.is_err(), "no data after a half-close");
+
+        hub.send(OP_BINARY, b"back").await;
+        hub.send(OP_PING, b"").await; // not answered, and harmless
+        hub.send(OP_PONG, b"").await; // ignored
+        hub.send(OP_TEXT, b"something else").await; // ignored
+        hub.send(OP_TEXT, b"eof").await;
+        let mut back = Vec::new();
+        c.read_to_end(&mut back).await.unwrap();
+        assert_eq!(back, b"back");
+        assert!(conn.info().read_eof);
+        assert!(conn.info().wrote_eof);
+
+        let closing = tokio::spawn(async move {
+            let (op, _) = hub.recv_data().await;
+            assert_eq!(op, OP_CLOSE, "both eofs exchanged: a close frame");
+            hub.send(OP_CLOSE, &CLOSE_NORMAL).await;
+            hub
+        });
+        conn.close().await.unwrap();
+        closing.await.unwrap();
+        assert!(conn.err().is_none());
+        let st = reg.stats();
+        assert_eq!((st.opened, st.active, st.failed, st.sent, st.received), (1, 0, 0, 100_000, 4));
+    }
+
+    #[tokio::test]
+    async fn a_reason_after_the_half_close() {
+        let (conn, mut hub, reg) = pair();
+        hub.send(OP_BINARY, b"partial").await;
+        hub.send(OP_TEXT, b"eof").await;
+        hub.send(OP_TEXT, b"err:the target reset its connection\x07").await;
+        hub.send(OP_CLOSE, &CLOSE_NORMAL).await;
+        let mut got = Vec::new();
+        (&conn).read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"partial");
+        let err = conn.finished().await.expect("the reason after the eof");
+        assert!(matches!(&err, Error::Remote(r) if r.reason == "the target reset its connection"), "{err:?}");
+        conn.close().await.unwrap();
+        assert_eq!(reg.stats().failed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_reason_instead_of_data() {
+        let (conn, mut hub, _) = pair();
+        hub.send(OP_TEXT, b"err:the serving side could not reach its target").await;
+        let mut buf = [0u8; 8];
+        let e = (&conn).read(&mut buf).await.unwrap_err();
+        match Error::from_io(&e) {
+            Some(Error::Remote(r)) => assert_eq!(r.reason, "the serving side could not reach its target"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_without_eofs_is_a_failure() {
+        let (conn, mut hub, _) = pair();
+        hub.send(OP_CLOSE, &CLOSE_NORMAL).await;
+        let mut buf = [0u8; 8];
+        assert!((&conn).read(&mut buf).await.is_err());
+        // The close is answered.
+        assert_eq!(hub.recv_data().await.0, OP_CLOSE);
+        assert!(conn.err().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_link_that_ends_is_a_failure() {
+        let (conn, hub, _) = pair();
+        drop(hub);
+        let mut buf = [0u8; 8];
+        assert!((&conn).read(&mut buf).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fail_sends_the_reason() {
+        let (conn, mut hub, reg) = pair();
+        conn.fail("pf-client serve is stopping").await;
+        assert_eq!(hub.recv_data().await, (OP_TEXT, b"err:pf-client serve is stopping".to_vec()));
+        assert_eq!(hub.recv_data().await.0, OP_CLOSE);
+        assert_eq!(reg.stats().failed, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pings_on_its_own_timer() {
+        let (_conn, mut hub, _) = pair();
+        tokio::time::sleep(PING_EVERY + Duration::from_millis(100)).await;
+        assert_eq!(hub.recv().await.0, OP_PING);
+    }
+}

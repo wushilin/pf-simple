@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wushilin/pf-simple/internal/tunnel"
+	"github.com/wushilin/pf-simple/pfrelay"
 )
 
 // The own CA makes its keys once and only ever replaces certificates: when
@@ -224,20 +225,20 @@ func TestConsoleOwnTLS(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	url := "https://" + addr
-	server, err := tunnel.NewClient(url, testWord, &tls.Config{RootCAs: pool})
+	server, err := pfrelay.NewClient(url, testWord, &tls.Config{RootCAs: pool})
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.ServeToken, server.Name, server.Logf = testServeToken, "Direct", func(string, ...any) {}
 	go func() { _ = server.Serve(ctx, echoTarget(t)) }()
-	client, err := tunnel.NewClient(url, testWord, &tls.Config{RootCAs: pool})
+	client, err := pfrelay.NewClient(url, testWord, &tls.Config{RootCAs: pool})
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.Logf = func(string, ...any) {}
 	waitFor(t, "the word to be served over the console's own TLS", func() bool { return client.Check(ctx) == nil })
 	// Without the CA the certificate is not trusted.
-	stranger, _ := tunnel.NewClient(url, testWord, nil)
+	stranger, _ := pfrelay.NewClient(url, testWord, nil)
 	if err := stranger.Check(ctx); err == nil || !strings.Contains(err.Error(), "certificate") {
 		t.Fatalf("check without the CA = %v", err)
 	}
@@ -322,12 +323,12 @@ func TestCertFilesReload(t *testing.T) {
 	if _, err := files.load(); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := files.get(nil); tunnel.Fingerprint(got.Leaf) != tunnel.Fingerprint(certA.Leaf) {
+	if got, _ := files.get(nil); pfrelay.Fingerprint(got.Leaf) != pfrelay.Fingerprint(certA.Leaf) {
 		t.Fatal("not the certificate in the files")
 	}
 	// A change is not looked for again within certRecheck...
 	put("b", time.Now())
-	if got, _ := files.get(nil); tunnel.Fingerprint(got.Leaf) != tunnel.Fingerprint(certA.Leaf) {
+	if got, _ := files.get(nil); pfrelay.Fingerprint(got.Leaf) != pfrelay.Fingerprint(certA.Leaf) {
 		t.Fatal("the files were read again too soon")
 	}
 	// ...and is picked up after it.
@@ -337,7 +338,7 @@ func TestCertFilesReload(t *testing.T) {
 		files.mu.Unlock()
 	}
 	due()
-	if got, _ := files.get(nil); tunnel.Fingerprint(got.Leaf) != tunnel.Fingerprint(certB.Leaf) {
+	if got, _ := files.get(nil); pfrelay.Fingerprint(got.Leaf) != pfrelay.Fingerprint(certB.Leaf) {
 		t.Fatal("the changed files were not picked up")
 	}
 	// A broken change keeps the certificate in use.
@@ -345,7 +346,7 @@ func TestCertFilesReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	due()
-	if got, err := files.get(nil); err != nil || tunnel.Fingerprint(got.Leaf) != tunnel.Fingerprint(certB.Leaf) {
+	if got, err := files.get(nil); err != nil || pfrelay.Fingerprint(got.Leaf) != pfrelay.Fingerprint(certB.Leaf) {
 		t.Fatalf("after a broken change: %v", err)
 	}
 }

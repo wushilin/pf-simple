@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wushilin/pf-simple/internal/tunnel"
+	"github.com/wushilin/pf-simple/pfrelay"
 )
 
 // A tunnelled connection is a chain of five parties and four links:
@@ -279,7 +279,7 @@ func TestRelayBrokenConnections(t *testing.T) {
 			// Each client reports the end of a connection in its log, with
 			// how long it lasted, what it carried and why it ended.
 			var reasons sync.Map
-			ended := func(c *tunnel.Client) <-chan time.Time {
+			ended := func(c *pfrelay.Client) <-chan time.Time {
 				ch := make(chan time.Time, 1)
 				c.Logf = func(format string, args ...any) {
 					if strings.HasPrefix(format, "connection %s closed after") {
@@ -292,8 +292,8 @@ func TestRelayBrokenConnections(t *testing.T) {
 				}
 				return ch
 			}
-			newClient := func(l *flakyLink) *tunnel.Client {
-				c, err := tunnel.NewClient(l.url(), testWord, f.tls)
+			newClient := func(l *flakyLink) *pfrelay.Client {
+				c, err := pfrelay.NewClient(l.url(), testWord, f.tls)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -368,7 +368,7 @@ func TestRelayBrokenConnections(t *testing.T) {
 			t.Logf("let go after: pf-client connect %s, hub %s, pf-client serve %s",
 				took[connect].Round(100*time.Millisecond), hubTook.Round(100*time.Millisecond), took[serve].Round(100*time.Millisecond))
 			for i, name := range []string{connect, serve} {
-				line, _ := reasons.Load(map[string]*tunnel.Client{connect: connector, serve: server}[name])
+				line, _ := reasons.Load(map[string]*pfrelay.Client{connect: connector, serve: server}[name])
 				t.Logf("  %-7s %v", name, line)
 				if text, _ := line.(string); !strings.Contains(text, "; "+tc.why[i]) {
 					t.Errorf("pf-client %s gave the wrong reason: want %q in %v", name, tc.why[i], line)

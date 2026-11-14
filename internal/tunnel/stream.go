@@ -25,7 +25,7 @@ import (
 // full, and a reader that stops reading stops the far end's writes.
 
 const (
-	chunkSize = 64 << 10
+	ChunkSize = 64 << 10
 
 	msgEOF       = "eof"
 	msgErrPrefix = "err:"
@@ -216,8 +216,8 @@ func (s *Stream) GoneReason() string {
 func (s *Stream) Gone() <-chan struct{} { return s.gone }
 
 func (s *Stream) Write(p []byte) (int, error) {
-	for off := 0; off < len(p); off += chunkSize {
-		if err := s.c.WriteFrame(OpBinary, p[off:min(off+chunkSize, len(p))]); err != nil {
+	for off := 0; off < len(p); off += ChunkSize {
+		if err := s.c.WriteFrame(OpBinary, p[off:min(off+ChunkSize, len(p))]); err != nil {
 			return off, err
 		}
 	}
@@ -292,3 +292,14 @@ func (s *Stream) RemoteAddr() net.Addr {
 func (s *Stream) SetDeadline(t time.Time) error      { return s.c.conn.SetDeadline(t) }
 func (s *Stream) SetReadDeadline(t time.Time) error  { return s.c.conn.SetReadDeadline(t) }
 func (s *Stream) SetWriteDeadline(t time.Time) error { return s.c.conn.SetWriteDeadline(t) }
+
+// LinkSilence is how long a stream may hear nothing before its link counts
+// as dead.
+func LinkSilence() time.Duration { return linkSilence }
+
+// ExpireWrites makes every write fail at once, as a write deadline that has
+// passed does. The stream cannot be written to again.
+func (s *Stream) ExpireWrites() { s.c.ExpireWrites() }
+
+// WroteEOF reports whether this end has half-closed.
+func (s *Stream) WroteEOF() bool { return s.wroteEOF.Load() }
