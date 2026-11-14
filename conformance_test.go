@@ -1167,6 +1167,14 @@ func checkStats(t *testing.T, h *conformanceHub, p *proc, side pfrelay.Side, ope
 	if st.Opened != 4 || st.Active != 1 || st.Sent != 6005 || st.Received != 6005 {
 		t.Errorf("with one open, stats = %+v", st)
 	}
+	// Finish it cleanly: half-close, read to the far end's half-close,
+	// then close. A close without that is a cut (PROTOCOL.md §8.4), which
+	// either side may then report as failed.
+	_ = conn.(interface{ CloseWrite() error }).CloseWrite()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if rest, err := io.ReadAll(conn); err != nil || len(rest) != 0 {
+		t.Errorf("finishing the open connection: %d more bytes, %v", len(rest), err)
+	}
 	conn.Close()
 	waitFor(t, "the last connection to close", func() bool {
 		p.ask(queryStats, &st)

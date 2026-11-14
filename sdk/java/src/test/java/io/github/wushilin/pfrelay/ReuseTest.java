@@ -280,8 +280,11 @@ public final class ReuseTest {
         eq(null, none.offer(Endpoint.SERVE), "announces none");
         throwsA(IllegalArgumentException.class,
                 () -> Client.builder().server("https://h").maxProto(3).build(), "a protocol it does not speak");
+        eq(Client.DEFAULT_MAX_IDLE_LEGS, Client.builder().server("https://h").maxIdleLegs(0).build().maxIdleLegs(),
+                "0 means the default");
         throwsA(IllegalArgumentException.class,
-                () -> Client.builder().server("https://h").maxIdleLegs(0).build(), "no idle legs");
+                () -> Client.builder().server("https://h").maxIdleLegs(-1).build(), "negative");
+        eq(2, Feature.REUSE.proto(), "reuse is protocol 2");
         check(!Client.builder().server("https://h").noReuse().build().reuseWanted(), "noReuse");
         // announcing none sends neither the range nor the agent
         try (FakeHub hub = new FakeHub(r -> r.respond(204, null))) {
@@ -506,6 +509,98 @@ public final class ReuseTest {
                     throwsA(IOException.class, () -> expectText(leg, 5000), "the leg closes");
                 }
             }
+        }
+    }
+
+    /**
+     * A bound attempt the hub asks for again is abandoned and reported
+     * failed, even when the application holding it closes it quietly; the
+     * new attempt is carried.
+     */
+    public static void testAbandonedAttemptIsFailed() throws Exception {
+        try (ScriptHub h = new ScriptHub()) {
+            Events ev = new Events();
+            try (Listener l = h.client().events(ev).build().listen()) {
+                BlockingQueue<Conn> held = new LinkedBlockingQueue<>();
+                Thread t = new Thread(() -> {
+                    while (true) {
+                        try {
+                            held.add(l.accept());
+                        } catch (IOException e) {
+                            return;
+                        }
+                    }
+                });
+                t.setDaemon(true);
+                t.start();
+                WebSocket ctl = h.nextCtl();
+                open(ctl, ID1);
+                AcceptReq a = h.nextAccept();
+                Conn first = held.poll(10, TimeUnit.SECONDS);
+                Sched.go(() -> {
+                    try {
+                        first.getInputStream().transferTo(first.getOutputStream());
+                        first.shutdownOutput();
+                    } catch (IOException ignored) {
+                        // reported by close
+                    } finally {
+                        first.close();
+                    }
+                });
+                exchange(a.ws());
+                text(a.ws(), "idle");
+                eq("idle", expectText(a.ws(), 5000), "kept");
+                text(a.ws(), "bind " + ID2);
+                eq("bound " + ID2, expectText(a.ws(), 5000), "bind is answered");
+                Conn old = held.poll(10, TimeUnit.SECONDS); // held, neither read nor written
+                check(old != null, "the bound attempt is accepted");
+                open(ctl, ID2);
+                h.nextAccept();
+                check(held.poll(10, TimeUnit.SECONDS) != null, "the new attempt is accepted");
+                old.close(); // quietly
+                IOException e = ev.closedWith(ID2, 1).get(0);
+                check(e instanceof DroppedException
+                        && ((DroppedException) e).reason().equals(Registration.REASON_LEG_LOST),
+                        "the abandoned attempt closed with " + e);
+            }
+        }
+    }
+
+    /** A bind for an id that already came with an open message is refused: the leg closes, nothing opens twice. */
+    public static void testLateBindIsRefused() throws Exception {
+        try (ScriptHub h = new ScriptHub()) {
+            Events ev = new Events();
+            try (Listener l = listenEcho(h.client().events(ev).build())) {
+                check(l.isUp(), "up");
+                WebSocket ctl = h.nextCtl();
+                WebSocket leg = keepLeg(h, ctl, ID1);
+                open(ctl, ID2);
+                h.nextAccept();
+                Thread.sleep(50);
+                text(leg, "bind " + ID2);
+                throwsA(IOException.class, () -> expectText(leg, 5000), "a late bind is refused");
+                eq(1L, ev.opened.stream().filter(ID2::equals).count(), "opened once");
+            }
+        }
+    }
+
+    /**
+     * An open message for an id this registration never bound abandons
+     * nothing, and abandoning only ever touches serving-side connections:
+     * the same client may be connecting through its own tunnel.
+     */
+    public static void testAbandonSparesTheConnectingSide() throws Exception {
+        try (TestMain.Pair p = new TestMain.Pair()) {
+            Client c = TestMain.localClient(Timing.DEFAULT);
+            Conn mine = new Conn(p.client, c, new ConnId(ID1), Side.CONNECT);
+            Registration reg = new Registration(c, TestMain.hdr(), (r, id, leg) -> { });
+            check(!reg.tookOpen(ID1), "an id never bound is no new attempt");
+            c.abandon(ID1); // even if asked, the connecting side is left alone
+            Thread.sleep(100);
+            check(mine.error() == null && c.stats().active() == 1, "the connecting connection is untouched");
+            check(reg.takeBind(ID2) && reg.tookOpen(ID2) && reg.abandoned(ID2), "bound, then opened: abandoned");
+            check(!reg.takeBind(ID1), "a bind after an open is refused");
+            mine.fail("done");
         }
     }
 }

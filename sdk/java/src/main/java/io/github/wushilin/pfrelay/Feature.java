@@ -5,7 +5,13 @@ public enum Feature {
     /** A client token: registered by serve, sent by connect and check. */
     CLIENT_TOKEN(1, "a client token"),
     /** Serving without a serve token. */
-    ANONYMOUS_SERVE(1, "serving without a serve token");
+    ANONYMOUS_SERVE(1, "serving without a serve token"),
+    /**
+     * Reusing the serving side's accept legs (docs/PROTOCOL.md §12).
+     * Nothing ever depends on it, so no request names it; listed for the
+     * record.
+     */
+    REUSE(2, "reusing accept legs");
 
     private final int proto;
     private final String description;

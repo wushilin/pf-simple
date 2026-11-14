@@ -479,6 +479,11 @@ func (l *Listener) open(ctx context.Context, reg *registration, id string, leg *
 		_ = c.get(ctx, "accept", h)
 		return
 	}
+	if leg != nil && reg.abandoned(id) {
+		<-l.slots
+		leg.Fail(reasonLegLost) // asked for again: the new attempt carries it
+		return
+	}
 	stream := leg
 	if stream == nil {
 		var err error
@@ -490,6 +495,9 @@ func (l *Listener) open(ctx context.Context, reg *registration, id string, leg *
 	}
 	conn := c.newConn(stream, id, SideServe)
 	conn.finish = reg.finisher()
+	if leg != nil && reg.abandoned(id) {
+		c.abandon(id) // asked for again just as it opened
+	}
 	select {
 	case l.conns <- conn:
 	case <-l.done:

@@ -95,10 +95,10 @@ public final class Client {
         }
         this.maxProto = b.maxProto < 0 ? -1 : b.maxProto == 0 ? Proto.MAX : b.maxProto;
         this.noReuse = b.noReuse;
-        if (b.maxIdleLegs < 1) {
-            throw new IllegalArgumentException("maxIdleLegs must be at least 1; use noReuse() to keep none");
+        if (b.maxIdleLegs < 0) {
+            throw new IllegalArgumentException("maxIdleLegs must not be negative; use noReuse() to keep none");
         }
-        this.maxIdleLegs = b.maxIdleLegs;
+        this.maxIdleLegs = b.maxIdleLegs == 0 ? DEFAULT_MAX_IDLE_LEGS : b.maxIdleLegs;
         if (b.sslContext != null) {
             this.ssl = b.sslContext;
         } else if (b.caFile != null) {
@@ -160,8 +160,9 @@ public final class Client {
         }
 
         /**
-         * How many idle legs the serving side keeps for reuse at most
-         * (default 16). Past that, the hub's offer is declined with a close.
+         * How many idle legs the serving side keeps for reuse at most; 0
+         * means the default, 16. Past that, the hub's offer is declined with
+         * a close. To keep none, use {@link #noReuse()}.
          */
         public Builder maxIdleLegs(int n) {
             this.maxIdleLegs = n;
@@ -745,10 +746,13 @@ public final class Client {
      * the new one goes on under the same id.
      */
     void abandon(String id) {
-        ConnId cid = new ConnId(id);
-        if (registry.find(cid) != null) {
+        // Only the serving side's connections: the same client may also be
+        // connecting through the tunnel, and its connection has the same id.
+        Registry.Record r = registry.find(new ConnId(id), Side.SERVE);
+        if (r != null && r.conn != null) {
             log("connection " + shortId(id) + " is asked for again: " + Registration.REASON_LEG_LOST);
-            drop(cid, Registration.REASON_LEG_LOST);
+            r.dropped.compareAndSet(null, Registration.REASON_LEG_LOST);
+            r.conn.cut(Registration.REASON_LEG_LOST);
         }
     }
 

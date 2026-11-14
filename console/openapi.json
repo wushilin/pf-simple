@@ -1725,16 +1725,6 @@
         }
        }
       }
-     },
-     "403": {
-      "description": "Missing X-PF-Console / X-API-Token header, or the switches are fixed because pf-simple was started from the command line",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
      }
     }
    }
@@ -1794,16 +1784,6 @@
      },
      "401": {
       "description": "Not signed in and no valid X-API-Token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "Missing X-PF-Console / X-API-Token header, or the switches are fixed because pf-simple was started from the command line",
       "content": {
        "application/json": {
         "schema": {

@@ -247,9 +247,13 @@ function relayIdleRow(w, il) {
   const last = el("span", "r");
   last.append(refs.close);
   row.append(refs.id, refs.state, refs.client, refs.serve, refs.opened, refs.age, refs.carried, refs.closes, last);
-  refs.close.addEventListener("click", () => api(`api/relay/${w.id}/legs/${il.leg}/close`)
-    .then(() => toast(`Closed idle leg ${il.leg} of ${w.name || w.word}`))
-    .catch((e) => toast(`Could not close it: ${e.message}`, true)));
+  refs.close.addEventListener("click", () => {
+    if (refs.close.disabled) return;
+    refs.close.disabled = true;
+    api(`api/relay/${w.id}/legs/${il.leg}/close`)
+      .then(() => toast(`Closed idle leg ${il.leg} of ${w.name || w.word}`))
+      .catch((e) => { refs.close.disabled = false; toast(`Could not close it: ${e.message}`, true); });
+  });
   return refs;
 }
 
@@ -326,7 +330,7 @@ function paintRelayWord(c, w, now) {
   // The server leaves proto out when it is 0: a pf-client from before
   // 0.14.0, which announces no tunnel protocol.
   setText(c.client.value, w.live && w.client ? `${w.client} · protocol ${w.proto || 0}` : "");
-  c.client.wrap.title = "The serving side's program, and the tunnel protocol in use with it: 1 for pf-client 0.14.0 or later, 0 for an older one that announces none (plain tunnels only)";
+  c.client.wrap.title = "The serving side's program, and the tunnel protocol in use with it: 2 for pf-client 0.15.0 or later and the SDKs (its connections can be reused), 1 for 0.14.0, 0 for an older one that announces none (plain tunnels only)";
   setText(c.since.wrap.firstChild, w.live ? "Up " : "Last served ");
   setText(c.since.value, w.live ? fmtAge(now - w.since) : fmtClock(w.lastServed));
   for (const f of [c.conns, c.tx, c.rx, c.up, c.down]) f.wrap.hidden = !w.live;

@@ -497,3 +497,82 @@ func TestClientIdleLegGivesItsPlaceBack(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// A bound attempt the hub asks for again is abandoned and reported failed,
+// even when the application holding it closes it quietly; the new attempt
+// is carried.
+func TestClientAbandonedAttemptIsFailed(t *testing.T) {
+	h := newScriptHub(t)
+	c := h.client(t)
+	var ev events
+	ev.install(c)
+	l, err := c.Listen(testCtx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	held := make(chan *Conn, 4)
+	go func() {
+		for {
+			conn, err := l.AcceptConn()
+			if err != nil {
+				return
+			}
+			held <- conn
+		}
+	}()
+	ctl := h.nextCtl()
+	open(t, ctl, "1111111111111111")
+	a := h.nextAccept()
+	first := <-held
+	go func() { _, _ = io.Copy(first, first); _ = first.CloseWrite(); _ = first.Close() }()
+	exchange(t, a.ws)
+	_ = a.ws.WriteFrame(tunnel.OpText, []byte(tunnel.MsgIdle))
+	if v, _ := expectText(t, a.ws, 5*time.Second); v != tunnel.MsgIdle {
+		t.Fatalf("not kept: %q", v)
+	}
+	_ = a.ws.WriteFrame(tunnel.OpText, []byte(tunnel.MsgBind+" 2222222222222222"))
+	if v, _ := expectText(t, a.ws, 5*time.Second); v != tunnel.MsgBound+" 2222222222222222" {
+		t.Fatalf("bind answered with %q", v)
+	}
+	old := <-held // the application holds it, neither reading nor writing
+	open(t, ctl, "2222222222222222")
+	h.nextAccept()
+	<-held
+	old.Close()
+	errs := ev.closedWith(t, "2222222222222222")
+	var dropped *DroppedError
+	if !errors.As(errs[0], &dropped) || dropped.Reason != reasonLegLost {
+		t.Errorf("the abandoned attempt closed with %v", errs[0])
+	}
+}
+
+// A bind for an id that already came with an open message (the hub fell
+// back first) is refused: the leg closes, and nothing opens twice.
+func TestClientLateBindIsRefused(t *testing.T) {
+	h := newScriptHub(t)
+	c := h.client(t)
+	var ev events
+	ev.install(c)
+	listenEcho(t, c)
+	ctl := h.nextCtl()
+	leg := keepLeg(t, h, ctl, "1111111111111111")
+	open(t, ctl, "2222222222222222")
+	h.nextAccept()
+	time.Sleep(50 * time.Millisecond)
+	_ = leg.WriteFrame(tunnel.OpText, []byte(tunnel.MsgBind+" 2222222222222222"))
+	if v, err := expectText(t, leg, 5*time.Second); err == nil {
+		t.Fatalf("a late bind was answered with %q", v)
+	}
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	n := 0
+	for _, id := range ev.opened {
+		if id.String() == "2222222222222222" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("connection 2222… opened %d times", n)
+	}
+}

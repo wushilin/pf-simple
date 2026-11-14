@@ -436,7 +436,9 @@ func (c *Client) serve(ctx context.Context, target string, open func(reg *regist
 			c.serving(true)
 			reg := c.newRegistration(ctx, ws.Header, open)
 			err = c.control(ctx, ws, func(id string) {
-				c.abandon(id) // an id that comes back is a new attempt (§12.7)
+				if reg.tookOpen(id) {
+					c.abandon(id) // a bound id asked for again: a new attempt (§12.7)
+				}
 				open(reg, id, nil)
 			})
 			reg.cancel() // its idle legs go with it
@@ -560,6 +562,13 @@ func (c *Client) serveConn(ctx context.Context, reg *registration, id, target st
 		}
 		return
 	}
+	if leg != nil && reg.abandoned(id) {
+		// Asked for again while this side was dialing: the new attempt
+		// carries it, and this one never opened.
+		_ = conn.Close()
+		leg.Fail(reasonLegLost)
+		return
+	}
 	stream := leg
 	if stream == nil {
 		if stream, err = c.accept(ctx, reg, id, true); err != nil {
@@ -573,6 +582,9 @@ func (c *Client) serveConn(ctx context.Context, reg *registration, id, target st
 	defer stop()
 	rec := c.reg.add(id, SideServe, stream)
 	c.opened(rec)
+	if leg != nil && reg.abandoned(id) {
+		c.abandon(id) // asked for again just as it opened
+	}
 	e := bridge(ctx, stream, conn.(*net.TCPConn), partyServe, rec, reg.finisher())
 	c.closed(rec, e.err)
 	c.logEnd(short(id), rec.opened, e, true)

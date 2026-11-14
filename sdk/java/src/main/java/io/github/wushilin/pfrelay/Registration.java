@@ -40,6 +40,20 @@ final class Registration {
     private final Set<WebSocket> legs = ConcurrentHashMap.newKeySet(); // idle, or binding
     private int idle;
     private boolean ended;
+    // The ids this registration answered "bound" to, and the ids that came
+    // with an open message, remembered for RECALL_MS: an id that came both
+    // ways is the case of §12.7, a bound lost with its leg and asked for again.
+    private final Map<String, Attempt> bound = new java.util.HashMap<>();
+    private final Map<String, Long> opened = new java.util.HashMap<>();
+
+    /** How long ids are remembered: well past the hub's 10 seconds to answer a connection. */
+    static final long RECALL_MS = 30_000;
+
+    /** A connection taken on a reused leg; abandoned when the hub asks for it again. */
+    private static final class Attempt {
+        final long at = System.nanoTime();
+        volatile boolean abandoned;
+    }
 
     Registration(Client client, Map<String, String> serveAnswer, Opener opener) {
         this.client = client;
@@ -66,6 +80,46 @@ final class Registration {
         }
         int n = Integer.parseInt(v);
         return n >= 1 && n <= 3600;
+    }
+
+    private void prune() {
+        long now = System.nanoTime();
+        bound.values().removeIf(a -> (now - a.at) / 1_000_000 > RECALL_MS);
+        opened.values().removeIf(at -> (now - at) / 1_000_000 > RECALL_MS);
+    }
+
+    /**
+     * Records a bind of id. Refuses one for an id that already came with an
+     * open message: a bind that arrives after the hub fell back.
+     */
+    synchronized boolean takeBind(String id) {
+        prune();
+        if (opened.containsKey(id)) {
+            return false;
+        }
+        bound.put(id, new Attempt());
+        return true;
+    }
+
+    /**
+     * Records an open message for id, and reports whether it is for an id
+     * bound here: a new attempt, the old one being abandoned (§12.7).
+     */
+    synchronized boolean tookOpen(String id) {
+        prune();
+        opened.put(id, System.nanoTime());
+        Attempt a = bound.get(id);
+        if (a != null) {
+            a.abandoned = true;
+            return true;
+        }
+        return false;
+    }
+
+    /** Whether the attempt at id on a reused leg was given up, because the hub asked for it again. */
+    synchronized boolean abandoned(String id) {
+        Attempt a = bound.get(id);
+        return a != null && a.abandoned;
     }
 
     /** Reserves room for one more idle leg. */
@@ -152,6 +206,9 @@ final class Registration {
                 pinger = null;
                 if (!legs.remove(ws) || isEnded()) {
                     return;
+                }
+                if (!takeBind(id)) {
+                    return; // already asked for with an open message: the hub gave this leg up
                 }
                 // answered at once, before anything else (§12.7)
                 ws.writeFrame(WebSocket.OP_TEXT, (BOUND + " " + id).getBytes(StandardCharsets.UTF_8));

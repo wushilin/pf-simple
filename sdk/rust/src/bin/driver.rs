@@ -210,6 +210,9 @@ fn events(cmd: Command) -> Events {
         .on_open(|ci| say(Event::Opened(ci)))
         .on_close(|ci, err| {
             let outcome = if err.is_some() { Outcome::Failed } else { Outcome::Ok };
+            if let Some(e) = err {
+                eprintln!("connection {} failed: {e}", ci.id);
+            }
             say(Event::Closed(ci, outcome))
         })
         .on_refuse(|id, _| say(Event::Refused(id)));

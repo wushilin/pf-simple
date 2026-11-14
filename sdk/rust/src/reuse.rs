@@ -8,6 +8,7 @@
 //! hub's `bind <id>`: the next connection, answered at once with
 //! `bound <id>`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +28,10 @@ pub(crate) const MSG_BOUND: &str = "bound ";
 /// How an attempt ends whose leg died before the hub heard `bound`: the
 /// hub asks again with an open message (§12.7).
 pub const REASON_LEG_LOST: &str = "the leg was lost before the server took the connection";
+/// How long a registration remembers the ids it answered `bound` to and
+/// the ids that came with an open message: well past the hub's 10 seconds
+/// to answer a connection.
+pub(crate) const RECALL: Duration = Duration::from_secs(30);
 /// Bounds one frame write on an idle leg.
 const LEG_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -73,12 +78,62 @@ pub(crate) struct Registration {
     pub(crate) session: Option<String>,
     pub(crate) cancel: CancellationToken,
     idle: Mutex<usize>,
+    ids: Mutex<Ids>,
+}
+
+/// The ids a registration answered `bound` to (and whether that attempt was
+/// abandoned), and those that came with an open message, with when.
+#[derive(Default)]
+struct Ids {
+    bound: HashMap<String, (Instant, bool)>,
+    opened: HashMap<String, Instant>,
+}
+
+impl Ids {
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.bound.retain(|_, (at, _)| now.duration_since(*at) <= RECALL);
+        self.opened.retain(|_, at| now.duration_since(*at) <= RECALL);
+    }
 }
 
 impl Registration {
     pub(crate) fn new(c: Client, sh: Arc<listener::Shared>, handler: Handler, session: Option<String>) -> Arc<Self> {
         let cancel = sh.cancel.child_token();
-        Arc::new(Registration { c, sh, handler, session, cancel, idle: Mutex::new(0) })
+        Arc::new(Registration { c, sh, handler, session, cancel, idle: Mutex::new(0), ids: Mutex::default() })
+    }
+
+    /// Records a bind of `id`. It refuses one for an id that already came
+    /// with an open message: a bind that arrives after the hub fell back.
+    pub(crate) fn take_bind(&self, id: &str) -> bool {
+        let mut ids = self.ids.lock().unwrap();
+        ids.prune();
+        if ids.opened.contains_key(id) {
+            return false;
+        }
+        ids.bound.insert(id.to_string(), (Instant::now(), false));
+        true
+    }
+
+    /// Records an open message for `id`, and reports whether it is for an
+    /// id bound here: a new attempt, the old one being abandoned (§12.7).
+    pub(crate) fn took_open(&self, id: &str) -> bool {
+        let mut ids = self.ids.lock().unwrap();
+        ids.prune();
+        ids.opened.insert(id.to_string(), Instant::now());
+        match ids.bound.get_mut(id) {
+            Some((_, abandoned)) => {
+                *abandoned = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the attempt at `id` on a reused leg was given up because the
+    /// hub asked for it again.
+    pub(crate) fn abandoned(&self, id: &str) -> bool {
+        self.ids.lock().unwrap().bound.get(id).is_some_and(|(_, a)| *a)
     }
 
     pub(crate) fn verdict_wait(&self) -> Duration {
@@ -174,6 +229,9 @@ async fn idle_leg(reg: Arc<Registration>, leg: Leg) {
     };
     if reg.cancel.is_cancelled() {
         return; // the registration ended: its legs go with it
+    }
+    if !reg.take_bind(&id) {
+        return; // already asked for with an open message: the hub gave this leg up
     }
     // "bound" first, before anything else, such as dialing a target.
     if !write(&mut w, OP_TEXT, format!("{MSG_BOUND}{id}").as_bytes()).await {

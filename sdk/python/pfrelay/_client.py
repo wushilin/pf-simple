@@ -445,6 +445,7 @@ class Client:
         host, port = split_host_port(target)
 
         async def open_one(cid: ConnID, sess: "_Session", leg: Optional[WebSocket]) -> None:
+            was_bound = leg is not None  # it came on a reused leg, after "bound"
             # On a reused leg the hub already has "bound": a refusal from
             # here on is an err: on that leg (12.7).
             try:
@@ -455,6 +456,16 @@ class Client:
                     await self._refuse_leg(leg, cid, REASON_UNREACHABLE)
                 else:
                     await self._refuse(cid, REASON_UNREACHABLE)
+                return
+            except BaseException:
+                if leg is not None:
+                    leg.abort()  # cancelled while dialing: the bound leg goes too
+                raise
+            if leg is not None and sess.abandoned(str(cid)):
+                # Asked for again while this side was dialing: the new attempt
+                # carries it, and this one never opened.
+                writer.transport.abort()
+                await _fail_leg(leg, REASON_LEG_LOST)
                 return
             reusable = True
             if leg is None:
@@ -468,6 +479,8 @@ class Client:
                     writer.transport.abort()
                     raise
             conn = await self._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
+            if was_bound and sess.abandoned(str(cid)):
+                self._drop(conn, REASON_LEG_LOST)  # asked for again just as it opened
             ended = await bridge(conn, reader, writer, PARTY_SERVE)
             log.info("connection %s closed: %s", cid.short, ended.reason)
 
@@ -490,10 +503,13 @@ class Client:
         connection was open. It is a plain function, so that a sync event
         handler may call it: the failure is sent in a task of its own, and
         on_close follows once it has gone out."""
-        conn = self._reg.find(conn_id)
+        return self._drop(self._reg.find(conn_id), reason)
+
+    def _drop(self, conn: Optional[Conn], reason: str) -> bool:
         if conn is None or conn._done or conn._dropping:
             return False
         conn._dropping = True
+        conn._drop_reason = reason
         task = asyncio.ensure_future(conn.fail(reason))
         self._drops.add(task)
         task.add_done_callback(self._drops.discard)
@@ -527,20 +543,15 @@ class Client:
         """The hub asks again for an id only when the leg it was bound to
         was lost before it heard "bound" (12.7): the old attempt fails, and
         the new one goes on under the same id."""
-        for info in self._reg.conns():
-            if info.id == cid and info.side is Side.SERVE:
-                self.drop(cid, REASON_LEG_LOST)
+        # Only the serving side's: the same client may also be connecting
+        # through the tunnel, and its connection carries the same id.
+        self._drop(self._reg.find(cid, Side.SERVE), REASON_LEG_LOST)
 
     async def _refuse_leg(self, ws: WebSocket, cid: ConnID, reason: str) -> None:
         """Refuse a connection that arrived on a reused leg, after "bound":
         err:<reason> and a close on that leg (12.7)."""
         await emit(self.events.on_refuse, cid, reason)
-        try:
-            await ws.send(OP_TEXT, b"err:" + _clean_header(reason, 128).encode("ascii"), timeout=_ws.CLOSE_TIMEOUT)
-            await ws.send(OP_CLOSE, b"", timeout=_ws.CLOSE_TIMEOUT)
-        except (ConnectionError, OSError):
-            pass
-        ws.close_transport()
+        await _fail_leg(ws, reason)
 
     async def _conn_closed(self, conn: Conn, err: Optional[BaseException]) -> None:
         if self._reg.finish(conn, err is not None):
@@ -643,7 +654,8 @@ class _Registration:
                 if op == OP_TEXT:
                     cid = _open_message(payload)
                     if cid:
-                        self._c._abandon(cid)  # an id that comes back is a new attempt (12.7)
+                        if sess.took_open(str(cid)):
+                            self._c._abandon(cid)  # a bound id asked for again: a new attempt (12.7)
                         self.spawn(self._open_one(cid, sess, None))
                 elif op == OP_PING:
                     try:
@@ -670,6 +682,17 @@ class _Registration:
             self.control = None
 
 
+async def _fail_leg(ws: WebSocket, reason: str) -> None:
+    """End a leg the protocol 1 way: err:<reason> and a close."""
+    try:
+        await ws.send(OP_TEXT, _ERR_FRAME + _clean_header(reason, 128).encode("ascii"), timeout=_ws.CLOSE_TIMEOUT)
+        await ws.send(OP_CLOSE, b"", timeout=_ws.CLOSE_TIMEOUT)
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        ws.close_transport()
+
+
 def known_leg_frame(msg: bytes) -> bool:
     """Whether msg is one of the text frames of streams and reused legs
     (8.1, 12): such a frame where it does not belong is a violation, while
@@ -691,6 +714,17 @@ def offered(headers) -> bool:
     return 1 <= int(v) <= KEEP_ALIVE_MAX
 
 
+RECALL = 30.0  # how long a session remembers ids: well past the hub's 10 s
+
+
+@dataclass
+class _Attempt:
+    """A connection taken on a reused leg, until the hub has seen "bound"."""
+
+    at: float
+    abandoned: bool = False
+
+
 class _Session:
     """One control channel's life (protocol 2): its secret, and the legs
     kept for reuse that belong to it."""
@@ -707,6 +741,44 @@ class _Session:
         self.idle = 0  # legs kept, idle or offered
         self.legs: set[WebSocket] = set()
         self.ended = False
+        # The ids answered "bound" (with whether that attempt was abandoned)
+        # and the ids that came with an open message, remembered for a
+        # while: an id that came both ways is the case of 12.7.
+        self._bound: dict[str, _Attempt] = {}
+        self._opened: dict[str, float] = {}
+
+    def _prune(self) -> None:
+        now = time.monotonic()
+        for k in [k for k, a in self._bound.items() if now - a.at > RECALL]:
+            del self._bound[k]
+        for k in [k for k, at in self._opened.items() if now - at > RECALL]:
+            del self._opened[k]
+
+    def take_bind(self, cid: str) -> bool:
+        """Record a bind of cid; refuse one for an id that already came
+        with an open message (a bind that arrived after the hub fell back)."""
+        self._prune()
+        if cid in self._opened:
+            return False
+        self._bound[cid] = _Attempt(time.monotonic())
+        return True
+
+    def took_open(self, cid: str) -> bool:
+        """Record an open message for cid; True when cid was bound here: a
+        new attempt, the old one being abandoned."""
+        self._prune()
+        self._opened[cid] = time.monotonic()
+        a = self._bound.get(cid)
+        if a is not None:
+            a.abandoned = True
+            return True
+        return False
+
+    def abandoned(self, cid: str) -> bool:
+        """Whether the attempt at cid on a reused leg was given up because
+        the hub asked for it again."""
+        a = self._bound.get(cid)
+        return a is not None and a.abandoned
 
     def keep(self) -> bool:
         """Reserve room for one more idle leg."""
@@ -733,11 +805,14 @@ class _Session:
             if self.keep():
                 ws = conn._ws
                 try:
-                    await ws.send(OP_TEXT, MSG_IDLE, timeout=_ws.WRITE_TIMEOUT)
+                    await ws.send(OP_TEXT, MSG_IDLE, timeout=_ws.WRITE_TIMEOUT)  # bounded
                 except (ConnectionError, OSError):
                     self.release()
                     await conn._close_stream()
                     return None
+                except BaseException:  # cancelled: the place goes back
+                    self.release()
+                    raise
                 self._reg.spawn(self._idle_leg(conn._detach()))
                 return None
             await conn._close_stream()  # the hub's "idle" answered with a close: not kept
@@ -772,6 +847,8 @@ class _Session:
             if self.ended:
                 return
             raw = payload[len(MSG_BIND) + 1:]
+            if not self.take_bind(raw.decode("utf-8", "replace")):
+                return  # already asked for with an open message: the hub gave this leg up
             await ws.send(OP_TEXT, MSG_BOUND + b" " + raw, timeout=_ws.WRITE_TIMEOUT)
             bound = True
         except (ConnectionError, OSError, LinkError, FrameError):
@@ -860,6 +937,7 @@ class Listener:
 
     async def _open(self, cid: ConnID, sess: _Session, leg: Optional[WebSocket]) -> None:
         c = self._c
+        was_bound = leg is not None  # it came on a reused leg, after "bound"
         if self._slots >= LISTEN_BACKLOG:
             log.warning("connection %s refused: %d connections are waiting to be accepted", cid.short, LISTEN_BACKLOG)
             if leg is not None:
@@ -868,6 +946,10 @@ class Listener:
                 await c._refuse(cid, REASON_BACKLOG)
             return
         self._slots += 1
+        if leg is not None and sess.abandoned(str(cid)):
+            self._slots -= 1
+            await _fail_leg(leg, REASON_LEG_LOST)  # asked for again: the new attempt carries it
+            return
         reusable = True
         if leg is None:
             try:
@@ -880,6 +962,8 @@ class Listener:
                 log.warning("connection %s failed: cannot bring it to the server: %s", cid.short, explain(e))
                 return
         conn = await c._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
+        if was_bound and sess.abandoned(str(cid)):
+            c._drop(conn, REASON_LEG_LOST)  # asked for again just as it opened
         if self._closed:
             self._slots -= 1
             await conn.fail(REASON_STOPPED)

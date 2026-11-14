@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -129,6 +130,15 @@ func (s *idleSlots) release(tenant string) {
 	}
 }
 
+// isUpgrade reports whether r is a WebSocket handshake that Upgrade would
+// answer with a 101; the headers of protocol 2 go out with that 101 only,
+// never with a refusal (§12.3).
+func isUpgrade(r *http.Request) bool {
+	return tunnel.HeaderHasToken(r.Header, "Connection", "upgrade") &&
+		tunnel.HeaderHasToken(r.Header, "Upgrade", "websocket") &&
+		r.Header.Get("Sec-WebSocket-Version") == "13" && r.Header.Get("Sec-WebSocket-Key") != ""
+}
+
 // newSession is a registration's secret.
 func newSession() []byte {
 	b := make([]byte, 16)
@@ -164,7 +174,7 @@ func (h *tunnelHub) reuseFor(t *relayTunnel) reuseSettings {
 // connecting side with its own connection's id included, gets a plain
 // protocol 1 leg.
 func (h *tunnelHub) offerReuse(w http.ResponseWriter, r *http.Request, t *relayTunnel) bool {
-	if chosenProto(w) < 2 || t.session == nil {
+	if chosenProto(w) < 2 || t.session == nil || !isUpgrade(r) {
 		return false
 	}
 	given, err := hex.DecodeString(r.Header.Get(tunnel.HeaderSession))
@@ -197,6 +207,7 @@ type reusableUpstream struct {
 	t      *relayTunnel
 	leg    *relayLeg
 	client *tunnel.Stream // the connecting side's leg of the same connection
+	pipeID uint64         // the connection's pipe, for the flow log
 	once   sync.Once
 }
 
@@ -209,7 +220,15 @@ func (u *reusableUpstream) Read(p []byte) (int, error) {
 	n, err := u.Stream.Read(p)
 	var remote *tunnel.RemoteError
 	if errors.As(err, &remote) {
-		u.client.Fail(remote.Reason)
+		reason := cleanHeader(remote.Reason) // as for X-PF-Tunnel-Error (§12.7)
+		// Nothing came from the serving side yet: it refused the connection
+		// after taking it, which counts as a failure, like a refusal at
+		// accept.
+		if pp := pipes.get(u.pipeID); pp != nil && pp.down.written.Load() == 0 {
+			pp.failReason.CompareAndSwap(nil, &reason)
+			u.t.stats.failed.Add(1)
+		}
+		u.client.Fail(reason)
 	}
 	return n, err
 }
@@ -244,6 +263,9 @@ func (u *reusableUpstream) finish(clean bool) {
 		_ = s.Close()
 		return
 	}
+	// Bounded like any control write: a serving side that stopped reading
+	// must not hold this goroutine and its socket (§12.5).
+	s.Leg().SetTimeouts(tunnel.LinkSilence(), tunnel.WriteTimeout)
 	if s.SendIdle() != nil {
 		_ = s.Close()
 		return
@@ -325,7 +347,7 @@ func (h *tunnelHub) expire(t *relayTunnel, il *idleLeg) {
 		if x != il {
 			continue
 		}
-		if newer := len(t.pool) - 1 - i; newer < rs.MinIdle {
+		if newer := len(t.pool) - 1 - i; rs.Enabled && newer < rs.MinIdle {
 			il.timer.Reset(time.Duration(rs.IdleSec) * time.Second)
 			t.mu.Unlock()
 			return
@@ -488,7 +510,9 @@ func (h *tunnelHub) setReuse(r reuseSettings) error {
 	h.mu.Unlock()
 	for _, t := range tunnels {
 		h.trimPool(t)
+		h.retime(t)
 	}
+	h.trimCaps(tunnels, r)
 	log.Printf("relay: reuse of accept legs changed from the console: enabled=%v, idle %ds, min %d, max %d, caps %d per tenant, %d in all",
 		r.Enabled, r.IdleSec, r.MinIdle, r.MaxIdle, r.TenantCap, r.HubCap)
 	changes.notify()
@@ -564,8 +588,51 @@ func (h *tunnelHub) trimPool(t *relayTunnel) {
 	}
 }
 
-// handleWordReuse sets a word's own limits on idle legs; an empty body, or
-// all fields null, goes back to the hub's.
+// retime moves each idle leg's expiry to the tunnel's idle limit now,
+// counted from when the leg became idle.
+func (h *tunnelHub) retime(t *relayTunnel) {
+	limit := time.Duration(h.reuseFor(t).IdleSec) * time.Second
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, il := range t.pool {
+		il.timer.Reset(max(limit-time.Since(il.since), time.Millisecond))
+	}
+}
+
+// trimCaps closes idle legs, oldest first, until every tenant and the hub
+// are within r's caps. The caps win over min idle (§12.6).
+func (h *tunnelHub) trimCaps(tunnels []*relayTunnel, r reuseSettings) {
+	type entry struct {
+		t  *relayTunnel
+		il *idleLeg
+	}
+	var all []entry
+	for _, t := range tunnels {
+		t.mu.Lock()
+		for _, il := range t.pool {
+			all = append(all, entry{t, il})
+		}
+		t.mu.Unlock()
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].il.since.Before(all[j].il.since) })
+	total, byTenant := len(all), map[string]int{}
+	for _, e := range all {
+		byTenant[e.t.owner]++
+	}
+	for _, e := range all {
+		if total <= r.HubCap && byTenant[e.t.owner] <= r.TenantCap {
+			continue
+		}
+		if h.unpool(e.t, e.il) {
+			_ = e.il.conn.Close()
+			total--
+			byTenant[e.t.owner]--
+		}
+	}
+}
+
+// handleWordReuse sets a word's own limits on idle legs; a body of {}, or
+// with every field null, goes back to the hub's.
 func (s *consoleServer) handleWordReuse(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))
 	var wr wordReuse

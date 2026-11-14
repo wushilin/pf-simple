@@ -92,9 +92,10 @@ class _Registry:
         self.received += conn._received
         return True
 
-    def find(self, cid: ConnID) -> Optional["Conn"]:
+    def find(self, cid: ConnID, side: Optional[Side] = None) -> Optional["Conn"]:
+        """The live connection cid, on side if given; the oldest first."""
         for c in self.live.values():
-            if c.id == cid:
+            if c.id == cid and (side is None or c.side is side):
                 return c
         return None
 
@@ -190,6 +191,7 @@ class Conn:
         self._done = False
         self._final: Optional[BaseException] = None  # why it ended, once it has
         self._dropping = False  # Client.drop has begun to fail it
+        self._drop_reason: Optional[str] = None
         # Protocol 2: the leg was offered reuse; the hub's verdict after a
         # clean finish (PROTOCOL.md 12.5).
         self._reusable = reusable
@@ -302,7 +304,8 @@ class Conn:
             inbox.finish(LinkError("the connection is closed"))
             ws.stop_keepalive()
             self._verdict.set()
-            self._gone.set()
+            if not self._idled:  # after idle the leg lives on; _end marks the end
+                self._gone.set()
 
     async def read(self, n: int = CHUNK_SIZE) -> bytes:
         """Up to n bytes of the stream; b"" after the far end's half-close."""
@@ -434,6 +437,10 @@ class Conn:
         closed. Returns why it ended, or None after a clean finish."""
         if self._done:
             return self._final
+        if self._drop_reason is not None:
+            # Dropped: it fails, however the application then ends it.
+            await self._fail(self._drop_reason, DroppedError(self._drop_reason))
+            return self._final
         if not self._wrote_eof and not self._failed and not self._gone.is_set():
             try:
                 await self.close_write()
@@ -443,24 +450,32 @@ class Conn:
             return self._final
         self._done = self._closing = True
         verdict_err: Optional[BaseException] = None
-        if self._finisher is not None and self._clean():
-            try:
-                verdict_err = await self._finisher(self)  # the hub's verdict; the leg kept if it may be
-            except Exception as e:  # never leave a connection unreported
-                log.exception("pfrelay: ending a reusable leg failed")
-                verdict_err = e
+        ended = False
+        try:
+            if self._finisher is not None and self._clean():
+                try:
+                    verdict_err = await self._finisher(self)  # the hub's verdict; the leg kept if it may be
+                except Exception as e:  # never leave a connection unreported
+                    log.exception("pfrelay: ending a reusable leg failed")
+                    verdict_err = e
+                    if not self._detached:
+                        self._ws.abort()
+            else:
+                await self._close_stream()
+            if self._broke is not None:
+                err = self._broke
+            elif verdict_err is not None:
+                err = verdict_err
+            else:
+                err = self.err
+            ended = True
+            await self._end(err)
+            return err
+        finally:
+            if not ended:  # cancelled on the way: the leg still closes, the close is still reported
                 if not self._detached:
                     self._ws.abort()
-        else:
-            await self._close_stream()
-        if self._broke is not None:
-            err = self._broke
-        elif verdict_err is not None:
-            err = verdict_err
-        else:
-            err = self.err
-        await self._end(err)
-        return err
+                await self._end(self._broke if self._broke is not None else self.err)
 
     def _clean(self) -> bool:
         """Finished cleanly so far: both half-closes, nothing failed."""
@@ -520,7 +535,10 @@ class Conn:
         return await self.close()
 
     async def _end(self, err: Optional[BaseException]) -> None:
+        if self._drop_reason is not None:
+            err = DroppedError(self._drop_reason)  # dropped is failed, whatever came after
         self._final = err
+        self._gone.set()  # for wait_closed, also when the leg went on (idle)
         self._inbox.close()
         if not self._detached:
             self._ws.stop_keepalive()

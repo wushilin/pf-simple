@@ -49,8 +49,8 @@ func (c *Client) opened(rec *connRecord) {
 
 // closed retires rec, once, and reports it.
 func (c *Client) closed(rec *connRecord, err error) {
-	if r := rec.dropped.Load(); r != nil && err != nil {
-		err = &DroppedError{Reason: *r}
+	if r := rec.dropped.Load(); r != nil {
+		err = &DroppedError{Reason: *r} // a dropped connection failed, however it then ended
 	}
 	if !c.reg.finish(rec, err != nil) {
 		return

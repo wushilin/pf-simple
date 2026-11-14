@@ -264,7 +264,9 @@ public final class Listener implements Closeable {
                         String id = openId(new String(p, StandardCharsets.UTF_8));
                         if (id != null) {
                             Sched.go(() -> {
-                                client.abandon(id); // an id that comes back is a new attempt (§12.7)
+                                if (reg.tookOpen(id)) {
+                                    client.abandon(id); // a bound id asked for again: a new attempt (§12.7)
+                                }
                                 open(reg, id, null);
                             });
                         }
@@ -316,6 +318,11 @@ public final class Listener implements Closeable {
             refuse(id, leg, REASON_BACKLOG);
             return;
         }
+        if (leg != null && reg.abandoned(id)) {
+            slots.release();
+            Registration.failLeg(leg, Registration.REASON_LEG_LOST); // asked for again: the new attempt carries it
+            return;
+        }
         Conn c;
         try {
             c = leg != null ? new Conn(leg, client, new ConnId(id), Side.SERVE, reg) : client.accept(reg, id);
@@ -324,6 +331,9 @@ public final class Listener implements Closeable {
             client.log("connection " + Client.shortId(id) + " failed: cannot bring it to the server: "
                     + e.getMessage());
             return;
+        }
+        if (leg != null && reg.abandoned(id)) {
+            client.abandon(id); // asked for again just as it opened
         }
         synchronized (this) {
             if (!closed) {
@@ -363,6 +373,13 @@ public final class Listener implements Closeable {
             refuse(id, leg, REASON_UNREACHABLE);
             return;
         }
+        if (leg != null && reg.abandoned(id)) {
+            // Asked for again while this side was dialing: the new attempt
+            // carries it, and this one never opened.
+            Bridge.closeQuietly(local);
+            Registration.failLeg(leg, Registration.REASON_LEG_LOST);
+            return;
+        }
         Conn c;
         try {
             c = leg != null ? new Conn(leg, client, new ConnId(id), Side.SERVE, reg) : client.accept(reg, id);
@@ -370,6 +387,9 @@ public final class Listener implements Closeable {
             client.log("connection " + shortId + " failed: cannot bring it to the server: " + e.getMessage());
             Bridge.closeQuietly(local);
             return;
+        }
+        if (leg != null && reg.abandoned(id)) {
+            client.abandon(id); // asked for again just as it opened
         }
         Forwarder f = forwarder;
         if (closed || !f.track(c)) {

@@ -164,6 +164,26 @@ class Drop(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(c.drop(ID, "gone"))
 
 
+class DroppedIsFailed(unittest.IsolatedAsyncioTestCase):
+    async def test_drop_then_quiet_close(self):
+        rec = Recorder()
+        c = new_client(events=rec.events())
+        async with Pair() as p:
+            conn = await c._new_conn(p.client, ID, pfrelay.Side.SERVE)
+            await p.hub.send(OP_TEXT, b"eof")
+            self.assertEqual(await conn.read(), b"")
+            self.assertTrue(c.drop(ID, "dropped by the test"))
+            await conn.close()  # before the drop's own task has run
+            for _ in range(100):
+                if rec.named("close"):
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            [(_, err)] = rec.named("close")
+            self.assertIsInstance(err, pfrelay.DroppedError)
+            self.assertEqual(c.stats().failed, 1)
+
+
 class Bookkeeping(unittest.IsolatedAsyncioTestCase):
     async def test_stats_and_conns(self):
         c = new_client()
@@ -253,6 +273,69 @@ class Forwarders(unittest.IsolatedAsyncioTestCase):
         [(info, err)] = rec.named("close")
         self.assertIsNone(err)
         self.assertEqual((info.sent, info.received), (4, 4))
+
+    async def test_bridge_cancelled_while_closing_closes_the_local_end(self):
+        c = new_client()
+
+        async def app(reader, writer):
+            writer.write_eof()
+            await reader.read()
+            writer.close()
+
+        server = await asyncio.start_server(app, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with Pair() as p:
+            conn = await c._new_conn(p.client, ID, pfrelay.Side.SERVE)
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            closing = asyncio.Event()
+
+            async def stuck(err):
+                closing.set()
+                await asyncio.sleep(100)
+
+            conn._close_with = stuck
+            carried = asyncio.ensure_future(_forward.bridge(conn, reader, writer, _forward.PARTY_SERVE))
+            await p.hub.send(OP_TEXT, b"eof")
+            await asyncio.wait_for(closing.wait(), 5)
+            carried.cancel()
+            await asyncio.gather(carried, return_exceptions=True)
+            self.assertTrue(writer.transport.is_closing())
+        server.close()
+
+    async def test_bridge_lets_a_slow_local_end_drain(self):
+        # The far end's data, eof and close all arrive while the local end is
+        # still reading slowly: nothing may be cut short.
+        c = new_client()
+        payload = os.urandom(900_000)
+        got = asyncio.get_running_loop().create_future()
+
+        async def app(reader, writer):
+            writer.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            writer.write_eof()  # this end finishes first
+            await asyncio.sleep(0.5)  # slow to start reading
+            data = b""
+            while chunk := await reader.read(65536):
+                data += chunk
+            got.set_result(data)
+            writer.close()
+
+        server = await asyncio.start_server(app, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with Pair() as p:
+            conn = await c._new_conn(p.client, ID, pfrelay.Side.SERVE)
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            sock = writer.get_extra_info("socket")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            carried = asyncio.ensure_future(_forward.bridge(conn, reader, writer, _forward.PARTY_SERVE))
+            self.assertEqual(await p.hub_recv_skip_pings(), (OP_TEXT, True, b"eof"))
+            for off in range(0, len(payload), 65536):
+                await p.hub.send(OP_BINARY, payload[off:off + 65536])
+            await p.hub.send(OP_TEXT, b"eof")
+            await p.hub.send(OP_CLOSE)  # the hub ends the stream at once
+            ended = await asyncio.wait_for(carried, 30)
+            self.assertEqual(len(await asyncio.wait_for(got, 30)), len(payload))
+            self.assertIsNone(ended.err, ended.reason)
+        server.close()
 
     async def test_bridge_tells_the_far_end_when_the_local_end_breaks(self):
         c = new_client()

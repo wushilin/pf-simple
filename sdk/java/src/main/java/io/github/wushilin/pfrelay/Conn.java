@@ -343,6 +343,7 @@ public final class Conn implements Closeable {
             // The reader has stopped at the hub's "idle": nobody reads the leg now.
             if (reuse.keep()) {
                 try {
+                    ws.setWriteTimeout(Client.CONTROL_WRITE_TIMEOUT_MS); // the leg is no longer carrying data
                     ws.writeFrame(WebSocket.OP_TEXT, Registration.IDLE_TEXT);
                     client.closed(rec, null);
                     reuse.idleLeg(ws);

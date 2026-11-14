@@ -160,7 +160,7 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 		}
 	}
 	if tunnelOn {
-		s.tunnel = &tunnelSettings{enabled: true, tenants: tenants}
+		s.tunnel = &tunnelSettings{enabled: true, tenants: tenants, reuse: defaultReuse}
 	}
 	return s, nil
 }

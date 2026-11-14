@@ -286,8 +286,11 @@ async fn control(c: &Client, reg: &Arc<Registration>, up: Upgraded) -> String {
                 Ok(f) => match f.op {
                     OP_TEXT if f.fin => {
                         if let Some(id) = parse_open(&f.payload) {
-                            // An id that comes back is a new attempt (§12.7).
-                            c.inner.registry.drop_conn(&ConnId::new(&id), REASON_LEG_LOST);
+                            // An id this registration answered "bound" to that
+                            // comes back is a new attempt (§12.7).
+                            if reg.took_open(&id) {
+                                c.inner.registry.abandon(&ConnId::new(&id));
+                            }
                             tokio::spawn(open(c.clone(), reg.clone(), id, None));
                         }
                     }
@@ -330,7 +333,7 @@ pub(crate) async fn refuse(c: &Client, id: &str, reason: &str) {
 
 /// Carries connection `id`: with an open message (`leg` is `None`: bring
 /// one to `accept`), or on an idle leg that answered `bound`.
-pub(crate) async fn open(c: Client, reg: Arc<Registration>, id: String, leg: Option<Leg>) {
+pub(crate) async fn open(c: Client, reg: Arc<Registration>, id: String, mut leg: Option<Leg>) {
     let tx = match &reg.handler {
         Handler::Forward(target) => {
             let target = target.clone();
@@ -356,6 +359,13 @@ pub(crate) async fn open(c: Client, reg: Arc<Registration>, id: String, leg: Opt
             };
         }
     };
+    if let Some(leg) = leg.take_if(|_| reg.abandoned(&id)) {
+        // Asked for again already: the new attempt carries it, and this one
+        // never opened.
+        drop(slot);
+        return fail_leg(leg, REASON_LEG_LOST).await;
+    }
+    let bound = leg.is_some();
     let conn = match leg {
         Some(leg) => Conn::on_leg(leg, &id, Side::Serve, c.inner.registry.clone(), Some(reg.clone())),
         None => match c.accept(&id, reg.session.as_deref()).await {
@@ -368,6 +378,9 @@ pub(crate) async fn open(c: Client, reg: Arc<Registration>, id: String, leg: Opt
             }
         },
     };
+    if bound && reg.abandoned(&id) {
+        c.inner.registry.abandon(&ConnId::new(&id)); // asked for again just as it opened
+    }
     if sh.cancel.is_cancelled() {
         conn.fail(STOPPED_LISTENING).await;
         return;

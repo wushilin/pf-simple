@@ -64,6 +64,16 @@ final class Registry {
         return true;
     }
 
+    /** The live connection with this id on this side, or null. */
+    synchronized Record find(ConnId id, Side side) {
+        for (Record r : live) {
+            if (r.id.equals(id) && r.side == side) {
+                return r;
+            }
+        }
+        return null;
+    }
+
     /** The live connection with this id, or null. */
     synchronized Record find(ConnId id) {
         for (Record r : live) {

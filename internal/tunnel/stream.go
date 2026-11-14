@@ -204,8 +204,14 @@ func (s *Stream) Reusable() bool { return s.reusable.Load() }
 
 // Clean reports whether the stream finished cleanly so far: both ends
 // half-closed, and nothing failed in either direction.
+//
+// A far end that said err: after its half-close did not finish cleanly,
+// though Read saw only the half-close. One that merely went away after it
+// did, as it does under protocol 1, where that end of the stream counts as
+// finished.
 func (s *Stream) Clean() bool {
-	return s.readEOF.Load() && s.wroteEOF.Load() && s.failure.Load() == nil && !s.wfail.Load() && !s.closed.Load()
+	return s.readEOF.Load() && s.wroteEOF.Load() && s.failure.Load() == nil && !s.wfail.Load() &&
+		!s.closed.Load() && s.goneReason.Load() == nil
 }
 
 // SendIdle sends "idle": on the hub, the verdict that the connection

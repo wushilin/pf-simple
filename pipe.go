@@ -102,8 +102,12 @@ type pipe struct {
 	down        flow // upstream -> client
 	interrupted atomic.Bool
 	resetReason atomic.Pointer[string] // why it was interrupted, for the flow log
-	ended       chan struct{}          // closed by end(); shared by both flows' cancel
-	endOnce     sync.Once
+	// failReason is why the serving side refused the connection after it
+	// had taken it on a reused leg (protocol 2): the flow log shows it as
+	// failed, as a refusal on a fresh leg is.
+	failReason atomic.Pointer[string]
+	ended      chan struct{} // closed by end(); shared by both flows' cancel
+	endOnce    sync.Once
 }
 
 // end wakes any copy goroutine waiting on a rate limit.

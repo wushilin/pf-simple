@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"encoding/json"
 	"errors"
 	"io"
@@ -748,4 +749,127 @@ func TestReuseIdleLegFrames(t *testing.T) {
 	}
 	_ = leg.WriteFrame(tunnel.OpText, []byte(tunnel.MsgIdle)) // idle again, while idle
 	waitFor(t, "the leg to be closed", func() bool { return len(f.wordSnap(t).Idle) == 0 })
+}
+
+// One client that both serves and connects through its word: its own
+// connecting connections share ids with what it serves, and must never be
+// taken for an attempt the hub asked for again (§12.7).
+func TestReuseServeAndDialOneClient(t *testing.T) {
+	for _, proto := range []int{1, 2} {
+		t.Run(fmt.Sprintf("protocol %d", proto), func(t *testing.T) {
+			f := newRelayFixture(t, "")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c := f.client(t, testWord, testServeToken)
+			c.MaxProto = proto
+			go func() { _ = c.Serve(ctx, echoTarget(t)) }()
+			waitFor(t, "the word to be served", func() bool { return c.Check(ctx) == nil })
+			for i := 0; i < 20; i++ {
+				echoOnce(t, c, "hello")
+			}
+			if st := c.Stats(); st.Failed != 0 {
+				t.Errorf("stats = %+v", st)
+			}
+		})
+	}
+}
+
+// A connecting side that fails after its half-close: the hub must not call
+// the connection clean, though the serving leg saw both half-closes.
+func TestReuseConnectingSideFailsAfterHalfClose(t *testing.T) {
+	f := newRelayFixture(t, "")
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	conn, err := c.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leg := fs.accept(fs.nextOpen(), fs.session)
+	_ = conn.CloseWrite()
+	conn.Fail("the application gave up")
+	time.Sleep(100 * time.Millisecond)
+	_ = leg.WriteFrame(tunnel.OpBinary, []byte("late"))
+	_ = leg.WriteFrame(tunnel.OpText, []byte("eof"))
+	var last string
+	leg.SetTimeouts(10*time.Second, time.Second)
+	for {
+		op, payload, err := leg.Next(1 << 20)
+		if err != nil {
+			break
+		}
+		if op == tunnel.OpText && string(payload) != "eof" {
+			last = string(payload)
+		}
+	}
+	if last == tunnel.MsgIdle {
+		t.Error("the hub said idle for a connection whose connecting side failed")
+	}
+}
+
+// Lowering the limits applies to the legs already idle: the caps close the
+// oldest, and a shorter idle limit applies at once.
+func TestReuseLoweredLimitsApply(t *testing.T) {
+	f := newRelayFixture(t, "")
+	f.hub.persistReuse = func(reuseSettings) error { return nil }
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	var conns []*pfrelay.Conn
+	var legs []*tunnel.Conn
+	for i := 0; i < 3; i++ {
+		conns = append(conns, dialEcho(t, c))
+		legs = append(legs, fs.accept(fs.nextOpen(), fs.session))
+	}
+	for i, leg := range legs {
+		verdict := make(chan string, 1)
+		go func() { verdict <- echoLeg(t, leg) }()
+		readAll(t, conns[i])
+		conns[i].Close()
+		<-verdict
+		_ = leg.WriteFrame(tunnel.OpText, []byte(tunnel.MsgIdle))
+		waitFor(t, "the leg in the pool", func() bool { return len(f.wordSnap(t).Idle) == i+1 })
+	}
+	r := defaultReuse
+	r.TenantCap = 2
+	if err := f.hub.setReuse(r); err != nil {
+		t.Fatal(err)
+	}
+	if w := f.wordSnap(t); len(w.Idle) != 2 || w.Idle[0].Leg != 2 {
+		t.Errorf("after a tenant cap of 2: %+v", w.Idle)
+	}
+	r.TenantCap, r.IdleSec, r.MinIdle = 256, 1, 0
+	if err := f.hub.setReuse(r); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the shorter idle limit", func() bool { return len(f.wordSnap(t).Idle) == 0 })
+}
+
+// A serving side that refuses after bound: the flow log and the counters
+// show a failure, as for a refusal at accept.
+func TestReuseRefusalAfterBoundIsAFailure(t *testing.T) {
+	f := newRelayFixture(t, "")
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	leg := fs.keptLeg(c)
+	before := f.wordSnap(t).Failed
+	conn := dialEcho(t, c)
+	id := awaitBind(t, leg)
+	_ = leg.WriteFrame(tunnel.OpText, []byte(tunnel.MsgBound+" "+id))
+	_ = leg.WriteFrame(tunnel.OpText, []byte("err:the serving side could not reach its target"))
+	_ = leg.WriteFrame(tunnel.OpClose, nil)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadAll(conn); err == nil {
+		t.Fatal("no failure")
+	}
+	waitFor(t, "a failure counted", func() bool { return f.wordSnap(t).Failed == before+1 })
+}
+
+// Settings: reuse must be whole, and a bad one changes nothing.
+func TestReuseSettingsAreWhole(t *testing.T) {
+	cfg, err := parseArgs([]string{"--console", "18222@secret", "--tunnel", testServeToken}, io.Discard, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.tunnel.reuse != defaultReuse {
+		t.Errorf("a hub from the command line reuses with %+v, want the defaults", cfg.tunnel.reuse)
+	}
 }

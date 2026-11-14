@@ -210,8 +210,9 @@ impl ClientBuilder {
         self
     }
 
-    /// How many idle legs to keep for reuse at most; [`DEFAULT_MAX_IDLE_LEGS`]
-    /// by default. More are closed when the hub offers them.
+    /// How many idle legs to keep for reuse at most; 0 (and the default)
+    /// means [`DEFAULT_MAX_IDLE_LEGS`]. More are closed when the hub offers
+    /// them. To turn reuse off, use [`no_reuse`](Self::no_reuse).
     pub fn max_idle_legs(mut self, n: usize) -> Self {
         self.max_idle_legs = n;
         self
@@ -263,8 +264,8 @@ impl ClientBuilder {
                 agent: self.agent.unwrap_or_else(|| DEFAULT_AGENT.into()),
                 registry: Arc::new(Registry::new(self.events)),
                 max_proto: self.max_proto,
-                reuse: !self.no_reuse && self.max_proto.max() >= 2 && self.max_idle_legs > 0,
-                max_idle_legs: self.max_idle_legs,
+                reuse: !self.no_reuse && self.max_proto.max() >= 2,
+                max_idle_legs: if self.max_idle_legs == 0 { DEFAULT_MAX_IDLE_LEGS } else { self.max_idle_legs },
                 log: self.log,
             }),
         })

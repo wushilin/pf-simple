@@ -16,7 +16,7 @@ use crate::conn::{Conn, Side, LINK_SILENCE};
 use crate::error::{Error, Result};
 use crate::events::ConnId;
 use crate::listener::{refuse, serve_loop, short, Handler, Shared};
-use crate::reuse::{fail_leg, Leg, Registration};
+use crate::reuse::{fail_leg, Leg, Registration, REASON_LEG_LOST};
 use crate::ws::CHUNK;
 
 /// How long the forwarder gives the target to answer.
@@ -71,7 +71,7 @@ impl Client {
 /// Carries connection `id` of a forwarding tunnel to `target`. `leg` is
 /// its stream when it arrived on a reused leg, which has already answered
 /// `bound`; `None` when this side brings a leg to `accept`.
-pub(crate) async fn serve_one(c: &Client, reg: &Arc<Registration>, id: &str, target: &str, leg: Option<Leg>) {
+pub(crate) async fn serve_one(c: &Client, reg: &Arc<Registration>, id: &str, target: &str, mut leg: Option<Leg>) {
     let dialed = tokio::time::timeout(TARGET_DIAL_TIMEOUT, TcpStream::connect(target)).await;
     let tcp = match dialed {
         Ok(Ok(tcp)) => tcp,
@@ -91,6 +91,13 @@ pub(crate) async fn serve_one(c: &Client, reg: &Arc<Registration>, id: &str, tar
             };
         }
     };
+    if let Some(leg) = leg.take_if(|_| reg.abandoned(id)) {
+        // Asked for again while this side was dialing: the new attempt
+        // carries it, and this one never opened.
+        drop(tcp);
+        return fail_leg(leg, REASON_LEG_LOST).await;
+    }
+    let bound = leg.is_some();
     let conn = match leg {
         Some(leg) => Conn::on_leg(leg, id, Side::Serve, c.inner.registry.clone(), Some(reg.clone())),
         None => match c.accept(id, reg.session.as_deref()).await {
@@ -101,6 +108,9 @@ pub(crate) async fn serve_one(c: &Client, reg: &Arc<Registration>, id: &str, tar
             }
         },
     };
+    if bound && reg.abandoned(id) {
+        c.inner.registry.abandon(&ConnId::new(id)); // asked for again just as it opened
+    }
     c.log(&format!("connection {} open: tunnel -> {target}", short(id)));
     bridge(c, conn, tcp, &SERVE, &reg.sh.cancel).await;
 }

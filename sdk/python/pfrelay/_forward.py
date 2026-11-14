@@ -128,51 +128,59 @@ async def bridge(conn: Conn, reader: asyncio.StreamReader, writer: asyncio.Strea
     out_t = asyncio.ensure_future(_outbound(conn, reader))
     in_t = asyncio.ensure_future(_inbound(conn, writer))
     tasks = {out_t, in_t}
+    writer_done = False
     try:
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        first = done.pop()
-        reason, mine, err = _describe(p, first.result())
-        if err is None:
-            # One direction finished cleanly. If it was the far end's
-            # half-close, watch for the far end going away while this end
-            # still has the floor.
-            second = in_t if first is out_t else out_t
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            first = in_t if in_t in done else out_t
+            reason, mine, err = _describe(p, first.result())
+            if err is None:
+                second = in_t if first is out_t else out_t
 
-            def then(r: _End) -> None:
-                nonlocal reason, mine, err
-                why, whose, failed = _describe(p, r)
-                if failed is not None:
-                    reason, mine, err = why, whose, failed
+                def then(r: _End) -> None:
+                    nonlocal reason, mine, err
+                    why, whose, failed = _describe(p, r)
+                    if failed is not None:
+                        reason, mine, err = why, whose, failed
 
-            gone = asyncio.ensure_future(conn.wait_closed())
-            try:
-                await asyncio.wait({second, gone}, return_when=asyncio.FIRST_COMPLETED)
-                if not second.done():
-                    await asyncio.wait({second}, timeout=_GONE_GRACE)
-                if second.done():
-                    then(second.result())
+                if second is in_t:
+                    # This end finished first; what the far end sends may
+                    # still be on its way to a slow local end. Wait for it:
+                    # the stream ending is no failure once its data is in.
+                    then(await in_t)
                 else:
-                    mine = False
-                    err = conn.err or PeerClosedError("the server closed the connection")
-                    reason = str(conn.err) if conn.err else "the server closed the connection"
-            finally:
-                gone.cancel()
-    except asyncio.CancelledError:
+                    # The far end's half-close is delivered, and this end
+                    # still has the floor: watch for the far end going away.
+                    gone = asyncio.ensure_future(conn.wait_closed())
+                    try:
+                        await asyncio.wait({second, gone}, return_when=asyncio.FIRST_COMPLETED)
+                        if not second.done():
+                            await asyncio.wait({second}, timeout=_GONE_GRACE)
+                        if second.done():
+                            then(second.result())
+                        else:
+                            mine = False
+                            err = conn.err or PeerClosedError("the server closed the connection")
+                            reason = str(conn.err) if conn.err else "the server closed the connection"
+                    finally:
+                        gone.cancel()
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            await conn._fail(f"{p.self} is stopping", ClosedError(f"{p.self} is stopping"))
+            raise
         for t in tasks:
             t.cancel()
-        await conn._fail(f"{p.self} is stopping", ClosedError(f"{p.self} is stopping"))
-        writer.transport.abort()
-        raise
-    for t in tasks:
-        t.cancel()
-    if err is not None and mine:
-        await conn._fail(reason, err)
-    else:
-        final = await conn._close_with(err)
-        if err is None and final is not None:  # the hub's verdict said otherwise (12.5)
-            reason, err = link_reason(p, final), final
-    if err is None:
-        writer.close()
-    else:
-        writer.transport.abort()
-    return Ended(reason, err)
+        if err is not None and mine:
+            await conn._fail(reason, err)
+        else:
+            final = await conn._close_with(err)
+            if err is None and final is not None:  # the hub's verdict said otherwise (12.5)
+                reason, err = link_reason(p, final), final
+        if err is None:
+            writer.close()
+            writer_done = True
+        return Ended(reason, err)
+    finally:
+        if not writer_done:
+            writer.transport.abort()  # never left open, cancelled or not

@@ -413,3 +413,185 @@ async fn an_idle_leg_gives_its_place_back() {
     }
     tasks.iter().for_each(JoinHandle::abort);
 }
+
+/// Serves with listen, and hands every connection to the test untouched.
+fn listen_hold(c: &Client) -> (JoinHandle<()>, tokio::sync::mpsc::UnboundedReceiver<crate::Conn>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let c = c.clone();
+    let task = tokio::spawn(async move {
+        let l = c.listen().await.unwrap();
+        while let Ok(conn) = l.accept().await {
+            if tx.send(conn).is_err() {
+                return;
+            }
+        }
+    });
+    (task, rx)
+}
+
+async fn held(rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::Conn>) -> crate::Conn {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a connection in time").unwrap()
+}
+
+/// An echo of one held connection: back what came, then close.
+fn echo_held(mut conn: crate::Conn) {
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if conn.read_to_end(&mut buf).await.is_ok() && conn.write_all(&buf).await.is_ok() {
+            let _ = conn.close().await;
+        }
+    });
+}
+
+#[tokio::test]
+async fn an_abandoned_attempt_is_failed() {
+    let heard = Heard::default();
+    let (c, mut sc) = scripted(configure(&heard, |b| b));
+    let (task, mut rx) = listen_hold(&c);
+    let mut ctl = register(&mut sc).await;
+    offer_open(&mut ctl, &id(1)).await;
+    let (_, mut leg) = take_accept(&mut sc, true).await;
+    echo_held(held(&mut rx).await);
+    exchange(&mut leg, b"one").await;
+    keep(&mut leg).await;
+    bind(&mut leg, &id(2)).await;
+    let old = held(&mut rx).await; // the application holds it, neither reading nor writing
+    // The hub never heard bound, and asks again for the same id.
+    offer_open(&mut ctl, &id(2)).await;
+    let (conn, _leg2) = take_accept(&mut sc, true).await;
+    assert_eq!(conn, id(2));
+    let new = held(&mut rx).await;
+    assert_eq!(new.id().to_string(), id(2));
+    old.close().await.unwrap();
+    let closes: Vec<String> = heard.until(4).await.into_iter().filter(|e| e.starts_with("close")).collect();
+    assert_eq!(closes[1], format!("close {} 0 0 dropped: {REASON_LEG_LOST}", id(2)), "{closes:?}");
+    assert_eq!(c.conns().len(), 1, "the new attempt goes on");
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_open_does_not_drop_this_clients_connecting_side() {
+    // One client that serves the word and dials it too: its connecting
+    // connection has the id the serving side then gets with an open
+    // message. That id was never bound here, so nothing is abandoned.
+    let heard = Heard::default();
+    let (c, mut sc) = scripted(configure(&heard, |b| b));
+    let (task, mut rx) = listen_hold(&c);
+    let mut ctl = register(&mut sc).await;
+    let dialing = {
+        let c = c.clone();
+        tokio::spawn(async move { c.dial().await.unwrap() })
+    };
+    let (req, mut connect_leg) = sc.next("connect").await;
+    upgrade(&mut connect_leg, &req, &[("X-Pf-Tunnel-Proto", "2"), ("X-PF-Tunnel-Conn", id(7).as_str())]).await;
+    let dialed = dialing.await.unwrap();
+    offer_open(&mut ctl, &id(7)).await;
+    let (_, _serve_leg) = take_accept(&mut sc, true).await;
+    let served = held(&mut rx).await;
+    assert_eq!((dialed.id(), served.id()), (served.id(), dialed.id()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(dialed.err().is_none(), "{:?}", dialed.err());
+    assert_eq!(c.conns().len(), 2);
+    assert!(!heard.all().iter().any(|e| e.starts_with("close")), "{:?}", heard.all());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_late_bind_is_refused() {
+    let heard = Heard::default();
+    let (c, mut sc) = scripted(configure(&heard, |b| b));
+    let tasks = serve(&c, Mode::Listen).await;
+    let mut ctl = register(&mut sc).await;
+    offer_open(&mut ctl, &id(1)).await;
+    let (_, mut leg) = take_accept(&mut sc, true).await;
+    exchange(&mut leg, b"one").await;
+    keep(&mut leg).await;
+    offer_open(&mut ctl, &id(2)).await;
+    let (_, _leg2) = take_accept(&mut sc, true).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The hub fell back already; a bind for that id is refused.
+    send(&mut leg, OP_TEXT, format!("bind {}", id(2)).as_bytes()).await;
+    let end = tokio::time::timeout(Duration::from_secs(5), recv(&mut leg)).await.expect("the leg closes");
+    assert!(matches!(end, None | Some((OP_CLOSE, _))), "a late bind was answered with {end:?}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let opened = heard.all().iter().filter(|e| **e == format!("open {}", id(2))).count();
+    assert_eq!(opened, 1, "{:?}", heard.all());
+    tasks.iter().for_each(JoinHandle::abort);
+}
+
+#[tokio::test]
+async fn finished_resolves_on_the_verdict() {
+    let (c, mut sc) = scripted(|b| b.serve_token(SERVE_TOKEN));
+    let (task, mut rx) = listen_hold(&c);
+    let mut ctl = register(&mut sc).await;
+    offer_open(&mut ctl, &id(1)).await;
+    let (_, mut leg) = take_accept(&mut sc, true).await;
+    let mut conn = held(&mut rx).await;
+    send(&mut leg, OP_TEXT, b"eof").await;
+    let mut buf = Vec::new();
+    conn.read_to_end(&mut buf).await.unwrap();
+    conn.shutdown().await.unwrap();
+    expect(&mut leg, OP_TEXT, b"eof").await;
+    send(&mut leg, OP_TEXT, b"idle").await;
+    let r = tokio::time::timeout(Duration::from_secs(2), conn.finished()).await;
+    assert!(matches!(r, Ok(None)), "finished() after the hub's idle: {r:?}");
+    conn.close().await.unwrap();
+    expect(&mut leg, OP_TEXT, b"idle").await; // and the leg is kept
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_cancelled_close_still_ends_and_reports() {
+    let heard = Heard::default();
+    let wait = Duration::from_millis(300);
+    let (c, mut sc) = scripted(configure(&heard, |b| b.timing(Timing { verdict_wait: wait, ..Timing::default() })));
+    let (task, mut rx) = listen_hold(&c);
+    let mut ctl = register(&mut sc).await;
+    offer_open(&mut ctl, &id(1)).await;
+    let (_, mut leg) = take_accept(&mut sc, true).await;
+    let conn = held(&mut rx).await;
+    send(&mut leg, OP_TEXT, b"eof").await;
+    let mut buf = Vec::new();
+    (&conn).read_to_end(&mut buf).await.unwrap();
+    // The close waits for the hub's verdict, and its future is dropped.
+    assert!(tokio::time::timeout(Duration::from_millis(50), conn.close()).await.is_err());
+    expect(&mut leg, OP_TEXT, b"eof").await;
+    // No verdict: after verdict_wait it closes, and is reported, though
+    // the Conn is still held.
+    expect(&mut leg, OP_CLOSE, &[3, 0xE8]).await;
+    send(&mut leg, OP_CLOSE, &[3, 0xE8]).await;
+    assert_eq!(heard.until(2).await[1], format!("close {} 0 0 ok", id(1)));
+    assert_eq!(c.stats().active, 0);
+    assert!(c.conns().is_empty());
+    drop(conn);
+    task.abort();
+}
+
+#[tokio::test]
+async fn idle_before_this_sides_eof_is_a_violation() {
+    let heard = Heard::default();
+    let (c, mut sc) = scripted(configure(&heard, |b| b));
+    let (task, mut rx) = listen_hold(&c);
+    let mut ctl = register(&mut sc).await;
+    offer_open(&mut ctl, &id(1)).await;
+    let (_, mut leg) = take_accept(&mut sc, true).await;
+    let conn = held(&mut rx).await; // the application has not half-closed
+    send(&mut leg, OP_TEXT, b"eof").await;
+    send(&mut leg, OP_TEXT, b"idle").await;
+    let end = tokio::time::timeout(Duration::from_secs(5), recv(&mut leg)).await.expect("the leg is cut");
+    assert!(matches!(end, None | Some((OP_CLOSE, _))), "{end:?}");
+    let events = heard.until(2).await;
+    assert!(events[1].starts_with(&format!("close {} 0 0 failed: ", id(1))), "{events:?}");
+    assert!(events[1].contains("idle"), "{events:?}");
+    assert!(conn.err().is_some());
+    task.abort();
+}
+
+#[test]
+fn zero_idle_legs_means_the_default() {
+    let c = Client::builder("https://127.0.0.1:1/", "k3f9-x2mq-7hpa").max_idle_legs(0).build().unwrap();
+    assert_eq!(c.inner.max_idle_legs, crate::DEFAULT_MAX_IDLE_LEGS);
+    assert!(c.inner.reuse);
+    let c = Client::builder("https://127.0.0.1:1/", "k3f9-x2mq-7hpa").no_reuse().build().unwrap();
+    assert!(!c.inner.reuse);
+}

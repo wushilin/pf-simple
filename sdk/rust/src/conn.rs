@@ -34,6 +34,8 @@ const WRITE_QUEUE: usize = 8;
 /// Frames read ahead of the application.
 const READ_QUEUE: usize = 4;
 const CLOSE_NORMAL: [u8; 2] = [0x03, 0xE8];
+/// Bounds the write of this side's `idle`.
+const IDLE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which end of the tunnel a connection belongs to. It prints, parses and
 /// serializes as `connect` or `serve`.
@@ -184,9 +186,10 @@ impl Registry {
         if rec.finished.swap(true, Ordering::AcqRel) {
             return false;
         }
-        let err = match (err, rec.dropped.lock().unwrap().clone()) {
-            (Some(_), Some(reason)) => Some(Error::Dropped { reason }),
-            (err, _) => err,
+        // A connection this side dropped failed, however it ended.
+        let err = match rec.dropped.lock().unwrap().clone() {
+            Some(reason) => Some(Error::Dropped { reason }),
+            None => err,
         };
         {
             let mut t = self.totals.lock().unwrap();
@@ -205,7 +208,26 @@ impl Registry {
 
     /// Drops the open connection `id` and tells the far end `reason`.
     pub(crate) fn drop_conn(&self, id: &ConnId, reason: &str) -> bool {
-        let rec = self.totals.lock().unwrap().live.values().find(|r| &r.id == id).cloned();
+        self.drop_where(id, None, reason)
+    }
+
+    /// Abandons the serving side's attempt at `id`, whose leg was lost
+    /// before the hub heard `bound` (PROTOCOL.md §12.7). Only the serving
+    /// side's connections are touched: the same client may also be
+    /// connecting through the tunnel, and that connection has the same id.
+    pub(crate) fn abandon(&self, id: &ConnId) -> bool {
+        self.drop_where(id, Some(Side::Serve), crate::reuse::REASON_LEG_LOST)
+    }
+
+    fn drop_where(&self, id: &ConnId, side: Option<Side>, reason: &str) -> bool {
+        let rec = self
+            .totals
+            .lock()
+            .unwrap()
+            .live
+            .values()
+            .find(|r| &r.id == id && side.is_none_or(|s| r.side == s))
+            .cloned();
         let Some(sh) = rec.as_ref().and_then(|r| r.stream.get()).and_then(Weak::upgrade) else {
             return false;
         };
@@ -315,6 +337,12 @@ struct Shared {
     /// reader in `leg_reader`: the far end is not gone, the leg goes on.
     idled: watch::Sender<bool>,
     leg_reader: Mutex<Option<Frames>>,
+    /// The writer has finished: the stream is over, one way or another.
+    ended: watch::Sender<bool>,
+    /// What `fail` or a forwarder said the connection ended with, if this
+    /// end saw no error of its own.
+    end_hint: Mutex<Option<Error>>,
+    registry: Arc<Registry>,
 }
 
 type Frames = FrameReader<ReadHalf<Tls>>;
@@ -446,6 +474,9 @@ impl Conn {
             reuse,
             idled: watch::channel(false).0,
             leg_reader: Mutex::new(None),
+            ended: watch::channel(false).0,
+            end_hint: Mutex::new(None),
+            registry: registry.clone(),
         });
         let _ = shared.rec.stream.set(Arc::downgrade(&shared));
         let (ev_tx, ev_rx) = mpsc::channel(READ_QUEUE);
@@ -495,50 +526,58 @@ impl Conn {
     /// Waits until the far end, having half-closed, is gone for good, or
     /// the link died, and returns what [`Conn::err`] then says.
     pub async fn finished(&self) -> Option<Error> {
-        let mut gone = self.shared.gone.subscribe();
-        let _ = gone.wait_for(|g| *g).await;
+        let sh = &self.shared;
+        let (mut gone, mut idled, mut ended) = (sh.gone.subscribe(), sh.idled.subscribe(), sh.ended.subscribe());
+        // Gone, or the hub's verdict "idle" (the far end finished cleanly),
+        // or the stream ended here.
+        tokio::select! {
+            _ = gone.wait_for(|g| *g) => {}
+            _ = idled.wait_for(|i| *i) => {}
+            _ = ended.wait_for(|e| *e) => {}
+        }
         self.err()
     }
 
     /// Drops the connection and tells the far end why: its reads fail with
     /// a [`RemoteError`] carrying `reason`.
     pub async fn fail(&self, reason: &str) {
-        self.shared.failed.store(true, Ordering::Release);
         let reason = clean_local(reason);
-        self.end(Ctl::Fail(reason.clone())).await;
-        let err = self.local_error().unwrap_or(Error::Dropped { reason });
-        self.registry.finish(&self.shared.rec, Some(err));
+        let hint = Error::Dropped { reason: reason.clone() };
+        self.end(Ctl::Fail(reason), Some(hint)).await;
     }
 
     /// Ends the connection, after sending what was written. If this end has
     /// not half-closed, it does so first. When both ends had half-closed,
     /// the close is clean; otherwise the far end sees the connection cut.
+    ///
+    /// The connection is reported closed when its stream has ended, even if
+    /// this future is dropped before then.
     pub async fn close(&self) -> Result<()> {
-        self.end(Ctl::Close).await;
-        self.registry.finish(&self.shared.rec, self.local_error().or_else(|| self.err()));
+        self.end(Ctl::Close, None).await;
         Ok(())
     }
 
     /// Ends a broken connection: with `reason` for the far end, or cut
     /// without one. It ends with the first error this end saw, or `err`.
     pub(crate) async fn end_with(&self, reason: Option<&str>, err: Error) {
-        self.shared.failed.store(true, Ordering::Release);
         let how = match reason {
             Some(r) => Ctl::Fail(clean_local(r)),
             None => Ctl::Close,
         };
-        self.end(how).await;
-        let err = self.local_error().unwrap_or(err);
-        self.registry.finish(&self.shared.rec, Some(err));
+        self.end(how, Some(err)).await;
     }
 
-    fn local_error(&self) -> Option<Error> {
-        self.shared.local_error()
-    }
-
-    async fn end(&self, how: Ctl) {
+    /// Ends the stream, once: the first of `close`, `fail` and drop wins.
+    /// `hint`, if any, is what it ended with unless this end saw an error
+    /// of its own; it also marks the end as failed. The writer reports the
+    /// connection when it has finished, so a dropped future changes nothing.
+    async fn end(&self, how: Ctl, hint: Option<Error>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if let Some(h) = hint {
+            self.shared.failed.store(true, Ordering::Release);
+            *self.shared.end_hint.lock().unwrap() = Some(h);
         }
         self.shared.closing.send_replace(true);
         let _ = self.shared.ctl.send(how);
@@ -655,25 +694,10 @@ impl Conn {
 impl Drop for Conn {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
-            // Closed in the background as `close` would, and reported once
-            // that is done: after the hub's verdict on a reusable leg.
+            // Closed in the background as `close` would; the writer reports
+            // it once that is done: after the hub's verdict on a reusable leg.
             self.shared.closing.send_replace(true);
             let _ = self.shared.ctl.send(Ctl::Close);
-            let writer = self.writer.lock().unwrap().take();
-            let (sh, registry) = (self.shared.clone(), self.registry.clone());
-            let report = move || {
-                let err = sh.local_error().or_else(|| sh.err());
-                registry.finish(&sh.rec, err);
-            };
-            match (writer, tokio::runtime::Handle::try_current()) {
-                (Some(w), Ok(rt)) => {
-                    rt.spawn(async move {
-                        let _ = w.await;
-                        report();
-                    });
-                }
-                _ => report(),
-            }
         }
     }
 }
@@ -757,6 +781,10 @@ async fn read_data(frames: &mut Frames, tx: &mpsc::Sender<Event>, sh: &Shared) -
                     let _ = tx.send(failed(Failure::Protocol("a fragmented text frame".into()))).await;
                     return false;
                 }
+                if frame.payload == MSG_IDLE && sh.reuse.is_some() {
+                    let _ = tx.send(failed(idle_violation(sh))).await;
+                    return false;
+                }
                 if frame.payload == b"eof" {
                     sh.rec.read_eof.store(true, Ordering::Release);
                     let _ = tx.send(Event::Eof).await;
@@ -779,6 +807,16 @@ async fn read_data(frames: &mut Frames, tx: &mpsc::Sender<Event>, sh: &Shared) -
     }
 }
 
+/// The hub's `idle` where it does not belong (before both half-closes): a
+/// violation, which fails the connection and cuts the leg (§12.4).
+fn idle_violation(sh: &Shared) -> Failure {
+    let f = Failure::Protocol("the server said idle before this side had half-closed".into());
+    sh.set_failure(f.clone());
+    sh.closing.send_replace(true);
+    let _ = sh.ctl.send(Ctl::Close);
+    f
+}
+
 /// Keeps reading after the far end's half-close: an `err:` may still come
 /// (PROTOCOL.md §8.3), and the far end's close or a dead link must be seen.
 /// On a leg offered reuse, it stops at the hub's `idle` after both
@@ -796,7 +834,11 @@ async fn watch_after_eof(frames: &mut Frames, sh: &Shared) -> bool {
                 if frame.payload == MSG_IDLE && sh.reuse.is_some() {
                     // Valid only once this end has half-closed too; in any
                     // other state it is a violation, which ends the leg.
-                    return frame.fin && sh.rec.wrote_eof.load(Ordering::Acquire);
+                    if frame.fin && sh.rec.wrote_eof.load(Ordering::Acquire) {
+                        return true;
+                    }
+                    let _ = idle_violation(sh);
+                    return false;
                 }
                 if let Some(reason) = frame.payload.strip_prefix(b"err:") {
                     let reason = clean_reason(&String::from_utf8_lossy(reason));
@@ -851,6 +893,20 @@ async fn write_loop(
     sh: Arc<Shared>,
     reader: AbortHandle,
 ) {
+    // However the writer ends, even aborted: the reader stops, a leg reader
+    // parked by a late "idle" is closed, and the connection is reported.
+    struct Exit(Arc<Shared>, AbortHandle);
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            let sh = &self.0;
+            self.1.abort();
+            drop(sh.leg_reader.lock().unwrap().take());
+            sh.ended.send_replace(true);
+            let err = sh.local_error().or_else(|| sh.end_hint.lock().unwrap().take()).or_else(|| sh.err());
+            sh.registry.finish(&sh.rec, err);
+        }
+    }
+    let _exit = Exit(sh.clone(), reader);
     let mut closing = sh.closing.subscribe();
     let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -957,7 +1013,9 @@ async fn write_loop(
                         let frames = sh.leg_reader.lock().unwrap().take();
                         if let Some(frames) = frames {
                             if reg.keep() {
-                                if put(&mut w, &mut closing, OP_TEXT, MSG_IDLE).await.is_ok() {
+                                let answered =
+                                    tokio::time::timeout(IDLE_WRITE_TIMEOUT, put(&mut w, &mut closing, OP_TEXT, MSG_IDLE)).await;
+                                if matches!(answered, Ok(Ok(()))) {
                                     reg.adopt(Leg { frames, w });
                                     return;
                                 }
@@ -998,7 +1056,6 @@ async fn write_loop(
             // Anything else cuts the stream: the socket is dropped.
         }
     }
-    reader.abort();
 }
 
 #[cfg(test)]

@@ -830,7 +830,7 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	// Protocol 2: the registration's secret goes out with the 101 only,
 	// never with a refusal (§12.3).
 	var session []byte
-	if chosenProto(w) >= 2 {
+	if chosenProto(w) >= 2 && isUpgrade(r) {
 		if session = newSession(); session != nil {
 			w.Header().Set(tunnel.HeaderSession, hex.EncodeToString(session))
 		}
@@ -1158,7 +1158,7 @@ func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if served.leg != nil {
 		// Closing it offers the leg back for the next connection, after a
 		// clean finish (protocol 2, §12.5).
-		up = &reusableUpstream{Stream: upstream, h: h, t: t, leg: served.leg, client: client}
+		up = &reusableUpstream{Stream: upstream, h: h, t: t, leg: served.leg, client: client, pipeID: id}
 	}
 	servePipe(id, start, client, up, l, h.idle)
 }
@@ -1309,9 +1309,9 @@ type relayWordSnapshot struct {
 	// Idle lists the idle legs, with the tunnel's limits on them.
 	Reuse   bool           `json:"reuse,omitempty"`
 	Reused  uint64         `json:"reused,omitempty"`
-	MinIdle int            `json:"minIdle,omitempty"`
-	MaxIdle int            `json:"maxIdle,omitempty"`
-	IdleSec int            `json:"idleSeconds,omitempty"`
+	MinIdle int            `json:"minIdle"`
+	MaxIdle int            `json:"maxIdle"`
+	IdleSec int            `json:"idleSeconds"`
 	Idle    []idleSnapshot `json:"idle,omitempty"`
 	// WordReuse is this word's own limits, where the console set them.
 	WordReuse *wordReuse `json:"wordReuse,omitempty"`
@@ -1432,21 +1432,43 @@ func (s *consoleServer) handleRelayAction(w http.ResponseWriter, r *http.Request
 // handleRelaySettings changes the hub's switches; a field left out stays.
 func (s *consoleServer) handleRelaySettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Enabled   *bool          `json:"enabled"`
-		Anonymous *bool          `json:"anonymous"`
-		Reuse     *reuseSettings `json:"reuse"`
+		Enabled   *bool           `json:"enabled"`
+		Anonymous *bool           `json:"anonymous"`
+		Reuse     json.RawMessage `json:"reuse"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "bad request body")
 		return
+	}
+	// reuse, if given, must be whole and usable before anything changes: a
+	// field left out would otherwise read as 0.
+	var reuse *reuseSettings
+	if len(body.Reuse) > 0 && string(body.Reuse) != "null" {
+		var fields map[string]json.RawMessage
+		var rs reuseSettings
+		if json.Unmarshal(body.Reuse, &fields) != nil || json.Unmarshal(body.Reuse, &rs) != nil {
+			writeError(w, http.StatusBadRequest, "reuse: bad value")
+			return
+		}
+		for _, k := range []string{"enabled", "idleSeconds", "minIdle", "maxIdle", "tenantCap", "hubCap"} {
+			if _, ok := fields[k]; !ok {
+				writeError(w, http.StatusBadRequest, "reuse: "+k+" is missing; send all six fields")
+				return
+			}
+		}
+		if msg := rs.check(); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+		reuse = &rs
 	}
 	if s.tunnels == nil {
 		writeError(w, http.StatusNotFound, "this server has no relay hub")
 		return
 	}
 	err := s.tunnels.setSettings(body.Enabled, body.Anonymous)
-	if err == nil && body.Reuse != nil {
-		err = s.tunnels.setReuse(*body.Reuse)
+	if err == nil && reuse != nil {
+		err = s.tunnels.setReuse(*reuse)
 	}
 	var bad *badSetting
 	if errors.As(err, &bad) {

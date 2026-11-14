@@ -371,6 +371,179 @@ class ReuseTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
         await self.keep_leg(ctl, ID2)  # its place is free again
 
+    async def held_listener(self, c):
+        """Listen, handing each accepted connection to the test."""
+        listener = await c.listen()
+        held: asyncio.Queue = asyncio.Queue()
+
+        async def loop():
+            async for conn in listener:
+                await held.put(conn)
+
+        task = asyncio.ensure_future(loop())
+
+        async def stop():
+            task.cancel()
+            await listener.close()
+
+        self.cleanups.append(stop)
+        return held, await self.hub.next_ctl()
+
+    async def test_abandoned_attempt_is_failed(self):
+        # A bound attempt the hub asks for again is reported failed, even when
+        # the application holding it closes it quietly; the new one is carried.
+        c = self.client()
+        ev = Recorder()
+        ev.install(c)
+        held, ctl = await self.held_listener(c)
+        await send_open(ctl, ID1)
+        _, _, leg = await self.hub.next_accept()
+        first = await asyncio.wait_for(held.get(), 5)
+        asyncio.ensure_future(echo_conn(first))
+        await exchange(self, leg)
+        await leg.send(OP_TEXT, b"idle")
+        self.assertEqual(await expect_text(leg, 5), b"idle")
+        await leg.send(OP_TEXT, b"bind " + ID2.encode())
+        self.assertEqual(await expect_text(leg, 5), b"bound " + ID2.encode())
+        old = await asyncio.wait_for(held.get(), 5)  # held, neither read nor written
+        await send_open(ctl, ID2)
+        await self.hub.next_accept()
+        new = await asyncio.wait_for(held.get(), 5)
+        self.assertIsNot(new, old)
+        await old.close()
+        [err] = await ev.closed_with(ID2)
+        self.assertIsInstance(err, pfrelay.DroppedError)
+        self.assertEqual(err.reason, pfrelay.REASON_LEG_LOST)
+        self.assertFalse(new._dropping)
+
+    async def test_late_bind_is_refused(self):
+        # A bind for an id that already came with an open message (the hub
+        # fell back first) is refused: the leg closes, nothing opens twice.
+        c = self.client()
+        ev = Recorder()
+        ev.install(c)
+        ctl = await self.serve(c, "listen")
+        leg = await self.keep_leg(ctl, ID1)
+        await send_open(ctl, ID2)
+        await self.hub.next_accept()
+        await asyncio.sleep(0.05)
+        await leg.send(OP_TEXT, b"bind " + ID2.encode())
+        with self.assertRaises((ConnectionError, pfrelay.LinkError, asyncio.TimeoutError)):
+            await expect_text(leg, 5)
+        self.assertEqual([str(i) for i in ev.opened].count(ID2), 1)
+
+    async def test_only_bound_serving_attempts_are_abandoned(self):
+        c = self.client()
+        held, ctl = await self.held_listener(c)
+        # The same client also connects through the tunnel, under ids the
+        # hub may hand the serving side too.
+        connecting = []
+        for cid in (ID2, "3333333333333333"):
+            pair = await Pair().__aenter__()
+            self.hub.pairs.append(pair)
+            connecting.append(await c._new_conn(pair.client, pfrelay.ConnID(cid), pfrelay.Side.CONNECT))
+        # An id never bound here: an open message drops nothing.
+        await send_open(ctl, "3333333333333333")
+        await self.hub.next_accept()
+        await asyncio.wait_for(held.get(), 5)
+        # A bound id asked for again: only the serving side's attempt goes.
+        await send_open(ctl, ID1)
+        _, _, leg = await self.hub.next_accept()
+        asyncio.ensure_future(echo_conn(await asyncio.wait_for(held.get(), 5)))
+        await exchange(self, leg)
+        await leg.send(OP_TEXT, b"idle")
+        await expect_text(leg, 5)
+        await leg.send(OP_TEXT, b"bind " + ID2.encode())
+        await expect_text(leg, 5)
+        bound = await asyncio.wait_for(held.get(), 5)
+        await send_open(ctl, ID2)
+        await self.hub.next_accept()
+        await asyncio.sleep(0.05)
+        self.assertTrue(bound._dropping)
+        self.assertFalse(any(conn._dropping for conn in connecting))
+        for conn in connecting:
+            await conn.close()
+
+    async def test_close_cancelled_during_the_verdict(self):
+        c = self.client()
+        c.verdict_wait = 30
+        ev = Recorder()
+        ev.install(c)
+        held, ctl = await self.held_listener(c)
+        await send_open(ctl, ID1)
+        _, _, leg = await self.hub.next_accept()
+        conn = await asyncio.wait_for(held.get(), 5)
+        await leg.send(OP_TEXT, b"eof")
+        self.assertEqual(await conn.read(), b"")
+        closing = asyncio.ensure_future(conn.close())  # sends eof, then waits for the verdict
+        self.assertEqual(await expect_text(leg, 5), b"eof")
+        await asyncio.sleep(0.1)
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        with self.assertRaises((ConnectionError, pfrelay.LinkError, asyncio.TimeoutError)):
+            await expect_text(leg, 5)  # the leg was closed
+        self.assertEqual(len(await ev.closed_with(ID1)), 1)
+        self.assertEqual(c.stats().active, 0)
+
+    async def test_cancelled_idle_send_gives_the_place_back(self):
+        c = self.client(max_idle_legs=1)
+        held, ctl = await self.held_listener(c)
+        await send_open(ctl, ID1)
+        _, _, leg = await self.hub.next_accept()
+        conn = await asyncio.wait_for(held.get(), 5)
+        send = conn._ws.send
+
+        async def stuck(op, payload=b"", *, timeout=None):
+            if payload == b"idle":
+                await asyncio.sleep(100)
+            return await send(op, payload, timeout=timeout)
+
+        conn._ws.send = stuck
+        await leg.send(OP_TEXT, b"eof")
+        self.assertEqual(await conn.read(), b"")
+        closing = asyncio.ensure_future(conn.close())
+        self.assertEqual(await expect_text(leg, 5), b"eof")
+        await leg.send(OP_TEXT, b"idle")
+        await asyncio.sleep(0.1)
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        # The place is free: the next leg is kept.
+        await send_open(ctl, ID2)
+        _, _, leg2 = await self.hub.next_accept()
+        conn2 = await asyncio.wait_for(held.get(), 5)
+        asyncio.ensure_future(echo_conn(conn2))
+        await exchange(self, leg2)
+        await leg2.send(OP_TEXT, b"idle")
+        self.assertEqual(await expect_text(leg2, 5), b"idle")
+
+    async def test_bound_leg_closes_when_cancelled_while_dialing(self):
+        c = self.client()
+        server, target = await echo_target()
+        task = asyncio.ensure_future(c.serve(target))
+
+        async def stop():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            server.close()
+
+        self.cleanups.append(stop)
+        ctl = await self.hub.next_ctl()
+        leg = await self.keep_leg(ctl, ID1)
+        dialing = asyncio.Event()
+
+        async def hang(*a, **kw):
+            dialing.set()
+            await asyncio.sleep(100)
+
+        with mock.patch("asyncio.open_connection", hang):
+            await leg.send(OP_TEXT, b"bind " + ID2.encode())
+            self.assertEqual(await expect_text(leg, 5), b"bound " + ID2.encode())
+            await asyncio.wait_for(dialing.wait(), 5)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        with self.assertRaises((ConnectionError, pfrelay.LinkError, asyncio.TimeoutError)):
+            await expect_text(leg, 5)
+
     def test_known_leg_frames(self):
         from pfrelay._client import known_leg_frame
 
