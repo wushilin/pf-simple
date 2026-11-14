@@ -32,18 +32,29 @@ public final class Listener implements Closeable {
     private volatile boolean up;
     private volatile WebSocket control;
     private volatile boolean closed;
+    /** For a serve forwarder: the target, and the forwarder; null for a listener. */
+    private final String target;
+    volatile Forwarder forwarder;
 
-    Listener(Client client) {
+    Listener(Client client, String target) {
         this.client = client;
+        this.target = target;
     }
 
-    void start() {
+    /** Registers, and returns once registered; throws on a final refusal. */
+    void register(Duration timeout) throws IOException {
+        client.checkServable();
+        start();
+        awaitRegistered(timeout);
+    }
+
+    private void start() {
         Thread t = new Thread(this::serve, "pfrelay-serve-" + client.wordLabel());
         t.setDaemon(true);
         t.start();
     }
 
-    void awaitRegistered(Duration timeout) throws IOException {
+    private void awaitRegistered(Duration timeout) throws IOException {
         try {
             boolean done;
             if (timeout == null) {
@@ -130,7 +141,7 @@ public final class Listener implements Closeable {
             });
         }
         for (Conn c : drop) {
-            c.fail("the serving side stopped listening");
+            c.fail(REASON_STOPPED);
         }
     }
 
@@ -146,8 +157,9 @@ public final class Listener implements Closeable {
     // ---------- the registration loop (docs/PROTOCOL.md §9) ----------
 
     private void serve() {
-        Map<String, String> h = client.serveHeader();
-        long backoff = Client.retryMinMs;
+        Map<String, String> h = client.serveHeader(target);
+        Timing timing = client.timing();
+        long backoff = timing.retryMinMs();
         boolean served = false;
         String base = client.server();
         for (int attempt = 1;; attempt++) {
@@ -157,7 +169,7 @@ public final class Listener implements Closeable {
             WebSocket ws = null;
             IOException err = null;
             try {
-                ws = client.openWs("serve", new java.util.LinkedHashMap<>(h));
+                ws = client.openWs(Endpoint.SERVE, new java.util.LinkedHashMap<>(h));
             } catch (IOException e) {
                 err = e;
             }
@@ -190,15 +202,17 @@ public final class Listener implements Closeable {
                 if (closed) { // close() may have missed it
                     ws.abort();
                 }
-                IOException lost = control(ws);
+                client.serving(true);
+                IOException lost = control(ws, timing);
                 up = false;
                 control = null;
+                client.serving(false);
                 if (closed) {
                     return;
                 }
                 long lasted = (System.nanoTime() - started) / 1_000_000L;
-                if (lasted >= Client.settledMs) {
-                    backoff = Client.retryMinMs;
+                if (lasted >= timing.settledMs()) {
+                    backoff = timing.retryMinMs();
                 }
                 client.log("lost the server after " + lasted / 1000.0 + "s (" + lost.getMessage()
                         + "); its connections are closed; registering again in " + backoff / 1000.0 + "s");
@@ -206,7 +220,7 @@ public final class Listener implements Closeable {
             if (!sleep(backoff)) {
                 return;
             }
-            backoff = Math.min(backoff * 2, Client.retryMaxMs);
+            backoff = timing.next(backoff);
         }
     }
 
@@ -216,12 +230,12 @@ public final class Listener implements Closeable {
     }
 
     /** Runs one control channel until it fails (docs/PROTOCOL.md §7). */
-    private IOException control(WebSocket ws) {
+    private IOException control(WebSocket ws, Timing timing) {
         ScheduledFuture<?> pinger = null;
         try {
-            ws.setReadTimeout(Client.controlSilenceMs);
+            ws.setReadTimeout(timing.controlSilenceMs());
             ws.setWriteTimeout(Client.CONTROL_WRITE_TIMEOUT_MS);
-            pinger = Sched.every(Client.controlPingMs, () -> {
+            pinger = Sched.every(timing.controlPingMs(), () -> {
                 try {
                     ws.tryWriteFrame(WebSocket.OP_PING, new byte[0]);
                 } catch (IOException e) {
@@ -256,7 +270,7 @@ public final class Listener implements Closeable {
                 }
             }
         } catch (java.net.SocketTimeoutException e) {
-            return new IOException("the control channel was silent for " + Client.controlSilenceMs / 1000 + "s");
+            return new IOException("the control channel was silent for " + timing.controlSilenceMs() / 1000 + "s");
         } catch (IOException e) {
             return e;
         } finally {
@@ -282,16 +296,20 @@ public final class Listener implements Closeable {
 
     /** Answers the hub's request for connection id. */
     private void open(String id) {
+        if (target != null) {
+            forward(id);
+            return;
+        }
         if (!slots.tryAcquire()) {
             client.log("connection " + Client.shortId(id) + " refused: " + BACKLOG
                     + " connections are waiting to be accepted");
-            client.refuse(id, "the serving side is not accepting connections fast enough");
+            client.refuse(id, REASON_BACKLOG);
             return;
         }
         Conn c;
         try {
-            WebSocket ws = client.openWs("accept", client.header(id));
-            c = new Conn(ws, client.registry, id, Side.SERVE);
+            WebSocket ws = client.openWs(Endpoint.ACCEPT, client.header(id));
+            c = new Conn(ws, client, new ConnId(id), Side.SERVE);
         } catch (IOException e) {
             slots.release();
             client.log("connection " + Client.shortId(id) + " failed: cannot bring it to the server: "
@@ -306,8 +324,50 @@ public final class Listener implements Closeable {
             }
         }
         slots.release();
-        c.fail("the serving side stopped listening");
+        c.fail(REASON_STOPPED);
     }
+
+    /**
+     * Carries connection id to the target. The target is reached first, so
+     * that one that cannot be reached is refused with a reason the
+     * connecting side hears at once (docs/PROTOCOL.md §9).
+     */
+    private void forward(String id) {
+        String shortId = Client.shortId(id);
+        java.net.Socket local;
+        try {
+            local = Bridge.dialTarget(target);
+        } catch (IOException | IllegalArgumentException e) {
+            client.log("connection " + shortId + " failed: cannot reach the target " + target + ": "
+                    + e.getMessage());
+            client.refuse(id, REASON_UNREACHABLE);
+            return;
+        }
+        Conn c;
+        try {
+            c = new Conn(client.openWs(Endpoint.ACCEPT, client.header(id)), client, new ConnId(id), Side.SERVE);
+        } catch (IOException e) {
+            client.log("connection " + shortId + " failed: cannot bring it to the server: " + e.getMessage());
+            Bridge.closeQuietly(local);
+            return;
+        }
+        Forwarder f = forwarder;
+        if (closed || !f.track(c)) {
+            c.fail(Bridge.SERVE.self + " is stopping");
+            Bridge.closeQuietly(local);
+            return;
+        }
+        client.log("connection " + shortId + " open: tunnel -> " + target);
+        try {
+            Bridge.run(client, c, local, Bridge.SERVE, f);
+        } finally {
+            f.untrack(c);
+        }
+    }
+
+    static final String REASON_UNREACHABLE = "the serving side could not reach its target";
+    static final String REASON_BACKLOG = "the serving side is not accepting connections fast enough";
+    static final String REASON_STOPPED = "the serving side stopped listening";
 
     @Override
     public String toString() {

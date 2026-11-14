@@ -28,6 +28,19 @@ pub(crate) trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Io for T {}
 pub(crate) type Stream = Box<dyn Io>;
 
+/// Opens a stream to the hub: TLS over TCP, or a pipe to a fake hub in
+/// tests.
+pub(crate) type Connector =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Stream>> + Send>> + Send + Sync>;
+
+/// The connector to a real hub.
+pub(crate) fn tls_connector(base: Base, tls: Arc<ClientConfig>) -> Connector {
+    Arc::new(move || {
+        let (base, tls) = (base.clone(), tls.clone());
+        Box::pin(async move { Ok(Box::new(connect_tls(&base, &tls).await?) as Stream) })
+    })
+}
+
 /// A response's status and headers.
 #[derive(Debug, Default)]
 pub(crate) struct Head {
@@ -78,24 +91,24 @@ pub(crate) async fn connect_tls(base: &Base, tls: &Arc<ClientConfig>) -> Result<
 /// a plain GET, and reads the answer, all within the handshake limit.
 pub(crate) async fn request(
     base: &Base,
-    tls: &Arc<ClientConfig>,
+    connect: &Connector,
     path: &str,
     headers: &[(&str, String)],
     upgrade: bool,
 ) -> Result<Answer> {
-    tokio::time::timeout(HANDSHAKE_LIMIT, request_inner(base, tls, path, headers, upgrade))
+    tokio::time::timeout(HANDSHAKE_LIMIT, request_inner(base, connect, path, headers, upgrade))
         .await
         .map_err(|_| Error::Link(format!("{} did not answer in time", base.url())))?
 }
 
 async fn request_inner(
     base: &Base,
-    tls: &Arc<ClientConfig>,
+    connect: &Connector,
     path: &str,
     headers: &[(&str, String)],
     upgrade: bool,
 ) -> Result<Answer> {
-    let mut stream = connect_tls(base, tls).await?;
+    let mut stream = connect().await?;
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: {}\r\n", base.authority);
     for (name, value) in headers {
         if value.bytes().any(|b| b == b'\r' || b == b'\n') {
@@ -138,7 +151,7 @@ async fn request_inner(
         if head.get("Sec-WebSocket-Accept") != Some(crate::ws::accept_key(key).as_str()) {
             return Err(Error::Protocol("the server's websocket handshake is invalid".into()));
         }
-        return Ok(Answer::Upgraded(Box::new(Upgraded { stream: Box::new(stream), leftover: rest, head })));
+        return Ok(Answer::Upgraded(Box::new(Upgraded { stream, leftover: rest, head })));
     }
     let body = read_body(&mut stream, &head, rest).await;
     Ok(Answer::Plain { head, body })
@@ -172,7 +185,7 @@ pub(crate) fn parse_head(raw: &[u8]) -> Result<Head> {
 
 /// Reads up to MAX_BODY of a response body: by its length, chunked, or up
 /// to the end of the connection. Whatever fails just ends the body.
-async fn read_body(stream: &mut Tls, head: &Head, mut buf: Vec<u8>) -> Vec<u8> {
+async fn read_body(stream: &mut Stream, head: &Head, mut buf: Vec<u8>) -> Vec<u8> {
     if head.status == 204 || head.status == 304 || (100..200).contains(&head.status) {
         return Vec::new();
     }

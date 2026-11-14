@@ -42,7 +42,6 @@ type Client struct {
 	// console, such as "pf-client 0.15.0". Nothing is decided from it.
 	// Empty means DefaultAgent.
 	Agent string
-	reg   registry // connections and totals
 
 	// Target is what Listen tells the server's console the tunnel leads
 	// to. Empty means "listener". Serve sends its own target instead.
@@ -50,6 +49,11 @@ type Client struct {
 	// ClientToken is a second secret the serving side may ask of whoever
 	// connects. Serve registers it, and the connecting side must send it.
 	ClientToken string
+	// Events are called as connections open and close, and as the
+	// tunnel comes and goes. None is set by default.
+	Events Events
+
+	reg registry // connections and totals
 }
 
 // NewClient checks the relay URL and the word. tlsConfig may be nil.
@@ -307,7 +311,9 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 		h := c.header(id)
 		if !taken.CompareAndSwap(false, true) {
 			c.logf("connection %s refused: this side carries one connection, and has one", short(id))
-			h.Set(tunnel.HeaderError, "the serving side carries a single connection and already has one")
+			const reason = "the serving side carries a single connection and already has one"
+			c.refused(id, reason)
+			h.Set(tunnel.HeaderError, reason)
 			_ = c.get(ctx, "accept", h)
 			return
 		}
@@ -324,8 +330,9 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 		defer stop()
 		rec := c.reg.add(id, SideServe, stream)
+		c.opened(rec)
 		e := bridge(ctx, stream, local, partyServeStdio, rec)
-		c.reg.finish(rec, e.err != nil)
+		c.closed(rec, e.err)
 		c.logEnd(short(id), started, e, true)
 		if e.err != nil {
 			done <- &endError{e.reason, e.err}
@@ -389,10 +396,12 @@ func (c *Client) serve(ctx context.Context, target string, open func(id string),
 			if up != nil {
 				up(true)
 			}
+			c.serving(true)
 			err = c.control(ctx, ws, open)
 			if up != nil {
 				up(false)
 			}
+			c.serving(false)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -408,16 +417,22 @@ func (c *Client) serve(ctx context.Context, target string, open func(id string),
 	}
 }
 
-// Watch reports, in the log, whether the tunnel can be reached, until ctx
-// ends. It is for the connecting side, which keeps listening either way:
-// a tunnel that is not there yet, or goes away, costs nothing but refused
-// connections until it is back.
+// Watch checks, until ctx ends, whether the tunnel can be reached, and
+// says so in the log. It is for the connecting side, which keeps listening
+// either way: a tunnel that is not there yet, or goes away, costs nothing
+// but refused connections until it is back. Events.OnTunnel hears the
+// first result and then every change: up, or down with why. A tunnel that
+// is up is checked every 30 seconds; one that is down sooner, from 1
+// second doubling to 30.
 func (c *Client) Watch(ctx context.Context) {
 	backoff, up := retryMin, false
 	for first := true; ; first = false {
 		err := c.Check(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if c.Events.OnTunnel != nil && (first || up != (err == nil)) {
+			c.Events.OnTunnel(err == nil, err)
 		}
 		wait := recheck
 		switch {
@@ -488,7 +503,9 @@ func (c *Client) serveConn(ctx context.Context, id, target string) {
 	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", target)
 	if err != nil {
 		c.logf("connection %s failed: cannot reach the target %s: %v", short(id), target, err)
-		h.Set(tunnel.HeaderError, "the serving side could not reach its target")
+		const reason = "the serving side could not reach its target"
+		c.refused(id, reason)
+		h.Set(tunnel.HeaderError, reason)
 		if err := c.get(ctx, "accept", h); err != nil {
 			c.logf("connection %s: could not tell the server: %v", short(id), explain(err))
 		}
@@ -505,8 +522,9 @@ func (c *Client) serveConn(ctx context.Context, id, target string) {
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
 	rec := c.reg.add(id, SideServe, stream)
+	c.opened(rec)
 	e := bridge(ctx, stream, conn.(*net.TCPConn), partyServe, rec)
-	c.reg.finish(rec, e.err != nil)
+	c.closed(rec, e.err)
 	c.logEnd(short(id), rec.opened, e, true)
 }
 
@@ -782,8 +800,9 @@ func (c *Client) carry(ctx context.Context, local HalfCloser, from string) error
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
 	rec := c.reg.add(fullID, SideConnect, stream)
+	c.opened(rec)
 	e := bridge(ctx, stream, local, partyConnect, rec)
-	c.reg.finish(rec, e.err != nil)
+	c.closed(rec, e.err)
 	c.logEnd(id, started, e, false)
 	if e.err != nil {
 		return &endError{e.reason, e.err}

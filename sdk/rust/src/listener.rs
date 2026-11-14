@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{Client, H_ERROR};
 use crate::conn::{Conn, Side};
 use crate::error::{Error, Result};
+use crate::events::ConnId;
 use crate::http::Upgraded;
 use crate::proto::Endpoint;
 use crate::ws::{self, FrameReader, CONTROL_LIMITS, OP_CLOSE, OP_PING, OP_PONG, OP_TEXT};
@@ -24,20 +25,34 @@ pub const CONTROL_PING: Duration = Duration::from_secs(20);
 /// A control channel that hears nothing for this long is dead.
 pub const CONTROL_SILENCE: Duration = Duration::from_secs(60);
 
-// Retry timing (PROTOCOL.md §9).
-const RETRY_MIN: Duration = Duration::from_secs(1);
-const RETRY_MAX: Duration = Duration::from_secs(30);
-/// A control channel that lasted this long resets the pause.
-const SETTLED: Duration = Duration::from_secs(60);
-
 type Pending = (Conn, OwnedSemaphorePermit);
 
-struct Shared {
-    cancel: CancellationToken,
+pub(crate) struct Shared {
+    pub(crate) cancel: CancellationToken,
     up: AtomicBool,
     slots: Arc<Semaphore>,
     /// Why serving stopped on its own, if it did.
     end: Mutex<Option<Error>>,
+}
+
+impl Shared {
+    pub(crate) fn new() -> Arc<Shared> {
+        Arc::new(Shared {
+            cancel: CancellationToken::new(),
+            up: AtomicBool::new(false),
+            slots: Arc::new(Semaphore::new(LISTEN_BACKLOG)),
+            end: Mutex::new(None),
+        })
+    }
+}
+
+/// What becomes of the connections the hub offers.
+#[derive(Clone)]
+pub(crate) enum Handler {
+    /// Queued for `Listener::accept`.
+    Listen(mpsc::Sender<Pending>),
+    /// Carried to this TCP target by the forwarder.
+    Forward(Arc<str>),
 }
 
 /// Serves the tunnel and hands each connection to [`Listener::accept`].
@@ -65,18 +80,18 @@ impl Client {
     /// as 409, a word of another tenant), a hub too old for what was asked
     /// as [`Error::Proto`]. Anything else, including a hub that cannot be
     /// reached, is retried with a pause of 1 second doubling up to 30.
+    ///
+    /// At most [`LISTEN_BACKLOG`] connections wait for `accept`; more are
+    /// refused at once with a reason, and reported to
+    /// [`Events::on_refuse`](crate::Events::on_refuse).
     pub async fn listen(&self) -> Result<Listener> {
-        let shared = Arc::new(Shared {
-            cancel: CancellationToken::new(),
-            up: AtomicBool::new(false),
-            slots: Arc::new(Semaphore::new(LISTEN_BACKLOG)),
-            end: Mutex::new(None),
-        });
+        let shared = Shared::new();
         // Should this future be dropped while waiting, serving stops.
         let guard = shared.cancel.clone().drop_guard();
         let (tx, rx) = mpsc::channel(LISTEN_BACKLOG);
         let (reg_tx, reg_rx) = oneshot::channel();
-        tokio::spawn(serve_loop(self.clone(), shared.clone(), tx, reg_tx));
+        let target = self.inner.target.clone();
+        tokio::spawn(serve_loop(self.clone(), shared.clone(), Handler::Listen(tx), target, Some(reg_tx)));
         match reg_rx.await {
             Ok(Ok(())) => {
                 guard.disarm();
@@ -136,9 +151,12 @@ impl Drop for Listener {
     }
 }
 
+const STOPPED_LISTENING: &str = "the serving side stopped listening";
+const BACKLOG_FULL: &str = "the serving side is not accepting connections fast enough";
+
 fn drop_pending(conn: Conn) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
-        rt.spawn(async move { conn.fail("the serving side stopped listening").await });
+        rt.spawn(async move { conn.fail(STOPPED_LISTENING).await });
     }
 }
 
@@ -150,39 +168,59 @@ async fn sleep(cancel: &CancellationToken, d: Duration) -> bool {
 }
 
 /// Keeps a control channel registered, and answers each open on its own
-/// task. The first registration's outcome goes to `registered`.
-async fn serve_loop(c: Client, sh: Arc<Shared>, tx: mpsc::Sender<Pending>, registered: oneshot::Sender<Result<()>>) {
-    let mut registered = Some(registered);
-    let mut backoff = RETRY_MIN;
+/// task, until `sh.cancel`. The first registration's outcome also goes to
+/// `registered`. It returns an error only for a refusal that waiting cannot
+/// cure.
+pub(crate) async fn serve_loop(
+    c: Client,
+    sh: Arc<Shared>,
+    handler: Handler,
+    target: String,
+    registered: Option<oneshot::Sender<Result<()>>>,
+) -> Result<()> {
+    let timing = c.inner.timing;
+    let mut registered = registered;
+    let mut backoff = timing.retry_min;
     let mut served = false;
     let mut attempt = 0u32;
-    let headers = c.serve_headers();
+    let headers = c.serve_headers(&target);
     let label = c.word_label();
     loop {
         attempt += 1;
         let result = tokio::select! {
-            _ = sh.cancel.cancelled() => return,
+            _ = sh.cancel.cancelled() => return Ok(()),
             r = c.upgrade(Endpoint::Serve, headers.clone()) => r,
         };
         match result {
             Err(e) if matches!(e, Error::Proto(_)) || (!served && e.is_final()) => {
                 // Waiting will not change it.
                 c.log(&format!("cannot register with {}: {e}", c.server()));
-                stop(&sh, registered.take(), e);
-                return;
+                let out = match registered.take() {
+                    Some(r) => {
+                        let _ = r.send(Err(e));
+                        Err(Error::Closed)
+                    }
+                    None if served => {
+                        *sh.end.lock().unwrap() = Some(Error::Protocol(e.to_string()));
+                        Err(e)
+                    }
+                    None => Err(e),
+                };
+                sh.cancel.cancel();
+                return out;
             }
             Err(e) => {
                 c.log(&format!(
-                    "cannot register with {} ({e}); attempt {attempt}, trying again in {}s",
+                    "cannot register with {} ({e}); attempt {attempt}, trying again in {:?}",
                     c.server(),
-                    backoff.as_secs()
+                    backoff
                 ));
             }
             Ok(up) => {
                 if served {
-                    c.log(&format!("registered again with {} after {attempt} attempt(s): tunnel {label}", c.server()));
+                    c.log(&format!("registered again with {} after {attempt} attempt(s): tunnel {label} -> {target}", c.server()));
                 } else {
-                    c.log(&format!("registered with {}: tunnel {label}", c.server()));
+                    c.log(&format!("registered with {}: tunnel {label} -> {target}", c.server()));
                 }
                 served = true;
                 attempt = 0;
@@ -190,38 +228,27 @@ async fn serve_loop(c: Client, sh: Arc<Shared>, tx: mpsc::Sender<Pending>, regis
                 if let Some(r) = registered.take() {
                     let _ = r.send(Ok(()));
                 }
+                c.events().serving(true);
                 let started = Instant::now();
-                let why = control(&c, &sh, &tx, up).await;
+                let why = control(&c, &sh, &handler, up).await;
                 sh.up.store(false, Ordering::Release);
+                c.events().serving(false);
                 if sh.cancel.is_cancelled() {
-                    return;
+                    return Ok(());
                 }
-                if started.elapsed() >= SETTLED {
-                    backoff = RETRY_MIN;
+                if started.elapsed() >= timing.settled {
+                    backoff = timing.retry_min;
                 }
                 c.log(&format!(
-                    "lost the server ({why}); its connections are closed; registering again in {}s",
-                    backoff.as_secs()
+                    "lost the server ({why}); its connections are closed; registering again in {backoff:?}"
                 ));
             }
         }
         if !sleep(&sh.cancel, backoff).await {
-            return;
+            return Ok(());
         }
-        backoff = (backoff * 2).min(RETRY_MAX);
+        backoff = timing.next(backoff);
     }
-}
-
-fn stop(sh: &Shared, registered: Option<oneshot::Sender<Result<()>>>, e: Error) {
-    match registered {
-        Some(r) => {
-            let _ = r.send(Err(e));
-        }
-        None => {
-            *sh.end.lock().unwrap() = Some(e);
-        }
-    }
-    sh.cancel.cancel();
 }
 
 /// The connection id in an open message, if it is one (PROTOCOL.md §7).
@@ -232,7 +259,7 @@ pub(crate) fn parse_open(payload: &[u8]) -> Option<String> {
 }
 
 /// Runs one control channel until it ends, and says why.
-async fn control(c: &Client, sh: &Arc<Shared>, tx: &mpsc::Sender<Pending>, up: Upgraded) -> String {
+async fn control(c: &Client, sh: &Arc<Shared>, handler: &Handler, up: Upgraded) -> String {
     let (r, mut w) = tokio::io::split(up.stream);
     let mut frames = FrameReader::new(r, up.leftover, CONTROL_LIMITS, CONTROL_SILENCE);
     let mut ping = tokio::time::interval_at(Instant::now() + CONTROL_PING, CONTROL_PING);
@@ -255,7 +282,7 @@ async fn control(c: &Client, sh: &Arc<Shared>, tx: &mpsc::Sender<Pending>, up: U
                 Ok(f) => match f.op {
                     OP_TEXT if f.fin => {
                         if let Some(id) = parse_open(&f.payload) {
-                            tokio::spawn(open(c.clone(), sh.clone(), tx.clone(), id));
+                            tokio::spawn(open(c.clone(), sh.clone(), handler.clone(), id));
                         }
                     }
                     OP_PING => {
@@ -281,12 +308,26 @@ async fn write<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, op: u8, payload: &[u
         .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out")))
 }
 
-fn short(id: &str) -> &str {
+pub(crate) fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+/// Refuses connection `id` through `accept`, telling the far end `reason`.
+pub(crate) async fn refuse(c: &Client, id: &str, reason: &str) {
+    c.events().refused(&ConnId::new(id), reason);
+    let mut h = c.accept_headers(id);
+    h.push((H_ERROR, reason.to_string()));
+    if let Err(e) = c.get(Endpoint::Accept, h).await {
+        c.log(&format!("connection {}: could not tell the server: {e}", short(id)));
+    }
+}
+
 /// Answers the hub's open message for connection `id`.
-async fn open(c: Client, sh: Arc<Shared>, tx: mpsc::Sender<Pending>, id: String) {
+async fn open(c: Client, sh: Arc<Shared>, handler: Handler, id: String) {
+    let tx = match handler {
+        Handler::Forward(target) => return crate::forward::serve_one(&c, &sh.cancel, &id, &target).await,
+        Handler::Listen(tx) => tx,
+    };
     let slot = match sh.slots.clone().try_acquire_owned() {
         Ok(slot) => slot,
         Err(_) => {
@@ -294,10 +335,7 @@ async fn open(c: Client, sh: Arc<Shared>, tx: mpsc::Sender<Pending>, id: String)
                 "connection {} refused: {LISTEN_BACKLOG} connections are waiting to be accepted",
                 short(&id)
             ));
-            let mut h = c.accept_headers(&id);
-            h.push((H_ERROR, "the serving side is not accepting connections fast enough".into()));
-            let _ = c.get(Endpoint::Accept, h).await;
-            return;
+            return refuse(&c, &id, BACKLOG_FULL).await;
         }
     };
     let up = match c.upgrade(Endpoint::Accept, c.accept_headers(&id)).await {
@@ -307,13 +345,13 @@ async fn open(c: Client, sh: Arc<Shared>, tx: mpsc::Sender<Pending>, id: String)
             return;
         }
     };
-    let conn = Conn::start(up, id, Side::Serve, c.inner.registry.clone());
+    let conn = Conn::start(up, &id, Side::Serve, c.inner.registry.clone());
     if sh.cancel.is_cancelled() {
-        conn.fail("the serving side stopped listening").await;
+        conn.fail(STOPPED_LISTENING).await;
         return;
     }
     if let Err(mpsc::error::SendError((conn, _))) = tx.send((conn, slot)).await {
-        conn.fail("the serving side stopped listening").await;
+        conn.fail(STOPPED_LISTENING).await;
     }
 }
 

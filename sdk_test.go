@@ -106,7 +106,7 @@ func TestSDKConnsAndDeadlines(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer accepted.Close()
-	if accepted.ID() != conn.ID() || len(conn.ID()) != 16 {
+	if accepted.ID() != conn.ID() || len(conn.ID().String()) != 16 {
 		t.Errorf("ids: connect %q, serve %q", conn.ID(), accepted.ID())
 	}
 

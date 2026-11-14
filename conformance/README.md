@@ -33,17 +33,30 @@ connecting through its dial API, so the suite tests what users get.
 ```
 driver serve   --server URL --ca FILE --word WORD --target HOST:PORT
                [--serve-token T] [--client-token T] [--name NAME]
+               [--mode listen|forward] [--no-accept]
 driver connect --server URL --ca FILE --word WORD --listen HOST:PORT
-               [--client-token T]
+               [--client-token T] [--mode listen|forward]
 driver check   --server URL --ca FILE --word WORD [--client-token T]
 driver version --server URL --ca FILE --serve-token T
 ```
 
+`--mode` chooses which part of the SDK carries connections:
+
+- `listen` (the default) uses the listen/accept and dial API, with the
+  driver's own copy loop.
+- `forward` uses the SDK's forwarders: serving to a TCP target, and
+  connecting a local TCP listener.
+
+The driver SHOULD define its commands, modes, queries, events and outcomes
+as constants or enums of its language, not as string literals scattered
+through the code. The Go driver (`go-driver/main.go`) shows the shape.
+
 Flags may come in any order. Rules that apply to every command:
 
-- **TLS.** `--ca` is a PEM file holding the hub's certificate, which is
-  self-signed for `127.0.0.1`. The driver MUST trust that certificate and
-  verify the hub against it. It MUST NOT turn verification off.
+- **TLS.** `--ca` is a PEM file holding a test CA. The hub's certificate
+  is a leaf for `127.0.0.1` that this CA signed, as with a hub that issues
+  its own certificates. The driver MUST trust that CA and verify the hub
+  against it. It MUST NOT turn verification off or loosen it.
 - **Agent.** The driver SHOULD send an `X-PF-Version` that names the SDK,
   such as `pfrelay-py 0.1.0 conformance`.
 - **Output.** Diagnostics go to stderr. Stdout carries only the lines below.
@@ -57,12 +70,44 @@ Flags may come in any order. Rules that apply to every command:
   | 3 | protocol error: the hub is too old for what was asked (PROTOCOL.md §5.3) |
   | 4 | access denied: the hub answered 403 |
 
+### Events
+
+While `serve` or `connect` runs, the driver installs the SDK's event
+handlers and prints one line for each event. The tokens in each line are
+separated by single spaces:
+
+| Line | When |
+|---|---|
+| `ready` | the first time the tunnel is registered (`serve`) |
+| `opened <id> <side>` | a connection opened; `<side>` is `connect` or `serve` |
+| `closed <id> <sent> <received> ok\|failed` | a connection ended, exactly once per `opened`, with its final byte counts; `failed` when the SDK reports an error |
+| `refused <id>` | this side refused a connection the hub offered (backlog full, target unreachable) |
+| `tunnel up`, `tunnel down` | the SDK's watch: the first result, then every change (`connect`) |
+
+`<id>` is the connection id as the SDK's opaque id type prints it: the
+hub's 16 hex digits.
+
+### Queries
+
+While `serve` or `connect` runs, the driver reads lines from stdin and
+answers each one on stdout with a single line: the query's name, a space,
+and then JSON.
+
+| Query | Answer |
+|---|---|
+| `stats` | `stats {"opened":N,"active":N,"failed":N,"sent":N,"received":N}`, from the SDK's stats |
+| `conns` | `conns [{"id":"…","side":"connect","sent":N,"received":N}, …]`, from the SDK's list of open connections |
+| `drop <id>` | `drop true` or `drop false`, from the SDK's drop-by-id. The driver drops the connection with the reason `dropped by the conformance suite` |
+
 ### `serve`
 
-1. Register the tunnel (the SDK's listen). On success, print `ready` and
-   flush stdout. On a refusal that waiting cannot cure, exit with the code
-   above.
-2. For each accepted connection, dial `--target` over TCP. If the dial
+1. Register the tunnel. In `listen` mode that means the SDK's listen; in
+   `forward` mode, its forwarder to `--target`. On success, print `ready`
+   and flush stdout. On a refusal that waiting cannot cure, exit with the
+   code above.
+2. With `--no-accept` (`listen` mode only), register but never accept a
+   connection, so that the backlog fills.
+3. In `listen` mode, for each accepted connection, dial `--target` over TCP. If the dial
    fails, fail the connection with a reason; any text will do, such as
    `the serving side could not reach its target`. Otherwise copy both ways
    until both directions finish:
@@ -71,17 +116,20 @@ Flags may come in any order. Rules that apply to every command:
      stream's half-close;
    - if either side fails, fail the stream with a reason and close both
      ends.
-3. Keep serving, and register again after losing the hub, until it gets
+4. Keep serving, and register again after losing the hub, until it gets
    SIGTERM. Then exit 0.
 
 ### `connect`
 
 1. Listen on `--listen` over TCP; port 0 means any port. Print
    `listening HOST:PORT` with the address actually bound, and flush stdout.
-2. For each accepted TCP connection, open a connection through the tunnel
-   (the SDK's dial), and copy both ways as `serve` does. If the dial fails,
-   close the TCP connection and say why on stderr.
-3. Run until SIGTERM, then exit 0.
+2. Start the SDK's watch, which prints `tunnel up` and `tunnel down`.
+3. In `listen` mode, for each accepted TCP connection, open a connection
+   through the tunnel (the SDK's dial), and copy both ways as `serve`
+   does. If the dial fails, close the TCP connection and say why on
+   stderr. In `forward` mode, hand the listener to the SDK's connect
+   forwarder.
+4. Run until SIGTERM, then exit 0.
 
 ### `check`
 
@@ -112,6 +160,13 @@ a 403.
 | protocol 0 hub | features of protocol 1 are refused (§5.3); plain tunnels still work |
 | version | the probe, and its refusal |
 | serve/registers again after losing the hub | the retry loop (§9) |
+| serve/retries with a growing pause | the first three registrations are refused with 503; the pauses are 1s, 2s and 4s (§9) |
+| serve/a full backlog refuses with a reason | with `--no-accept`, 128 connections wait and the rest are refused with a reason, and reported as `refused` (§9) |
+| stats/connect side, stats/serve side (both modes) | `stats` and `conns` agree with what was sent, the ids are the hub's, and `opened`/`closed` come exactly once per connection with the right figures |
+| serve/drop a connection by its id (both modes) | dropping by id reaches the far end with the reason, and the connection closes as `failed` |
+| forward/serve, forward/connect | echo through the forwarders |
+| forward/serve: an unreachable target is reported at once | the forwarder refuses through `accept` with a reason, so the far end hears it on its first read |
+| connect/watch reports the tunnel coming up | `tunnel down`, then `tunnel up` once someone serves |
 | idle connections stay up (slow) | pings on streams and on the control channel (§7, §8.5) |
 
 ## Adding an SDK

@@ -41,7 +41,7 @@ try (Listener listener = client.listen()) {    // returns once registered
         Conn conn = listener.accept();
         new Thread(() -> {
             try (Socket target = new Socket("localhost", 22)) {
-                pipe(conn, target);            // copy both ways, see below
+                pipe(conn, target);            // your copy loop, such as the conformance driver's pipe
             } catch (java.io.IOException e) {
                 conn.fail("the serving side could not reach its target");
             }
@@ -83,52 +83,83 @@ The hub answers `dial()` before the serving side has: when the serving side
 cannot reach its target, the first read throws a `RemoteException` with its
 reason.
 
-## Copying both ways
+## Forwarders
+
+To carry TCP connections, let the SDK do the copying: it passes half-closes
+on, and when something breaks it tells the far end which hop broke.
 
 ```java
-static void pipe(Conn conn, Socket local) throws java.io.IOException {
-    Thread up = new Thread(() -> {
-        try {
-            local.getInputStream().transferTo(conn.getOutputStream());
-            conn.shutdownOutput();             // TCP EOF -> the stream's half-close
-        } catch (java.io.IOException e) {
-            conn.fail("the local connection failed: " + e.getMessage());
-        }
-    });
-    up.start();
-    try {
-        conn.getInputStream().transferTo(local.getOutputStream());
-        local.shutdownOutput();                // the stream's half-close -> TCP shutdown
-        up.join();
-        conn.close();                          // clean when both ends half-closed
-    } catch (java.io.IOException e) {
-        conn.fail(e.getMessage());
-    } catch (InterruptedException e) {
-        conn.fail("interrupted");
-    } finally {
-        local.close();
-    }
+// serving: the target is reached before the hub is answered, so an
+// unreachable target is refused at once, with a reason the far end hears
+try (Forwarder f = client.serve("localhost:22")) {      // returns once registered
+    Thread.sleep(Long.MAX_VALUE);
+}
+
+// connecting: every local connection goes through the tunnel
+try (ServerSocket local = new ServerSocket(2222);
+     Forwarder f = client.connect(local);
+     Watcher w = client.watch()) {                       // onTunnel: up and down
+    Thread.sleep(Long.MAX_VALUE);
 }
 ```
 
-The conformance driver, `src/conformance/java/.../Driver.java`, is a
-complete example.
+Closing a forwarder stops it and drops the connections it carries, telling
+their far ends that this side is stopping. The conformance driver,
+`src/conformance/java/.../Driver.java`, shows the listen/accept and dial
+API used with a copy loop of its own.
+
+## Events
+
+```java
+Client client = Client.builder()
+        .server("https://hub.example.com")
+        .word("k3f9-x2mq-7hpa")
+        .events(new ClientEvents() {
+            @Override public void onOpen(ConnInfo info) {
+                System.out.println("open " + info.id() + " " + info.side());
+            }
+            @Override public void onClose(ConnInfo info, IOException error) {
+                System.out.println("closed " + info.id() + (error == null ? "" : ": " + error.getMessage()));
+            }
+        })
+        .build();
+```
+
+Every method of `ClientEvents` does nothing by default. They are called
+synchronously, on the SDK's thread where the event happened, so a handler
+**must return quickly and must not block**. It may call `drop`, `conns`
+and `stats`.
+
+| Event | When |
+|---|---|
+| `onServing(up)` | a listener or serve forwarder registered (true) or lost its registration (false) |
+| `onTunnel(up, error)` | a watcher's first result, then every change |
+| `onOpen(info)` | a connection opened: dialed, accepted, or carried by a forwarder |
+| `onClose(info, error)` | exactly once per `onOpen`, with the final figures; `error` is null after a clean finish |
+| `onRefuse(id, reason)` | this side refused a connection: the backlog was full, or the target could not be reached |
 
 ## API overview
 
 | Type | What it is |
 |---|---|
-| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.1.0`), `logger`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
-| `Client.listen()`, `listen(Duration)` | Register and return a `Listener`. |
+| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.1.0`), `logger`, `events`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
+| `Client.listen()`, `listen(Duration)` | Register, and return a `Listener`. |
+| `Client.serve(target)`, `serve(target, Duration)` | Register, and forward each connection to a TCP `host:port`; returns a `Forwarder`. |
 | `Client.dial()` | Open one connection; a `Conn`. |
+| `Client.connect(ServerSocket)` | Forward each local connection through the tunnel; returns a `Forwarder`. |
+| `Client.watch()` | Check the tunnel until closed (every 30 s while it is up, from 1 s doubling to 30 s while it is down); a `Watcher` with `isUp()`, `lastError()`, `close()`. |
 | `Client.check()` | Returns if someone serves the word; throws `AccessDeniedException` otherwise. |
 | `Client.probe()` | The hub's `ServerInfo` (version, protoMin, protoMax, token); needs a serve token. |
-| `Client.stats()`, `conns()` | Local bookkeeping: `Stats` (opened, active, failed, sent, received) and the open connections as `ConnInfo` (id, side, opened, sent, received, wroteEof, readEof). |
-| `Listener` | `accept()`, `isUp()`, `close()`. At most 128 connections wait for `accept()`; more are refused and their connecting side is told why. |
+| `Client.drop(ConnId, reason)` | Drop an open connection, telling its far end why; false if no such connection is open. |
+| `Client.stats()`, `conns()` | Local bookkeeping: `Stats` (opened, active, failed, sent, received) and the open connections as `ConnInfo` (id, side, opened, sent, received, wroteEof, readEof), every connection included, forwarded or not. |
+| `Listener` | `accept()`, `isUp()`, `close()`. At most 128 connections wait for `accept()`; more are refused at once, their connecting side is told why, and `onRefuse` hears of it. |
+| `Forwarder` | `isUp()`, `isClosed()`, `close()`. |
 | `Conn` | `getInputStream()` (-1 at the far end's half-close), `getOutputStream()` (closing it half-closes), `shutdownOutput()`, `fail(reason)`, `close()`, `error()`, `id()`, `info()`, `setSoTimeout(ms)`. |
+| `ConnId` | The hub's id for a connection, the same on both ends: opaque, with `equals`, `hashCode`, `toString()` (16 hex digits) and `shortForm()`. |
+| `Side` | `CONNECT` or `SERVE`; prints as `connect` or `serve`. |
 | `Words` | `newWord()`, `normalize(word)`. |
 | `Tls` | `trusting(Path pem)`: an `SSLContext` that trusts a PEM file. |
-| Exceptions | All are `IOException`s: `StatusException` (`code()`, `hubMessage()`, `isFinal()`), its subclass `AccessDeniedException` (403), `ProtoException` (`serverProto()`, `need()`), `RemoteException` (`reason()`). |
+| Exceptions | All are `IOException`s: `StatusException` (`code()`, `hubMessage()`, `isFinal()`), its subclass `AccessDeniedException` (403), `ProtoException` (`serverProto()`, `need()`), `RemoteException` (`reason()`: the far end or the hub said why), `DroppedException` (`reason()`: this side dropped it, with `fail` or `drop`). |
 
 ### Behavior worth knowing
 
@@ -148,9 +179,12 @@ complete example.
 - **Keepalive.** Each `Conn` pings every 10 seconds and gives up after 30
   seconds of silence; the control channel pings every 20 seconds and gives
   up after 60. Nothing relies on pongs.
-- **Threads.** Each `Conn` has a reader thread, and each `Listener` a
-  registration thread; all are daemons. A `Conn` takes one reader and one
-  writer at a time.
+- **Dropping.** `drop(id, reason)` cuts the stream at once; whoever holds
+  the `Conn` sees its reads and writes fail, and `onClose` reports a
+  `DroppedException` when it closes the connection (forwarders do at once).
+- **Threads.** Each `Conn` has a reader thread, each `Listener`, forwarder
+  and watcher a thread of its own; all are daemons. A `Conn` takes one
+  reader and one writer at a time.
 
 ## Conformance
 

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
+import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Optional, Protocol, Union
 
 from . import _ws
-from ._proto import ClosedError, LinkError, RemoteError, clean_reason
-from ._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT, FrameError, WebSocket
+from ._proto import ClosedError, ConnID, DroppedError, LinkError, RemoteError, Side, clean_reason
+from ._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_TEXT, FrameError, PeerClosedError, WebSocket
 
 CHUNK_SIZE = 64 * 1024  # the most a sender puts in one frame
 MAX_DATA_FRAME = 1 << 20  # the most a receiver accepts in one frame
@@ -20,16 +22,32 @@ _INBOX_LIMIT = 1 << 20  # bytes read ahead of the application
 _EOF = b"eof"
 _ERR = b"err:"
 
-SIDE_CONNECT = "connect"
-SIDE_SERVE = "serve"
+log = logging.getLogger("pfrelay")
+
+
+async def emit(handler: Optional[Callable[..., Any]], *args: Any) -> None:
+    """Call an event handler, awaiting it if it is a coroutine function. A
+    handler that raises is logged, never passed on."""
+    if handler is None:
+        return
+    try:
+        result = handler(*args)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # an application's handler must not break the SDK
+        log.exception("pfrelay event handler %r failed", handler)
+
+
+class _Owner(Protocol):
+    async def _conn_closed(self, conn: "Conn", err: Optional[BaseException]) -> None: ...
 
 
 @dataclass(frozen=True)
 class ConnInfo:
     """A snapshot of one connection."""
 
-    id: str
-    side: str  # "connect" or "serve"
+    id: ConnID  # the hub's id, the same on both ends
+    side: Side
     opened: float  # time.time() when it was opened
     sent: int  # bytes sent into the tunnel
     received: int  # bytes received from the tunnel
@@ -60,13 +78,21 @@ class _Registry:
         self.live[id(conn)] = conn
         self.opened += 1
 
-    def finish(self, conn: "Conn", failed: bool) -> None:
+    def finish(self, conn: "Conn", failed: bool) -> bool:
+        """Move conn out of the live set; False if it already was."""
         if self.live.pop(id(conn), None) is None:
-            return
+            return False
         if failed:
             self.failed += 1
         self.sent += conn._sent
         self.received += conn._received
+        return True
+
+    def find(self, cid: ConnID) -> Optional["Conn"]:
+        for c in self.live.values():
+            if c.id == cid:
+                return c
+        return None
 
     def stats(self) -> Stats:
         sent, received = self.sent, self.received
@@ -127,11 +153,17 @@ class Conn:
     _PING_EVERY = 10.0
     _SILENCE = 30.0
 
-    def __init__(self, ws: WebSocket, conn_id: str, side: str, registry: Optional[_Registry] = None):
+    def __init__(
+        self,
+        ws: WebSocket,
+        conn_id: Union[ConnID, str],
+        side: Side,
+        owner: Optional[_Owner] = None,
+    ):
         self._ws = ws
-        self._id = conn_id
-        self._side = side
-        self._registry = registry
+        self._id = conn_id if isinstance(conn_id, ConnID) else ConnID(conn_id)
+        self._side = Side(side)
+        self._owner = owner
         self._opened = time.time()
         self._sent = 0
         self._received = 0
@@ -146,22 +178,22 @@ class Conn:
         self._gone = asyncio.Event()  # the WebSocket has ended
         self._closing = False  # close or fail has begun: errors are ours
         self._failed = False
+        self._broke: Optional[BaseException] = None  # the first error that broke it here
         self._close_sent = False
         self._done = False
-        if registry is not None:
-            registry.add(self)
+        self._dropping = False  # Client.drop has begun to fail it
         ws.start_keepalive(self._PING_EVERY, self._SILENCE)
         self._reader = asyncio.ensure_future(self._pump())
 
     # ---------------------------------------------------------- facts
 
     @property
-    def id(self) -> str:
+    def id(self) -> ConnID:
         """The hub's id for this connection."""
         return self._id
 
     @property
-    def side(self) -> str:
+    def side(self) -> Side:
         return self._side
 
     @property
@@ -224,7 +256,7 @@ class Conn:
                     # any other text frame is ignored
                 elif op == OP_CLOSE:
                     if not self._read_eof and not self._closing and self._failure is None and not inbox.ended:
-                        self._failure = LinkError("the server closed the connection")
+                        self._failure = PeerClosedError("the server closed the connection")
                         inbox.finish(self._failure)
                     await self._send_close()
                     ws.close_transport()
@@ -260,6 +292,7 @@ class Conn:
                 if inbox.ended:
                     if inbox.end is None:
                         return b""
+                    self._break(inbox.end)
                     raise inbox.end
                 inbox.readable.clear()
                 await inbox.readable.wait()
@@ -306,10 +339,9 @@ class Conn:
                     await self._ws.send(OP_BINARY, piece)
                     self._sent += len(piece)
             except (ConnectionError, OSError) as e:
-                self._failed = True
-                if isinstance(e, LinkError):
-                    raise
-                raise LinkError(f"the connection to the server was lost ({e})") from None
+                err = e if isinstance(e, LinkError) else LinkError(f"the connection to the server was lost ({e})")
+                self._break(err)
+                raise err from None
 
     async def close_write(self) -> None:
         """Half-close: the far end reads b"" after what was written so far,
@@ -321,10 +353,9 @@ class Conn:
             try:
                 await self._ws.send(OP_TEXT, _EOF)
             except (ConnectionError, OSError) as e:
-                self._failed = True
-                if isinstance(e, LinkError):
-                    raise
-                raise LinkError(f"the connection to the server was lost ({e})") from None
+                err = e if isinstance(e, LinkError) else LinkError(f"the connection to the server was lost ({e})")
+                self._break(err)
+                raise err from None
 
     # ---------------------------------------------------------- the end
 
@@ -337,12 +368,22 @@ class Conn:
         except (ConnectionError, OSError):
             pass
 
+    def _break(self, err: BaseException) -> None:
+        self._failed = True
+        if self._broke is None:
+            self._broke = err
+
     async def fail(self, reason: str) -> None:
         """Drop the connection and tell the far end why: its read raises a
-        RemoteError with this reason."""
+        RemoteError with this reason. The connection ends with a
+        DroppedError."""
+        await self._fail(reason, DroppedError(reason))
+
+    async def _fail(self, reason: str, err: BaseException) -> None:
         if self._done:
             return
-        self._done = self._closing = self._failed = True
+        self._done = self._closing = True
+        self._break(err)
         reason = "".join(c for c in reason if c.isprintable()) or "the connection was dropped"
         payload = (_ERR + reason.encode("utf-8"))[:MAX_TEXT_FRAME]
         payload = payload.decode("utf-8", "ignore").encode("utf-8")
@@ -352,7 +393,7 @@ class Conn:
         except (ConnectionError, OSError):
             pass
         self._ws.close_transport()
-        self._end(True)
+        await self._end(self._broke)
 
     async def close(self) -> None:
         """End the connection. If this end has not half-closed, it does so
@@ -379,17 +420,19 @@ class Conn:
             self._ws.close_transport()
         else:
             self._ws.abort()
-        self._end(self._failed or self.err is not None)
+        await self._end(self._broke if self._broke is not None else self.err)
 
-    def _end(self, failed: bool) -> None:
+    async def _close_with(self, err: Optional[BaseException]) -> None:
+        """close(), recording err as why the connection ended."""
+        if err is not None:
+            self._break(err)
+        await self.close()
+
+    async def _end(self, err: Optional[BaseException]) -> None:
         self._inbox.close()
         self._ws.stop_keepalive()
-        if not self._reader.done():
-            # Let the reader see the far end's close if it is on its way;
-            # the transport is closed, so it ends on its own.
-            pass
-        if self._registry is not None:
-            self._registry.finish(self, failed)
+        if self._owner is not None:
+            await self._owner._conn_closed(self, err)
 
     async def __aenter__(self) -> "Conn":
         return self
@@ -401,4 +444,4 @@ class Conn:
             await self.close()
 
     def __repr__(self) -> str:
-        return f"<pfrelay.Conn {self._id[:8]} {self._side}>"
+        return f"<pfrelay.Conn {self._id.short} {self._side}>"

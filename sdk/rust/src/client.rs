@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,7 +10,8 @@ use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 
 use crate::conn::{Conn, ConnInfo, Registry, Side, Stats};
 use crate::error::{Error, Result};
-use crate::http::{self, Answer, Head, Upgraded};
+use crate::events::{ConnId, Events};
+use crate::http::{self, Answer, Connector, Head, Upgraded};
 use crate::proto::{self, Endpoint};
 use crate::values::{self, Base};
 
@@ -54,6 +56,40 @@ enum Trust {
 
 type Logger = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// The client's timing (PROTOCOL.md §9). The defaults are what pf-client
+/// does; change them only to test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// A failed registration or check is retried after this pause, which
+    /// doubles each time...
+    pub retry_min: Duration,
+    /// ...up to this.
+    pub retry_max: Duration,
+    /// A control channel that lasted this long starts the pause again from
+    /// `retry_min`.
+    pub settled: Duration,
+    /// [`Client::watch`] checks a tunnel that is up this often.
+    pub recheck: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Timing {
+        Timing {
+            retry_min: Duration::from_secs(1),
+            retry_max: Duration::from_secs(30),
+            settled: Duration::from_secs(60),
+            recheck: Duration::from_secs(30),
+        }
+    }
+}
+
+impl Timing {
+    /// The pause after `pause`: double, up to `retry_max`.
+    pub fn next(&self, pause: Duration) -> Duration {
+        (pause * 2).min(self.retry_max)
+    }
+}
+
 /// Builds a [`Client`].
 pub struct ClientBuilder {
     server: String,
@@ -65,6 +101,9 @@ pub struct ClientBuilder {
     agent: Option<String>,
     trust: Trust,
     log: Option<Logger>,
+    events: Events,
+    timing: Timing,
+    connector: Option<Connector>,
 }
 
 impl ClientBuilder {
@@ -136,6 +175,26 @@ impl ClientBuilder {
         self
     }
 
+    /// The handlers to call as things happen; none by default. They are
+    /// called synchronously and must not block (see [`Events`]).
+    pub fn events(mut self, events: Events) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Retry and recheck timing; [`Timing::default`] unless told otherwise.
+    pub fn timing(mut self, timing: Timing) -> Self {
+        self.timing = timing;
+        self
+    }
+
+    /// Talks to the hub over this connector instead of TLS (tests only).
+    #[cfg(test)]
+    pub(crate) fn connector(mut self, connector: Connector) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+
     /// Checks the settings (PROTOCOL.md §2, §3) and makes the client.
     pub fn build(self) -> Result<Client> {
         let base = Base::parse(&self.server)?;
@@ -152,18 +211,22 @@ impl ClientBuilder {
                 return Err(Error::Config("the target may not contain control characters".into()));
             }
         }
-        let tls = tls_config(self.trust)?;
+        let connector = match self.connector {
+            Some(c) => c,
+            None => http::tls_connector(base.clone(), tls_config(self.trust)?),
+        };
         Ok(Client {
             inner: Arc::new(Inner {
                 base,
                 word,
-                tls,
+                connector,
+                timing: self.timing,
                 serve_token: self.serve_token,
                 client_token: self.client_token,
                 name,
                 target: self.target.unwrap_or_else(|| "listener".into()),
                 agent: self.agent.unwrap_or_else(|| DEFAULT_AGENT.into()),
-                registry: Arc::new(Registry::default()),
+                registry: Arc::new(Registry::new(self.events)),
                 log: self.log,
             }),
         })
@@ -219,7 +282,8 @@ fn tls_config(trust: Trust) -> Result<Arc<ClientConfig>> {
 pub(crate) struct Inner {
     pub(crate) base: Base,
     pub(crate) word: String,
-    tls: Arc<ClientConfig>,
+    connector: Connector,
+    pub(crate) timing: Timing,
     pub(crate) serve_token: Option<String>,
     pub(crate) client_token: Option<String>,
     pub(crate) name: String,
@@ -258,6 +322,9 @@ impl Client {
             agent: None,
             trust: Trust::Native,
             log: None,
+            events: Events::default(),
+            timing: Timing::default(),
+            connector: None,
         }
     }
 
@@ -279,6 +346,50 @@ impl Client {
     /// This client's open connections, oldest first.
     pub fn conns(&self) -> Vec<ConnInfo> {
         self.inner.registry.conns()
+    }
+
+    /// Ends the open connection `id` at once and tells the far end
+    /// `reason`, as [`Conn::fail`] does; the connection then ends with
+    /// [`Error::Dropped`]. Returns whether such a connection was open.
+    pub fn drop_conn(&self, id: &ConnId, reason: &str) -> bool {
+        self.inner.registry.drop_conn(id, reason)
+    }
+
+    pub(crate) fn events(&self) -> &Events {
+        &self.inner.registry.events
+    }
+
+    /// Checks, for as long as the future runs, whether the tunnel can be
+    /// reached, and reports through [`Events::on_tunnel`]: the first result,
+    /// then every change. A tunnel that is up is checked every 30 seconds;
+    /// one that is down sooner, from 1 second doubling to 30. It is for the
+    /// connecting side, which can open connections either way. Drop the
+    /// future (or abort its task) to stop it.
+    pub async fn watch(&self) {
+        let t = self.inner.timing;
+        let mut backoff = t.retry_min;
+        let mut up: Option<bool> = None;
+        loop {
+            let result = self.check().await;
+            let now_up = result.is_ok();
+            if up != Some(now_up) {
+                match &result {
+                    Ok(()) => self.log("the tunnel is up"),
+                    Err(e) => self.log(&format!("the tunnel is not available ({e}); this keeps checking")),
+                }
+                self.events().tunnel(now_up, result.as_ref().err());
+            }
+            up = Some(now_up);
+            let wait = if now_up {
+                backoff = t.retry_min;
+                t.recheck
+            } else {
+                let w = backoff;
+                backoff = t.next(backoff);
+                w
+            };
+            tokio::time::sleep(wait).await;
+        }
     }
 
     pub(crate) fn log(&self, msg: &str) {
@@ -305,7 +416,7 @@ impl Client {
             ("User-Agent", i.agent.clone()),
         ];
         headers.extend(extra);
-        let answer = http::request(&i.base, &i.tls, endpoint.path(), &headers, upgrade).await?;
+        let answer = http::request(&i.base, &i.connector, endpoint.path(), &headers, upgrade).await?;
         let head = match &answer {
             Answer::Upgraded(u) => Some(&u.head),
             Answer::Plain { head, .. } if head.status != 404 => Some(head),
@@ -349,11 +460,11 @@ impl Client {
     }
 
     /// What `serve` sends.
-    pub(crate) fn serve_headers(&self) -> Vec<(&'static str, String)> {
+    pub(crate) fn serve_headers(&self, target: &str) -> Vec<(&'static str, String)> {
         let i = &self.inner;
         let mut h = self.word_header();
         h.push((H_NAME, values::query_escape(&i.name)));
-        h.push((H_TARGET, i.target.clone()));
+        h.push((H_TARGET, target.to_string()));
         if let Some(t) = &i.serve_token {
             h.push((H_SERVE, t.clone()));
         }
@@ -378,7 +489,7 @@ impl Client {
     pub async fn dial(&self) -> Result<Conn> {
         let up = self.upgrade(Endpoint::Connect, self.connect_headers()).await?;
         let id = up.head.get(H_CONN).unwrap_or_default().to_string();
-        Ok(Conn::start(up, id, Side::Connect, self.inner.registry.clone()))
+        Ok(Conn::start(up, &id, Side::Connect, self.inner.registry.clone()))
     }
 
     /// Asks the hub whether someone serves this word (and whether the

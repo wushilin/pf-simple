@@ -460,6 +460,10 @@ behavior.
 - **Serving to a TCP target.** Connect to the target first, and answer
   `accept` with `X-PF-Tunnel-Error` if it cannot be reached. The
   connecting side then hears the reason at once.
+- **Accepting.** A serving side that hands connections to an application
+  holds at most 128 that have not been accepted yet. It refuses the rest
+  at once through `accept` with `X-PF-Tunnel-Error`, so the connecting
+  side is not left waiting.
 - **Connecting.** Use `check` to tell the user whether the tunnel is up,
   but open each connection with `connect` regardless: a tunnel may come up
   or go away at any time.

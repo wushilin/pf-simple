@@ -13,5 +13,5 @@ import java.time.Instant;
  * @param wroteEof this end has half-closed
  * @param readEof  the far end has half-closed
  */
-public record ConnInfo(String id, Side side, Instant opened, long sent, long received,
+public record ConnInfo(ConnId id, Side side, Instant opened, long sent, long received,
                        boolean wroteEof, boolean readEof) {}

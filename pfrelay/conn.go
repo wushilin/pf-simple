@@ -24,7 +24,7 @@ const (
 
 // ConnInfo is a snapshot of one connection.
 type ConnInfo struct {
-	ID       string    // the server's connection id
+	ID       ConnID    // the server's connection id
 	Side     Side      // which end of the tunnel this is
 	Opened   time.Time // when the connection was opened
 	Sent     int64     // bytes sent into the tunnel
@@ -47,13 +47,14 @@ type Stats struct {
 // connRecord is the bookkeeping of one connection, shared by Conn and the
 // forwarders.
 type connRecord struct {
-	id       string
+	id       ConnID
 	side     Side
 	opened   time.Time
 	stream   *tunnel.Stream
 	sent     atomic.Int64
 	received atomic.Int64
 	finished atomic.Bool
+	dropped  atomic.Pointer[string] // the reason, once Drop was used
 }
 
 // registry holds a Client's live connections and its totals.
@@ -67,7 +68,7 @@ type registry struct {
 }
 
 func (r *registry) add(id string, side Side, s *tunnel.Stream) *connRecord {
-	rec := &connRecord{id: id, side: side, opened: time.Now(), stream: s}
+	rec := &connRecord{id: ConnID{id}, side: side, opened: time.Now(), stream: s}
 	r.mu.Lock()
 	if r.live == nil {
 		r.live = make(map[*connRecord]struct{})
@@ -78,10 +79,11 @@ func (r *registry) add(id string, side Side, s *tunnel.Stream) *connRecord {
 	return rec
 }
 
-// finish moves rec out of the live set, once.
-func (r *registry) finish(rec *connRecord, failed bool) {
+// finish moves rec out of the live set. It reports false if it already
+// had.
+func (r *registry) finish(rec *connRecord, failed bool) bool {
 	if !rec.finished.CompareAndSwap(false, true) {
-		return
+		return false
 	}
 	r.mu.Lock()
 	delete(r.live, rec)
@@ -91,6 +93,7 @@ func (r *registry) finish(rec *connRecord, failed bool) {
 	r.sent += rec.sent.Load()
 	r.received += rec.received.Load()
 	r.mu.Unlock()
+	return true
 }
 
 func (rec *connRecord) info() ConnInfo {
@@ -160,6 +163,7 @@ type Conn struct {
 	wdl *deadline
 
 	failed    atomic.Bool
+	failure   atomic.Pointer[error] // the first error that broke the connection here
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -172,11 +176,19 @@ type chunk struct {
 var _ net.Conn = (*Conn)(nil)
 
 func (c *Client) newConn(s *tunnel.Stream, id string, side Side) *Conn {
-	return &Conn{
+	conn := &Conn{
 		s: s, c: c, rec: c.reg.add(id, side, s),
 		chunks: make(chan chunk), taken: make(chan struct{}),
 		rdl: newDeadline(), wdl: newDeadline(), done: make(chan struct{}),
 	}
+	c.opened(conn.rec)
+	return conn
+}
+
+// broke records the first error that broke the connection.
+func (c *Conn) broke(err error) {
+	c.failed.Store(true)
+	c.failure.CompareAndSwap(nil, &err)
 }
 
 // Err is why the connection failed, once that is known: the far end's or
@@ -200,8 +212,8 @@ func (c *Conn) Err() error {
 	return nil
 }
 
-// ID is the server's id for this connection.
-func (c *Conn) ID() string { return c.rec.id }
+// ID is the server's id for this connection, the same on both ends.
+func (c *Conn) ID() ConnID { return c.rec.id }
 
 // Info is a snapshot of this connection.
 func (c *Conn) Info() ConnInfo { return c.rec.info() }
@@ -251,7 +263,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 			if ch.err != nil {
 				c.rerr = ch.err
 				if ch.err != io.EOF {
-					c.failed.Store(true)
+					c.broke(ch.err)
 				}
 			} else if len(ch.b) == 0 {
 				c.release()
@@ -306,10 +318,10 @@ func (c *Conn) Write(p []byte) (int, error) {
 	n, err := c.s.Write(p)
 	c.rec.sent.Add(int64(n))
 	if err != nil {
-		c.failed.Store(true)
 		if timedOut.Load() {
 			err = os.ErrDeadlineExceeded
 		}
+		c.broke(err)
 	}
 	return n, err
 }
@@ -321,11 +333,11 @@ func (c *Conn) CloseWrite() error { return c.s.CloseWrite() }
 // Fail drops the connection and tells the far end why: its Read returns a
 // *RemoteError with this reason.
 func (c *Conn) Fail(reason string) {
-	c.failed.Store(true)
+	c.broke(&DroppedError{Reason: reason})
 	c.closeOnce.Do(func() {
 		close(c.done)
 		c.s.Fail(reason)
-		c.c.reg.finish(c.rec, true)
+		c.c.closed(c.rec, *c.failure.Load())
 	})
 }
 
@@ -339,7 +351,13 @@ func (c *Conn) Close() error {
 		}
 		close(c.done)
 		_ = c.s.Close()
-		c.c.reg.finish(c.rec, c.failed.Load() || c.Err() != nil)
+		var err error
+		if f := c.failure.Load(); f != nil {
+			err = *f
+		} else {
+			err = c.Err()
+		}
+		c.c.closed(c.rec, err)
 	})
 	return nil
 }
@@ -439,9 +457,11 @@ func (l *Listener) open(ctx context.Context, id string) {
 	select {
 	case l.slots <- struct{}{}:
 	default:
+		const reason = "the serving side is not accepting connections fast enough"
 		c.logf("connection %s refused: %d connections are waiting to be accepted", short(id), listenBacklog)
+		c.refused(id, reason)
 		h := c.header(id)
-		h.Set(tunnel.HeaderError, "the serving side is not accepting connections fast enough")
+		h.Set(tunnel.HeaderError, reason)
 		_ = c.get(ctx, "accept", h)
 		return
 	}

@@ -78,6 +78,10 @@ pub enum Error {
     /// The far end or the hub dropped the connection, and said why.
     #[error(transparent)]
     Remote(#[from] RemoteError),
+    /// This side dropped the connection, with [`Conn::fail`](crate::Conn::fail)
+    /// or [`Client::drop_conn`](crate::Client::drop_conn).
+    #[error("dropped by this side: {reason}")]
+    Dropped { reason: String },
     /// The link to the hub broke: it closed, went silent, or reset.
     #[error("{0}")]
     Link(String),

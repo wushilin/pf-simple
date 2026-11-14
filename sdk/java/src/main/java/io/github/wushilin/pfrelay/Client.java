@@ -2,6 +2,8 @@ package io.github.wushilin.pfrelay;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLEncoder;
@@ -44,12 +46,6 @@ public final class Client {
     static final String H_CLIENT_TOKEN = "X-PF-Client-Token";
     static final String H_VERSION = "X-PF-Version";
 
-    // Retry timing (docs/PROTOCOL.md §9); package-private so tests can shorten them.
-    static volatile long retryMinMs = 1000;
-    static volatile long retryMaxMs = 30_000;
-    static volatile long settledMs = 60_000;
-    static volatile long controlPingMs = 20_000;
-    static volatile int controlSilenceMs = 60_000;
     static final long CONTROL_WRITE_TIMEOUT_MS = 10_000;
     static final int MAX_CONTROL_FRAME = 4096;
 
@@ -63,6 +59,8 @@ public final class Client {
     private final String tunnelTarget;
     private final String agent;
     private final Consumer<String> logger;
+    private final ClientEvents events;
+    private final Timing timing;
     final Registry registry = new Registry();
 
     private Client(Builder b) {
@@ -85,6 +83,8 @@ public final class Client {
         this.tunnelTarget = b.target == null || b.target.isEmpty() ? "listener" : b.target;
         this.agent = b.agent == null || b.agent.isBlank() ? DEFAULT_AGENT : b.agent;
         this.logger = b.logger;
+        this.events = b.events == null ? new ClientEvents() {} : b.events;
+        this.timing = b.timing == null ? Timing.DEFAULT : b.timing;
         if (b.sslContext != null) {
             this.ssl = b.sslContext;
         } else if (b.caFile != null) {
@@ -119,8 +119,26 @@ public final class Client {
         private String target;
         private String agent;
         private Consumer<String> logger;
+        private ClientEvents events;
+        private Timing timing;
 
         private Builder() {}
+
+        /**
+         * The handlers to call as connections open and close, and as the
+         * tunnel comes and goes. None by default. They are called
+         * synchronously and must not block; see {@link ClientEvents}.
+         */
+        public Builder events(ClientEvents events) {
+            this.events = events;
+            return this;
+        }
+
+        /** Shorter timings, for tests. */
+        Builder timing(Timing timing) {
+            this.timing = timing;
+            return this;
+        }
 
         /** The hub: {@code https://host[:port]}, optionally followed by {@code /} or {@code /pf}. */
         public Builder server(String url) {
@@ -292,10 +310,10 @@ public final class Client {
     // ---------- protocol negotiation (docs/PROTOCOL.md §5) ----------
 
     /** What a request to endpoint depends on beyond protocol 0. */
-    List<Feature> needs(String endpoint) {
+    List<Feature> needs(Endpoint endpoint) {
         List<Feature> out = new ArrayList<>(2);
         switch (endpoint) {
-            case "serve":
+            case SERVE:
                 if (!clientToken.isEmpty()) {
                     out.add(Feature.CLIENT_TOKEN);
                 }
@@ -303,8 +321,8 @@ public final class Client {
                     out.add(Feature.ANONYMOUS_SERVE);
                 }
                 break;
-            case "connect":
-            case "check":
+            case CONNECT:
+            case CHECK:
                 if (!clientToken.isEmpty()) {
                     out.add(Feature.CLIENT_TOKEN);
                 }
@@ -316,7 +334,7 @@ public final class Client {
     }
 
     /** The protocol range a request to endpoint offers: from its newest feature to the highest spoken. */
-    String offer(String endpoint) {
+    String offer(Endpoint endpoint) {
         int min = Proto.MIN;
         for (Feature f : needs(endpoint)) {
             min = Math.max(min, f.proto());
@@ -329,7 +347,7 @@ public final class Client {
      * negotiated ignores what it does not know, so it is for this side to
      * refuse when the request depends on something that hub would not do.
      */
-    void answered(String endpoint, Map<String, String> headers) throws ProtoException {
+    void answered(Endpoint endpoint, Map<String, String> headers) throws ProtoException {
         int proto = Proto.serverProto(headers);
         for (Feature f : needs(endpoint)) {
             if (proto < f.proto()) {
@@ -339,10 +357,10 @@ public final class Client {
     }
 
     /** Makes one request, and checks every answer except 404 for the protocol (§5.3). */
-    private Http.Response exchange(String endpoint, Map<String, String> h, boolean upgrade) throws IOException {
+    private Http.Response exchange(Endpoint endpoint, Map<String, String> h, boolean upgrade) throws IOException {
         h.put(Proto.HEADER, offer(endpoint));
         h.put(H_VERSION, agent);
-        Http.Response r = Http.request(target, PATH + endpoint, h, ssl, upgrade);
+        Http.Response r = Http.request(target, endpoint.path(), h, ssl, upgrade);
         if (r.status != 404) {
             try {
                 answered(endpoint, r.headers);
@@ -357,7 +375,7 @@ public final class Client {
     }
 
     /** Opens a WebSocket at endpoint; any answer but 101 is an exception. */
-    WebSocket openWs(String endpoint, Map<String, String> h) throws IOException {
+    WebSocket openWs(Endpoint endpoint, Map<String, String> h) throws IOException {
         Http.Response r = exchange(endpoint, h, true);
         if (r.ws == null) {
             throw explain(r.status, r.errorText(), r.headers);
@@ -366,7 +384,7 @@ public final class Client {
     }
 
     /** Makes a plain GET; anything but 2xx is an exception. */
-    private Http.Response get(String endpoint, Map<String, String> h) throws IOException {
+    private Http.Response get(Endpoint endpoint, Map<String, String> h) throws IOException {
         Http.Response r = exchange(endpoint, h, false);
         if (r.status / 100 != 2) {
             throw explain(r.status, r.errorText(), r.headers);
@@ -417,10 +435,10 @@ public final class Client {
      * @throws ProtoException        the hub is too old for the client token
      */
     public Conn dial() throws IOException {
-        WebSocket ws = openWs("connect", connectHeader());
-        String id = ws.header.getOrDefault(H_CONN, "");
+        WebSocket ws = openWs(Endpoint.CONNECT, connectHeader());
+        ConnId id = new ConnId(ws.header.getOrDefault(H_CONN, ""));
         try {
-            return new Conn(ws, registry, id, Side.CONNECT);
+            return new Conn(ws, this, id, Side.CONNECT);
         } catch (IOException e) {
             ws.abort();
             throw e;
@@ -435,7 +453,7 @@ public final class Client {
      * @throws ProtoException        the hub is too old for the client token
      */
     public void check() throws IOException {
-        get("check", connectHeader());
+        get(Endpoint.CHECK, connectHeader());
     }
 
     /**
@@ -451,7 +469,7 @@ public final class Client {
         if (!serveToken.isEmpty()) {
             h.put(H_SERVE, serveToken);
         }
-        Http.Response r = exchange("version", h, false);
+        Http.Response r = exchange(Endpoint.VERSION, h, false);
         if (r.status == 404) {
             throw new StatusException(404, "this server does not answer a version probe: it is older than "
                     + "pf-simple 0.14.0, or its relay hub is off", r.headers);
@@ -499,20 +517,131 @@ public final class Client {
      * @throws java.io.InterruptedIOException if it is not registered in time
      */
     public Listener listen(Duration timeout) throws IOException {
+        Listener l = new Listener(this, null);
+        l.register(timeout);
+        return l;
+    }
+
+    /**
+     * Serves the tunnel to a TCP target, {@code host:port}, until the
+     * returned forwarder is closed. It returns once registered, and throws
+     * what {@link #listen()} throws.
+     *
+     * <p>For each connection the hub offers, it connects to the target
+     * first: if the target cannot be reached, it refuses the connection
+     * with a reason ({@link ClientEvents#onRefuse}), which the connecting
+     * side hears at once. Otherwise it copies both ways, passing half-closes
+     * on, until both directions finish or either fails; a failure is passed
+     * on with a reason that names the hop that broke.
+     */
+    public Forwarder serve(String target) throws IOException {
+        return serve(target, null);
+    }
+
+    /** {@link #serve(String)}, waiting at most timeout for the first registration. */
+    public Forwarder serve(String target, Duration timeout) throws IOException {
+        Bridge.parseHostPort(target); // fail early on a target that is not one
+        Listener l = new Listener(this, target);
+        Forwarder f = new Forwarder(l, l::isUp, Bridge.SERVE.self + " is stopping");
+        l.forwarder = f;
+        l.register(timeout);
+        return f;
+    }
+
+    /**
+     * Carries every connection accepted on local through the tunnel, on
+     * threads of its own, until the returned forwarder is closed, which
+     * closes local too. A connection that cannot be opened through the
+     * tunnel is closed at once.
+     */
+    public Forwarder connect(ServerSocket local) {
+        requireWord();
+        Forwarder f = new Forwarder(local, () -> !local.isClosed(), Bridge.CONNECT.self + " is stopping");
+        Thread t = new Thread(() -> {
+            while (!f.isClosed()) {
+                Socket s;
+                try {
+                    s = local.accept();
+                } catch (IOException e) {
+                    if (!f.isClosed()) {
+                        log("the local listener failed: " + e.getMessage());
+                        f.close();
+                    }
+                    return;
+                }
+                Sched.go(() -> carry(f, s));
+            }
+        }, "pfrelay-connect-" + wordLabel());
+        t.setDaemon(true);
+        t.start();
+        return f;
+    }
+
+    private void carry(Forwarder f, Socket local) {
+        Conn conn;
+        try {
+            local.setTcpNoDelay(true);
+            conn = dial();
+        } catch (IOException e) {
+            log("connection from " + local.getRemoteSocketAddress() + " refused: " + e.getMessage());
+            Bridge.closeQuietly(local);
+            return;
+        }
+        if (!f.track(conn)) {
+            conn.fail(Bridge.CONNECT.self + " is stopping");
+            Bridge.closeQuietly(local);
+            return;
+        }
+        log("connection " + conn.id().shortForm() + " open: " + local.getRemoteSocketAddress() + " -> tunnel "
+                + wordLabel());
+        try {
+            Bridge.run(this, conn, local, Bridge.CONNECT, f);
+        } finally {
+            f.untrack(conn);
+        }
+    }
+
+    /**
+     * Starts checking whether the tunnel can be reached, on a thread of its
+     * own, until the returned watcher is closed. {@link ClientEvents#onTunnel}
+     * hears the first result and then every change.
+     */
+    public Watcher watch() {
+        requireWord();
+        Watcher w = new Watcher(this);
+        w.start();
+        return w;
+    }
+
+    /**
+     * Ends the open connection id at once and tells the far end reason, as
+     * {@link Conn#fail} does. Whoever holds the connection sees its reads
+     * and writes fail; when it closes the connection, the connection is
+     * reported closed with a {@link DroppedException}. (The forwarders close
+     * theirs at once.) Returns whether such a connection was open.
+     */
+    public boolean drop(ConnId id, String reason) {
+        Registry.Record r = registry.find(id);
+        if (r == null || r.conn == null) {
+            return false;
+        }
+        r.dropped.compareAndSet(null, reason);
+        r.conn.cut(reason);
+        return true;
+    }
+
+    /** Checks what serving needs. */
+    void checkServable() {
         if (name == null) {
             throw new IllegalStateException("give the tunnel a name to serve it (Client.Builder.name)");
         }
         requireWord();
-        Listener l = new Listener(this);
-        l.start();
-        l.awaitRegistered(timeout);
-        return l;
     }
 
-    /** The headers of a registration. */
-    Map<String, String> serveHeader() {
+    /** The headers of a registration that tells the console target. */
+    Map<String, String> serveHeader(String target) {
         Map<String, String> h = header(null);
-        h.put(H_TARGET, tunnelTarget);
+        h.put(H_TARGET, target == null ? tunnelTarget : target);
         if (!serveToken.isEmpty()) {
             h.put(H_SERVE, serveToken);
         }
@@ -525,10 +654,11 @@ public final class Client {
 
     /** Refuses connection id, with a reason the connecting side hears. */
     void refuse(String id, String reason) {
+        refused(new ConnId(id), reason);
         Map<String, String> h = header(id);
         h.put(H_ERROR, reason);
         try {
-            get("accept", h);
+            get(Endpoint.ACCEPT, h);
         } catch (IOException e) {
             log("connection " + shortId(id) + ": could not tell the server: " + e.getMessage());
         }
@@ -544,6 +674,45 @@ public final class Client {
     /** This client's open connections, oldest first. */
     public List<ConnInfo> conns() {
         return registry.conns();
+    }
+
+    Timing timing() {
+        return timing;
+    }
+
+    // ---------- events ----------
+
+    private void event(String what, Runnable call) {
+        try {
+            call.run();
+        } catch (RuntimeException e) {
+            log("the " + what + " handler failed: " + e);
+        }
+    }
+
+    void opened(Registry.Record rec) {
+        event("onOpen", () -> events.onOpen(rec.info()));
+    }
+
+    /** Retires rec, once, and reports it. */
+    void closed(Registry.Record rec, IOException err) {
+        String dropped = rec.dropped.get();
+        IOException e = dropped != null && !(err instanceof DroppedException) ? new DroppedException(dropped) : err;
+        if (registry.finish(rec, e != null)) {
+            event("onClose", () -> events.onClose(rec.info(), e));
+        }
+    }
+
+    void refused(ConnId id, String reason) {
+        event("onRefuse", () -> events.onRefuse(id, reason));
+    }
+
+    void serving(boolean up) {
+        event("onServing", () -> events.onServing(up));
+    }
+
+    void tunnel(boolean up, IOException err) {
+        event("onTunnel", () -> events.onTunnel(up, err));
     }
 
     void log(String msg) {

@@ -17,9 +17,14 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,6 +46,37 @@ import (
 
 type driver []string
 
+// The driver's commands, modes and queries (conformance/README.md).
+type (
+	driverCommand string
+	driverMode    string
+	driverQuery   string
+)
+
+const (
+	cmdServe   driverCommand = "serve"
+	cmdConnect driverCommand = "connect"
+	cmdCheck   driverCommand = "check"
+	cmdVersion driverCommand = "version"
+
+	modeListen  driverMode = "listen"
+	modeForward driverMode = "forward"
+
+	queryStats driverQuery = "stats"
+	queryConns driverQuery = "conns"
+	queryDrop  driverQuery = "drop" // "drop <id>"
+
+	// The lines the driver prints for the SDK's events.
+	eventOpened  = "opened "  // "opened <id> <side>"
+	eventClosed  = "closed "  // "closed <id> <sent> <received> ok|failed"
+	eventRefused = "refused " // "refused <id>"
+
+	// The driver's exit codes.
+	exitOK     = 0
+	exitProto  = 3
+	exitDenied = 4
+)
+
 func conformanceDriver(t *testing.T) driver {
 	t.Helper()
 	if d := os.Getenv("PF_CONFORMANCE_DRIVER"); d != "" {
@@ -56,9 +92,16 @@ func conformanceDriver(t *testing.T) driver {
 
 // proc is one run of the driver.
 type proc struct {
-	t      *testing.T
-	cmd    *exec.Cmd
-	lines  chan string
+	t     *testing.T
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	// out is every line the driver printed. line reads it in order from
+	// next; lines that do not match are passed over, but stay in out.
+	mu     sync.Mutex
+	out    []string
+	next   int
+	eof    bool
+	more   chan struct{} // a line arrived, or the output ended
 	stderr *syncBuffer
 	exited chan struct{}
 	code   int
@@ -85,8 +128,11 @@ func (s *syncBuffer) String() string {
 // certificate for the driver.
 type conformanceHub struct {
 	*relayFixture
-	ca string
-	d  driver
+	ca     string
+	d      driver
+	server string          // the URL the driver is given; the hub's, or a proxy's
+	leaf   tls.Certificate // the hub's certificate, for a proxy in front of it
+	roots  *x509.CertPool  // what trusts it
 }
 
 func newConformanceHub(t *testing.T, d driver) *conformanceHub {
@@ -96,7 +142,7 @@ func newConformanceHub(t *testing.T, d driver) *conformanceHub {
 	if err := os.WriteFile(ca, caPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return &conformanceHub{relayFixture: f, ca: ca, d: d}
+	return &conformanceHub{relayFixture: f, ca: ca, d: d, server: f.srv.URL, leaf: leaf, roots: pool}
 }
 
 // conformanceCerts makes what a real deployment has: a CA, and a server
@@ -142,16 +188,20 @@ func conformanceCerts(t *testing.T) (caPEM []byte, leaf tls.Certificate, pool *x
 
 // run starts the driver with a command and flags; the hub's URL and
 // certificate are added.
-func (h *conformanceHub) run(t *testing.T, cmd string, args ...string) *proc {
+func (h *conformanceHub) run(t *testing.T, cmd driverCommand, args ...string) *proc {
 	t.Helper()
-	argv := append(append([]string{}, h.d[1:]...), cmd, "--server", h.srv.URL, "--ca", h.ca)
+	argv := append(append([]string{}, h.d[1:]...), string(cmd), "--server", h.server, "--ca", h.ca)
 	argv = append(argv, args...)
 	c := exec.Command(h.d[0], argv...)
 	stdout, err := c.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &proc{t: t, cmd: c, lines: make(chan string, 100), stderr: &syncBuffer{}, exited: make(chan struct{})}
+	stdin, err := c.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &proc{t: t, cmd: c, stdin: stdin, more: make(chan struct{}, 1), stderr: &syncBuffer{}, exited: make(chan struct{})}
 	c.Stderr = p.stderr
 	if err := c.Start(); err != nil {
 		t.Fatalf("starting the driver: %v", err)
@@ -159,9 +209,15 @@ func (h *conformanceHub) run(t *testing.T, cmd string, args ...string) *proc {
 	go func() {
 		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
-			p.lines <- sc.Text()
+			p.mu.Lock()
+			p.out = append(p.out, sc.Text())
+			p.mu.Unlock()
+			p.wake()
 		}
-		close(p.lines)
+		p.mu.Lock()
+		p.eof = true
+		p.mu.Unlock()
+		p.wake()
 		err := c.Wait()
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -193,19 +249,87 @@ func (p *proc) line(prefix string, within time.Duration) string {
 	p.t.Helper()
 	deadline := time.After(within)
 	for {
-		select {
-		case l, ok := <-p.lines:
-			if !ok {
-				<-p.exited
-				p.t.Fatalf("the driver exited (%d) without saying %q; stderr:\n%s", p.code, prefix, p.stderr)
-			}
-			if strings.HasPrefix(l, prefix) {
+		p.mu.Lock()
+		for ; p.next < len(p.out); p.next++ {
+			if l := p.out[p.next]; strings.HasPrefix(l, prefix) {
+				p.next++
+				p.mu.Unlock()
 				return strings.TrimSpace(strings.TrimPrefix(l, prefix))
 			}
+		}
+		eof := p.eof
+		p.mu.Unlock()
+		if eof {
+			<-p.exited
+			p.t.Fatalf("the driver exited (%d) without saying %q; stderr:\n%s", p.code, prefix, p.stderr)
+		}
+		select {
+		case <-p.more:
 		case <-deadline:
 			p.t.Fatalf("the driver did not say %q within %s; stderr:\n%s", prefix, within, p.stderr)
 		}
 	}
+}
+
+func (p *proc) wake() {
+	select {
+	case p.more <- struct{}{}:
+	default:
+	}
+}
+
+// printed is every line printed so far that starts with prefix, without
+// the prefix.
+func (p *proc) printed(prefix string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	for _, l := range p.out {
+		if strings.HasPrefix(l, prefix) {
+			out = append(out, strings.TrimPrefix(l, prefix))
+		}
+	}
+	return out
+}
+
+// ask sends the driver a query on stdin ("stats" or "conns") and decodes
+// the JSON of its answer into v.
+func (p *proc) ask(query driverQuery, v any) {
+	p.t.Helper()
+	p.askArg(query, "", v)
+}
+
+// askArg is ask with an argument, such as the connection to drop.
+func (p *proc) askArg(query driverQuery, arg string, v any) {
+	p.t.Helper()
+	line := string(query)
+	if arg != "" {
+		line += " " + arg
+	}
+	if _, err := io.WriteString(p.stdin, line+"\n"); err != nil {
+		p.t.Fatalf("asking the driver %q: %v", query, err)
+	}
+	answer := p.line(string(query)+" ", 10*time.Second)
+	if err := json.Unmarshal([]byte(answer), v); err != nil {
+		p.t.Fatalf("the driver answered %q with %q: %v", query, answer, err)
+	}
+}
+
+// driverStats and driverConn are what a driver answers to "stats" and
+// "conns".
+type driverStats struct {
+	Opened   uint64 `json:"opened"`
+	Active   uint64 `json:"active"`
+	Failed   uint64 `json:"failed"`
+	Sent     int64  `json:"sent"`
+	Received int64  `json:"received"`
+}
+
+type driverConn struct {
+	ID       string       `json:"id"`
+	Side     pfrelay.Side `json:"side"`
+	Sent     int64        `json:"sent"`
+	Received int64        `json:"received"`
 }
 
 // exit waits for the driver to end and returns its exit code.
@@ -224,7 +348,7 @@ func (p *proc) exit(within time.Duration) int {
 // is registered.
 func (h *conformanceHub) serve(t *testing.T, target string, args ...string) *proc {
 	t.Helper()
-	p := h.run(t, "serve", append([]string{"--word", testWord, "--target", target}, args...)...)
+	p := h.run(t, cmdServe, append([]string{"--word", testWord, "--target", target}, args...)...)
 	p.line("ready", 15*time.Second)
 	return p
 }
@@ -233,8 +357,30 @@ func (h *conformanceHub) serve(t *testing.T, target string, args ...string) *pro
 // it listens on.
 func (h *conformanceHub) connect(t *testing.T, args ...string) string {
 	t.Helper()
-	p := h.run(t, "connect", append([]string{"--word", testWord, "--listen", "127.0.0.1:0"}, args...)...)
-	return p.line("listening ", 15*time.Second)
+	addr, _ := h.connectProc(t, args...)
+	return addr
+}
+
+// connectProc is connect, and the driver's process.
+func (h *conformanceHub) connectProc(t *testing.T, args ...string) (string, *proc) {
+	t.Helper()
+	p := h.run(t, cmdConnect, append([]string{"--word", testWord, "--listen", "127.0.0.1:0"}, args...)...)
+	return p.line("listening ", 15*time.Second), p
+}
+
+// connIDs is every connection id the hub has open.
+func (h *conformanceHub) connIDs() map[string]bool {
+	ids := map[string]bool{}
+	h.hub.mu.Lock()
+	defer h.hub.mu.Unlock()
+	for _, tn := range h.hub.tunnels {
+		tn.mu.Lock()
+		for _, id := range tn.connIDs {
+			ids[id] = true
+		}
+		tn.mu.Unlock()
+	}
+	return ids
 }
 
 // goServe serves testWord to target with the Go SDK.
@@ -342,7 +488,6 @@ func parallel(n int, f func(i int) error) error {
 
 func TestConformance(t *testing.T) {
 	d := conformanceDriver(t)
-	const exitProto, exitDenied = 3, 4
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	payload := randomBytes(1 << 20)
@@ -447,11 +592,11 @@ func TestConformance(t *testing.T) {
 
 	t.Run("check", func(t *testing.T) {
 		h := newConformanceHub(t, d)
-		if code := h.run(t, "check", "--word", testWord).exit(15 * time.Second); code != exitDenied {
+		if code := h.run(t, cmdCheck, "--word", testWord).exit(15 * time.Second); code != exitDenied {
 			t.Errorf("check with nobody serving exits %d, want %d", code, exitDenied)
 		}
 		h.goServe(t, ctx, echoTarget(t))
-		if code := h.run(t, "check", "--word", testWord).exit(15 * time.Second); code != 0 {
+		if code := h.run(t, cmdCheck, "--word", testWord).exit(15 * time.Second); code != exitOK {
 			t.Errorf("check of a served word exits %d", code)
 		}
 	})
@@ -473,10 +618,10 @@ func TestConformance(t *testing.T) {
 			t.Error(err)
 		}
 		conn.Close()
-		if code := h.run(t, "check", "--word", testWord).exit(15 * time.Second); code != exitDenied {
+		if code := h.run(t, cmdCheck, "--word", testWord).exit(15 * time.Second); code != exitDenied {
 			t.Errorf("check without the client token exits %d, want %d", code, exitDenied)
 		}
-		if code := h.run(t, "check", "--word", testWord, "--client-token", "open-sesame").exit(15 * time.Second); code != 0 {
+		if code := h.run(t, cmdCheck, "--word", testWord, "--client-token", "open-sesame").exit(15 * time.Second); code != exitOK {
 			t.Errorf("check with the client token exits %d", code)
 		}
 		// The driver's connect side sends it too.
@@ -488,7 +633,7 @@ func TestConformance(t *testing.T) {
 
 	t.Run("serve/a wrong serve token is final", func(t *testing.T) {
 		h := newConformanceHub(t, d)
-		p := h.run(t, "serve", "--word", testWord, "--target", "127.0.0.1:1", "--serve-token", "wrong-serve-token-0123456789abcdef")
+		p := h.run(t, cmdServe, "--word", testWord, "--target", "127.0.0.1:1", "--serve-token", "wrong-serve-token-0123456789abcdef")
 		if code := p.exit(15 * time.Second); code != exitDenied {
 			t.Errorf("exit %d, want %d; stderr:\n%s", code, exitDenied, p.stderr)
 		}
@@ -497,7 +642,7 @@ func TestConformance(t *testing.T) {
 	t.Run("serve/a word of another tenant is final", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.goServe(t, ctx, echoTarget(t)) // alice binds the word
-		p := h.run(t, "serve", "--word", testWord, "--target", "127.0.0.1:1", "--serve-token", testServeToken2)
+		p := h.run(t, cmdServe, "--word", testWord, "--target", "127.0.0.1:1", "--serve-token", testServeToken2)
 		if code := p.exit(15 * time.Second); code == 0 || code == exitProto {
 			t.Errorf("exit %d; stderr:\n%s", code, p.stderr)
 		}
@@ -508,7 +653,7 @@ func TestConformance(t *testing.T) {
 
 	t.Run("serve/anonymous", func(t *testing.T) {
 		h := newConformanceHub(t, d)
-		p := h.run(t, "serve", "--word", testWord, "--target", "127.0.0.1:1")
+		p := h.run(t, cmdServe, "--word", testWord, "--target", "127.0.0.1:1")
 		if code := p.exit(15 * time.Second); code != exitDenied {
 			t.Errorf("anonymous serve where it is off exits %d, want %d", code, exitDenied)
 		}
@@ -531,11 +676,11 @@ func TestConformance(t *testing.T) {
 		h.hub.mu.Lock()
 		h.hub.silent = true
 		h.hub.mu.Unlock()
-		p := h.run(t, "serve", "--word", testWord, "--target", "127.0.0.1:1", "--serve-token", testServeToken, "--client-token", "open-sesame")
+		p := h.run(t, cmdServe, "--word", testWord, "--target", "127.0.0.1:1", "--serve-token", testServeToken, "--client-token", "open-sesame")
 		if code := p.exit(15 * time.Second); code != exitProto {
 			t.Errorf("serve with a client token exits %d, want %d; stderr:\n%s", code, exitProto, p.stderr)
 		}
-		if code := h.run(t, "check", "--word", testWord, "--client-token", "open-sesame").exit(15 * time.Second); code != exitProto {
+		if code := h.run(t, cmdCheck, "--word", testWord, "--client-token", "open-sesame").exit(15 * time.Second); code != exitProto {
 			t.Errorf("check with a client token exits %d, want %d", code, exitProto)
 		}
 		// A plain tunnel works with it.
@@ -547,10 +692,10 @@ func TestConformance(t *testing.T) {
 
 	t.Run("version", func(t *testing.T) {
 		h := newConformanceHub(t, d)
-		if code := h.run(t, "version", "--serve-token", "wrong-serve-token-0123456789abcdef").exit(15 * time.Second); code != exitDenied {
+		if code := h.run(t, cmdVersion, "--serve-token", "wrong-serve-token-0123456789abcdef").exit(15 * time.Second); code != exitDenied {
 			t.Errorf("version with a wrong serve token exits %d, want %d", code, exitDenied)
 		}
-		p := h.run(t, "version", "--serve-token", testServeToken)
+		p := h.run(t, cmdVersion, "--serve-token", testServeToken)
 		var info tunnel.ServerInfo
 		line := p.line("", 15*time.Second)
 		if err := json.Unmarshal([]byte(line), &info); err != nil {
@@ -559,7 +704,7 @@ func TestConformance(t *testing.T) {
 		if info.Version != version || info.ProtoMin != tunnel.ProtoMin || info.ProtoMax != tunnel.ProtoMax || info.Token != "alice" {
 			t.Errorf("version printed %+v", info)
 		}
-		if code := p.exit(15 * time.Second); code != 0 {
+		if code := p.exit(15 * time.Second); code != exitOK {
 			t.Fatalf("version exits %d", code)
 		}
 	})
@@ -592,6 +737,176 @@ func TestConformance(t *testing.T) {
 		}
 	})
 
+	for _, mode := range []driverMode{modeListen, modeForward} {
+		t.Run("stats/connect side ("+string(mode)+")", func(t *testing.T) {
+			h := newConformanceHub(t, d)
+			h.goServe(t, ctx, echoTarget(t))
+			addr, p := h.connectProc(t, "--mode", string(mode))
+			checkStats(t, h, p, pfrelay.SideConnect, func() (net.Conn, error) { return net.Dial("tcp", addr) })
+		})
+		t.Run("stats/serve side ("+string(mode)+")", func(t *testing.T) {
+			h := newConformanceHub(t, d)
+			p := h.serve(t, echoTarget(t), "--serve-token", testServeToken, "--mode", string(mode))
+			c := h.client(t, testWord, "")
+			checkStats(t, h, p, pfrelay.SideServe, func() (net.Conn, error) { return c.Dial(ctx) })
+		})
+	}
+
+	for _, mode := range []driverMode{modeListen, modeForward} {
+		t.Run("serve/drop a connection by its id ("+string(mode)+")", func(t *testing.T) {
+			h := newConformanceHub(t, d)
+			h.hub.idle = 500 * time.Millisecond // the reason follows the half-close (PROTOCOL.md §8.3)
+			p := h.serve(t, echoTarget(t), "--serve-token", testServeToken, "--mode", string(mode))
+			conn, err := h.client(t, testWord, "").Dial(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.Write([]byte("hello")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(conn, make([]byte, 5)); err != nil { // the connection is up
+				t.Fatal(err)
+			}
+			var dropped bool
+			if p.askArg(queryDrop, "0000000000000000", &dropped); dropped {
+				t.Error("dropped a connection that does not exist")
+			}
+			if p.askArg(queryDrop, conn.ID().String(), &dropped); !dropped {
+				t.Fatalf("could not drop %s", conn.ID())
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_, err = io.ReadAll(conn)
+			var remote *pfrelay.RemoteError
+			if !errors.As(err, &remote) && !errors.As(conn.Err(), &remote) {
+				waitFor(t, "the reason", func() bool { return errors.As(conn.Err(), &remote) })
+			}
+			if !strings.Contains(remote.Reason, "dropped by the conformance suite") {
+				t.Errorf("the connecting side heard %q", remote.Reason)
+			}
+			// The closed event may come before or after the answer to drop.
+			var closed []string
+			waitFor(t, "the closed event", func() bool {
+				closed = p.printed(eventClosed + conn.ID().String())
+				return len(closed) > 0
+			})
+			if len(closed) != 1 || !strings.HasSuffix(closed[0], " failed") {
+				t.Errorf("closed events %q: a dropped connection is closed once, as failed", closed)
+			}
+		})
+	}
+
+	t.Run("forward/serve: echo to a Go connector", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		h.serve(t, echoTarget(t), "--serve-token", testServeToken, "--mode", string(modeForward))
+		c := h.client(t, testWord, "")
+		if err := parallel(8, func(int) error {
+			conn, err := c.Dial(ctx)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			return echoOver(conn, payload)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("forward/connect: echo through a Go server", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		h.goServe(t, ctx, echoTarget(t))
+		addr := h.connect(t, "--mode", string(modeForward))
+		if err := parallel(8, func(int) error { return echoTCP(addr, payload) }); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("forward/serve: an unreachable target is reported at once", func(t *testing.T) {
+		// The forwarder dials the target before it answers, and refuses
+		// through accept with a reason, so the hub's idle timeout plays
+		// no part (PROTOCOL.md §9).
+		h := newConformanceHub(t, d)
+		h.serve(t, closedPort(t), "--serve-token", testServeToken, "--mode", string(modeForward))
+		conn, err := h.client(t, testWord, "").Dial(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+		_, err = conn.Read(make([]byte, 1))
+		var remote *pfrelay.RemoteError
+		if !errors.As(err, &remote) || remote.Reason == "" {
+			t.Fatalf("the first read gave %v, not the serving side's reason", err)
+		}
+	})
+
+	t.Run("connect/watch reports the tunnel coming up", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		_, p := h.connectProc(t)
+		p.line("tunnel down", 15*time.Second)
+		h.goServe(t, ctx, echoTarget(t))
+		p.line("tunnel up", 15*time.Second) // checked again within 1s, 2s, 4s ...
+	})
+
+	t.Run("serve/retries with a growing pause", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		attempts := h.refuseServes(t, 3)
+		h.serve(t, echoTarget(t), "--serve-token", testServeToken)
+		times := attempts()
+		if len(times) < 4 {
+			t.Fatalf("%d attempts", len(times))
+		}
+		// 1s, then 2s, then 4s (PROTOCOL.md §9), with room for slow machines.
+		for i, want := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second} {
+			if gap := times[i+1].Sub(times[i]); gap < want*7/10 || gap > want*15/10+300*time.Millisecond {
+				t.Errorf("pause %d was %s, want about %s", i+1, gap.Round(10*time.Millisecond), want)
+			}
+		}
+	})
+
+	t.Run("serve/a full backlog refuses with a reason", func(t *testing.T) {
+		// A serving side that does not accept holds at most 128
+		// connections, and refuses the rest at once (PROTOCOL.md §9).
+		h := newConformanceHub(t, d)
+		p := h.serve(t, echoTarget(t), "--serve-token", testServeToken, "--no-accept")
+		c := h.client(t, testWord, "")
+		const n = 140
+		conns := make([]*pfrelay.Conn, 0, n)
+		defer func() {
+			for _, conn := range conns {
+				conn.Close()
+			}
+		}()
+		for i := 0; i < n; i++ {
+			conn, err := c.Dial(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conns = append(conns, conn)
+		}
+		refused := 0
+		results := make(chan error, n)
+		for _, conn := range conns {
+			go func() {
+				_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+				_, err := conn.Read(make([]byte, 1))
+				results <- err
+			}()
+		}
+		for range conns {
+			var remote *pfrelay.RemoteError
+			if err := <-results; errors.As(err, &remote) && remote.Reason != "" {
+				refused++
+			}
+		}
+		if refused != n-128 {
+			t.Errorf("%d of %d connections were refused, want %d", refused, n, n-128)
+		}
+		if got := len(p.printed(eventRefused)); got != n-128 {
+			t.Errorf("%d refusals reported as events, want %d", got, n-128)
+		}
+	})
+
 	t.Run("idle connections stay up", func(t *testing.T) {
 		if os.Getenv("PF_CONFORMANCE_SLOW") == "" {
 			t.Skip("takes a minute; set PF_CONFORMANCE_SLOW=1")
@@ -610,4 +925,128 @@ func TestConformance(t *testing.T) {
 			t.Fatalf("after a minute idle: %v", err)
 		}
 	})
+}
+
+// checkStats runs connections through the driver's side of a tunnel and
+// checks what it reports in "stats" and "conns" against the hub.
+func checkStats(t *testing.T, h *conformanceHub, p *proc, side pfrelay.Side, open func() (net.Conn, error)) {
+	t.Helper()
+	echo := func(n int) {
+		conn, err := open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := echoOver(conn.(interface {
+			io.ReadWriter
+			CloseWrite() error
+		}), randomBytes(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	echo(1000)
+	echo(2000)
+	echo(3000)
+	var st driverStats
+	waitFor(t, "three closed connections", func() bool {
+		p.ask(queryStats, &st)
+		return st.Active == 0 && st.Opened == 3
+	})
+	if st.Failed != 0 || st.Sent != 6000 || st.Received != 6000 {
+		t.Fatalf("after three connections, stats = %+v", st)
+	}
+
+	// One held open.
+	conn, err := open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, make([]byte, 5)); err != nil {
+		t.Fatal(err)
+	}
+	var list []driverConn
+	waitFor(t, "the open connection's figures", func() bool {
+		p.ask(queryConns, &list)
+		return len(list) == 1 && list[0].Sent == 5 && list[0].Received == 5
+	})
+	if c := list[0]; c.Side != side || !h.connIDs()[c.ID] {
+		t.Errorf("conns = %+v; the hub has %v", list, h.connIDs())
+	}
+	p.ask(queryStats, &st)
+	if st.Opened != 4 || st.Active != 1 || st.Sent != 6005 || st.Received != 6005 {
+		t.Errorf("with one open, stats = %+v", st)
+	}
+	conn.Close()
+	waitFor(t, "the last connection to close", func() bool {
+		p.ask(queryStats, &st)
+		return st.Active == 0
+	})
+	p.ask(queryConns, &list)
+	if len(list) != 0 {
+		t.Errorf("conns after all closed = %+v", list)
+	}
+
+	// Every connection was opened once and closed once, with its figures.
+	opened := map[string]bool{}
+	for _, l := range p.printed(eventOpened) {
+		var id, s string
+		if _, err := fmt.Sscan(l, &id, &s); err != nil || pfrelay.Side(s) != side || opened[id] {
+			t.Errorf("event %q", eventOpened+l)
+		}
+		opened[id] = true
+	}
+	var closed []string
+	for _, l := range p.printed(eventClosed) {
+		var id, outcome string
+		var sent, received int64
+		if _, err := fmt.Sscan(l, &id, &sent, &received, &outcome); err != nil || !opened[id] || outcome != "ok" || sent != received {
+			t.Errorf("event %q", eventClosed+l)
+		}
+		closed = append(closed, fmt.Sprint(sent))
+	}
+	sort.Strings(closed)
+	if len(opened) != 4 || strings.Join(closed, " ") != "1000 2000 3000 5" {
+		t.Errorf("events: %d opened, closed with %v; want 4, and 1000 2000 3000 5", len(opened), closed)
+	}
+}
+
+// refuseServes puts a proxy in front of the hub that answers the first n
+// registrations with 503, and points the driver at it. It returns the
+// times of the registration attempts so far.
+func (h *conformanceHub) refuseServes(t *testing.T, n int) func() []time.Time {
+	t.Helper()
+	backend, err := url.Parse(h.srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(backend)
+	proxy.Transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: h.roots}}
+	var mu sync.Mutex
+	var times []time.Time
+	front := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/serve") {
+			mu.Lock()
+			times = append(times, time.Now())
+			refuse := len(times) <= n
+			mu.Unlock()
+			if refuse {
+				w.Header().Set(tunnel.HeaderProto, "1")
+				writeError(w, http.StatusServiceUnavailable, "the conformance suite refuses this registration")
+				return
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	front.TLS = &tls.Config{Certificates: []tls.Certificate{h.leaf}}
+	front.StartTLS()
+	t.Cleanup(front.Close)
+	h.server = front.URL
+	return func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Time(nil), times...)
+	}
 }

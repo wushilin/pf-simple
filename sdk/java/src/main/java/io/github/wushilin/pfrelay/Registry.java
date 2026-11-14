@@ -8,27 +8,30 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** A client's live connections and its totals: local bookkeeping only. */
 final class Registry {
     /** The bookkeeping of one connection. */
     static final class Record {
-        final String id;
+        final ConnId id;
         final Side side;
         final Instant opened = Instant.now();
         final AtomicLong sent = new AtomicLong();
         final AtomicLong received = new AtomicLong();
         final AtomicBoolean finished = new AtomicBoolean();
-        Conn conn;
+        final AtomicReference<String> dropped = new AtomicReference<>(); // the reason, once drop was used
+        volatile Conn conn;
 
-        Record(String id, Side side) {
+        Record(ConnId id, Side side) {
             this.id = id;
             this.side = side;
         }
 
         ConnInfo info() {
+            Conn c = conn;
             return new ConnInfo(id, side, opened, sent.get(), received.get(),
-                    conn != null && conn.wroteEof(), conn != null && conn.readEof());
+                    c != null && c.wroteEof(), c != null && c.readEof());
         }
     }
 
@@ -38,17 +41,17 @@ final class Registry {
     private long sent; // of the connections that have ended
     private long received;
 
-    synchronized Record add(String id, Side side) {
+    synchronized Record add(ConnId id, Side side) {
         Record r = new Record(id, side);
         live.add(r);
         opened++;
         return r;
     }
 
-    /** Moves r out of the live set, once. */
-    void finish(Record r, boolean didFail) {
+    /** Moves r out of the live set; false if it already had. */
+    boolean finish(Record r, boolean didFail) {
         if (!r.finished.compareAndSet(false, true)) {
-            return;
+            return false;
         }
         synchronized (this) {
             live.remove(r);
@@ -58,6 +61,17 @@ final class Registry {
             sent += r.sent.get();
             received += r.received.get();
         }
+        return true;
+    }
+
+    /** The live connection with this id, or null. */
+    synchronized Record find(ConnId id) {
+        for (Record r : live) {
+            if (r.id.equals(id)) {
+                return r;
+            }
+        }
+        return null;
     }
 
     synchronized Stats stats() {

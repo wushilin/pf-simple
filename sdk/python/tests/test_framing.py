@@ -10,7 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pfrelay  # noqa: E402
 from pfrelay import _conn, _ws  # noqa: E402
-from pfrelay._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_TEXT, WebSocket  # noqa: E402
+from pfrelay._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_TEXT  # noqa: E402
+from support import Pair, new_client  # noqa: E402
 
 
 class Encoding(unittest.TestCase):
@@ -70,38 +71,6 @@ class HTTP(unittest.IsolatedAsyncioTestCase):
             _ws._request_bytes("/", "h", [("X-A", "a\r\nX-B: b")])
 
 
-class Pair:
-    """A client WebSocket and the fake hub's end of the same TCP connection."""
-
-    async def __aenter__(self):
-        got = asyncio.get_running_loop().create_future()
-
-        async def on(reader, writer):
-            got.set_result((reader, writer))
-
-        self.server = await asyncio.start_server(on, "127.0.0.1", 0)
-        port = self.server.sockets[0].getsockname()[1]
-        r, w = await asyncio.open_connection("127.0.0.1", port)
-        self.client = WebSocket(r, w)
-        sr, sw = await got
-        self.hub = WebSocket(sr, sw, client=False)
-        return self
-
-    async def __aexit__(self, *exc):
-        self.client.abort()
-        self.hub.abort()
-        self.server.close()
-
-    async def hub_recv(self, timeout=5):
-        return await asyncio.wait_for(self.hub.recv(1 << 21, 1 << 21), timeout)
-
-    async def hub_recv_skip_pings(self, timeout=5):
-        while True:
-            op, fin, p = await self.hub_recv(timeout)
-            if op != OP_PING:
-                return op, fin, p
-
-
 class Frames(unittest.IsolatedAsyncioTestCase):
     async def test_masked_server_frame_is_refused(self):
         async with Pair() as p:
@@ -134,8 +103,8 @@ class Frames(unittest.IsolatedAsyncioTestCase):
 class Streams(unittest.IsolatedAsyncioTestCase):
     async def test_data_and_half_close(self):
         async with Pair() as p:
-            reg = _conn._Registry()
-            conn = _conn.Conn(p.client, "0123456789abcdef", "connect", reg)
+            reg = new_client()
+            conn = await reg._new_conn(p.client, pfrelay.ConnID("0123456789abcdef"), pfrelay.Side.CONNECT)
             await p.hub.send(OP_BINARY, b"hello ")
             await p.hub.send(OP_CONT, b"world")
             await p.hub.send(OP_BINARY, b"")
@@ -178,7 +147,7 @@ class Streams(unittest.IsolatedAsyncioTestCase):
 
     async def test_err_before_eof(self):
         async with Pair() as p:
-            conn = _conn.Conn(p.client, "id", "connect")
+            conn = _conn.Conn(p.client, "id", pfrelay.Side.CONNECT)
             await p.hub.send(OP_BINARY, b"abc")
             await p.hub.send(OP_TEXT, b"err:the target reset\x07 its connection")
             await p.hub.send(OP_CLOSE, b"")
@@ -194,7 +163,7 @@ class Streams(unittest.IsolatedAsyncioTestCase):
     async def test_err_after_eof(self):
         # PROTOCOL.md 8.3: a failure may arrive as eof first, err: later.
         async with Pair() as p:
-            conn = _conn.Conn(p.client, "id", "connect")
+            conn = _conn.Conn(p.client, "id", pfrelay.Side.CONNECT)
             await p.hub.send(OP_TEXT, b"eof")
             self.assertEqual(await conn.read(), b"")
             self.assertIsNone(conn.err)
@@ -208,7 +177,7 @@ class Streams(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_without_eof_is_a_failure(self):
         async with Pair() as p:
-            conn = _conn.Conn(p.client, "id", "connect")
+            conn = _conn.Conn(p.client, "id", pfrelay.Side.CONNECT)
             await p.hub.send(OP_CLOSE, b"")
             with self.assertRaises(pfrelay.LinkError):
                 await conn.read()
@@ -216,7 +185,7 @@ class Streams(unittest.IsolatedAsyncioTestCase):
 
     async def test_tcp_end_without_close_is_a_failure(self):
         async with Pair() as p:
-            conn = _conn.Conn(p.client, "id", "connect")
+            conn = _conn.Conn(p.client, "id", pfrelay.Side.CONNECT)
             p.hub.close_transport()
             with self.assertRaises(pfrelay.LinkError):
                 await asyncio.wait_for(conn.read(), 5)
@@ -224,7 +193,7 @@ class Streams(unittest.IsolatedAsyncioTestCase):
 
     async def test_data_after_eof_breaks(self):
         async with Pair() as p:
-            conn = _conn.Conn(p.client, "id", "connect")
+            conn = _conn.Conn(p.client, "id", pfrelay.Side.CONNECT)
             await p.hub.send(OP_TEXT, b"eof")
             await p.hub.send(OP_BINARY, b"late")
             self.assertEqual(await conn.read(), b"")
@@ -233,8 +202,8 @@ class Streams(unittest.IsolatedAsyncioTestCase):
 
     async def test_fail(self):
         async with Pair() as p:
-            reg = _conn._Registry()
-            conn = _conn.Conn(p.client, "id", "serve", reg)
+            reg = new_client()
+            conn = await reg._new_conn(p.client, pfrelay.ConnID("id"), pfrelay.Side.SERVE)
             await conn.fail("the target\nwent away")
             self.assertEqual(await p.hub_recv_skip_pings(), (OP_TEXT, True, b"err:the targetwent away"))
             self.assertEqual((await p.hub_recv_skip_pings())[0], OP_CLOSE)
@@ -242,7 +211,7 @@ class Streams(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_before_far_eof_cuts(self):
         async with Pair() as p:
-            conn = _conn.Conn(p.client, "id", "connect")
+            conn = _conn.Conn(p.client, "id", pfrelay.Side.CONNECT)
             await conn.close()
             self.assertEqual(await p.hub_recv_skip_pings(), (OP_TEXT, True, b"eof"))
             with self.assertRaises(pfrelay.LinkError):
@@ -253,7 +222,7 @@ class Streams(unittest.IsolatedAsyncioTestCase):
             old = (_conn.Conn._PING_EVERY, _conn.Conn._SILENCE)
             _conn.Conn._PING_EVERY, _conn.Conn._SILENCE = 0.1, 0.5
             try:
-                conn = _conn.Conn(p.client, "id", "connect")
+                conn = _conn.Conn(p.client, "id", pfrelay.Side.CONNECT)
                 op, _, _ = await p.hub_recv(2)
                 self.assertEqual(op, OP_PING)
                 # The hub stays silent: the link counts as dead.

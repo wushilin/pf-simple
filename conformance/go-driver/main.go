@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,18 +16,85 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/wushilin/pf-simple/pfrelay"
 )
 
+// Mode is how a driver uses the SDK.
+type Mode string
+
+const (
+	ModeListen  Mode = "listen"  // the SDK's listen/accept and dial API, with the driver's own copy loop
+	ModeForward Mode = "forward" // the SDK's forwarders: Serve(target) and Connect(listener)
+)
+
+// Command is what the suite asks the driver to do.
+type Command string
+
+const (
+	CmdServe   Command = "serve"
+	CmdConnect Command = "connect"
+	CmdCheck   Command = "check"
+	CmdVersion Command = "version"
+)
+
+// Query is a question the suite asks on stdin while serve or connect runs.
+type Query string
+
+const (
+	QueryStats Query = "stats"
+	QueryConns Query = "conns"
+	QueryDrop  Query = "drop" // "drop <id>": drop that connection
+)
+
+// Event is a line the driver prints when the SDK reports one of its
+// events.
+type Event string
+
+const (
+	EventReady   Event = "ready"     // the first registration (serve)
+	EventOpened  Event = "opened"    // "opened <id> <side>"
+	EventClosed  Event = "closed"    // "closed <id> <sent> <received> ok|failed"
+	EventRefused Event = "refused"   // "refused <id>"
+	EventUp      Event = "tunnel up" // Watch: reachable (connect)
+	EventDown    Event = "tunnel down"
+)
+
+// Outcome is how a closed connection ended, in EventClosed.
+type Outcome string
+
+const (
+	OutcomeOK     Outcome = "ok"
+	OutcomeFailed Outcome = "failed"
+)
+
+// StatsAnswer is the answer to QueryStats.
+type StatsAnswer struct {
+	Opened   uint64 `json:"opened"`
+	Active   uint64 `json:"active"`
+	Failed   uint64 `json:"failed"`
+	Sent     int64  `json:"sent"`
+	Received int64  `json:"received"`
+}
+
+// ConnAnswer is one entry of the answer to QueryConns.
+type ConnAnswer struct {
+	ID       string       `json:"id"`
+	Side     pfrelay.Side `json:"side"`
+	Sent     int64        `json:"sent"`
+	Received int64        `json:"received"`
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fail(2, "usage: go-driver serve|connect|check|version [flags]")
 	}
-	cmd := os.Args[1]
-	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	cmd := Command(os.Args[1])
+	fs := flag.NewFlagSet(string(cmd), flag.ExitOnError)
 	server := fs.String("server", "", "hub URL")
 	ca := fs.String("ca", "", "PEM file of the hub's certificate")
 	word := fs.String("word", "", "the tunnel's word")
@@ -35,7 +103,13 @@ func main() {
 	name := fs.String("name", "conformance", "tunnel name")
 	target := fs.String("target", "", "serve: host:port to forward to")
 	listen := fs.String("listen", "", "connect: host:port to listen on")
+	modeFlag := fs.String("mode", string(ModeListen), "listen: the SDK's listen/accept and dial API; forward: its forwarders")
+	noAccept := fs.Bool("no-accept", false, "serve: register, but never accept a connection")
 	_ = fs.Parse(os.Args[2:])
+	mode := Mode(*modeFlag)
+	if mode != ModeListen && mode != ModeForward {
+		fail(2, "unknown mode "+*modeFlag)
+	}
 
 	tlsConfig := &tls.Config{}
 	if *ca != "" {
@@ -56,22 +130,58 @@ func main() {
 	}
 	c.ServeToken, c.ClientToken, c.Name, c.Target = *serveToken, *clientToken, *name, *target
 	c.Agent = "pfrelay-go conformance"
+	var ready sync.Once
+	c.Events = pfrelay.Events{
+		OnServing: func(up bool) {
+			if up {
+				ready.Do(func() { say(string(EventReady)) })
+			}
+		},
+		OnTunnel: func(up bool, _ error) {
+			if up {
+				say(string(EventUp))
+			} else {
+				say(string(EventDown))
+			}
+		},
+		OnOpen: func(ci pfrelay.ConnInfo) {
+			say(fmt.Sprintf("%s %s %s", EventOpened, ci.ID, ci.Side))
+		},
+		OnClose: func(ci pfrelay.ConnInfo, err error) {
+			outcome := OutcomeOK
+			if err != nil {
+				outcome = OutcomeFailed
+			}
+			say(fmt.Sprintf("%s %s %d %d %s", EventClosed, ci.ID, ci.Sent, ci.Received, outcome))
+		},
+		OnRefuse: func(id pfrelay.ConnID, _ string) {
+			say(fmt.Sprintf("%s %s", EventRefused, id))
+		},
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	switch cmd {
-	case "version":
+	if cmd == CmdServe || cmd == CmdConnect {
+		go queries(c)
+	}
+	switch {
+	case cmd == CmdVersion:
 		info, err := c.Probe(ctx)
 		check(err)
 		out, _ := json.Marshal(info)
-		fmt.Println(string(out))
-	case "check":
+		say(string(out))
+	case cmd == CmdCheck:
 		check(c.Check(ctx))
-	case "serve":
-		l, err := c.Listen(ctx)
+	case cmd == CmdServe && mode == ModeForward:
+		check(c.Serve(ctx, *target))
+	case cmd == CmdServe:
+		l, err := c.Listen(ctx) // its registration says EventReady
 		check(err)
-		fmt.Println("ready")
 		go func() { <-ctx.Done(); l.Close() }()
+		if *noAccept {
+			<-ctx.Done()
+			return
+		}
 		for {
 			conn, err := l.AcceptConn()
 			if err != nil {
@@ -79,10 +189,15 @@ func main() {
 			}
 			go serveOne(conn, *target)
 		}
-	case "connect":
+	case cmd == CmdConnect:
 		ln, err := net.Listen("tcp", *listen)
 		check(err)
-		fmt.Println("listening " + ln.Addr().String())
+		say("listening " + ln.Addr().String())
+		go c.Watch(ctx)
+		if mode == ModeForward {
+			check(c.Connect(ctx, ln))
+			return
+		}
 		go func() { <-ctx.Done(); ln.Close() }()
 		for {
 			local, err := ln.Accept()
@@ -100,7 +215,7 @@ func main() {
 			}()
 		}
 	default:
-		fail(2, "unknown command "+cmd)
+		fail(2, "unknown command "+string(cmd))
 	}
 }
 
@@ -141,6 +256,52 @@ func pipe(local *net.TCPConn, conn *pfrelay.Conn) {
 	}
 	conn.Close()
 	local.Close()
+}
+
+var out sync.Mutex
+
+// say prints one line of output; lines never interleave.
+func say(line string) {
+	out.Lock()
+	defer out.Unlock()
+	fmt.Println(line)
+}
+
+// queries answers the suite's questions on stdin: "stats" and "conns".
+func queries(c *pfrelay.Client) {
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		word, arg, _ := strings.Cut(strings.TrimSpace(sc.Text()), " ")
+		q := Query(word)
+		var answer any
+		switch q {
+		case QueryDrop:
+			answer = dropByName(c, arg)
+		case QueryStats:
+			st := c.Stats()
+			answer = StatsAnswer{Opened: st.Opened, Active: st.Active, Failed: st.Failed, Sent: st.Sent, Received: st.Received}
+		case QueryConns:
+			list := []ConnAnswer{}
+			for _, ci := range c.Conns() {
+				list = append(list, ConnAnswer{ID: ci.ID.String(), Side: ci.Side, Sent: ci.Sent, Received: ci.Received})
+			}
+			answer = list
+		default:
+			continue
+		}
+		b, _ := json.Marshal(answer)
+		say(string(q) + " " + string(b))
+	}
+}
+
+// dropByName drops the open connection whose id prints as name.
+func dropByName(c *pfrelay.Client, name string) bool {
+	for _, ci := range c.Conns() {
+		if ci.ID.String() == name {
+			return c.Drop(ci.ID, "dropped by the conformance suite")
+		}
+	}
+	return false
 }
 
 // check exits with the code the conformance suite expects for err.

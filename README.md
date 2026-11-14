@@ -650,6 +650,34 @@ the connection, telling the far end why) and `Err()` (why the far end
 dropped it). `Client.Stats()` and `Client.Conns()` report the client's own
 connections and byte counts.
 
+`Client.Serve(ctx, "localhost:22")` and `Client.Connect(ctx, listener)`
+forward to a TCP target and from a local port, as `pf-client` does.
+`Client.Watch` keeps checking whether the tunnel is up.
+
+For lifecycle rules, set handlers in `Client.Events`. None is set by
+default. Every event names its connection by a `ConnID`, an opaque id that
+prints as the hub's connection id, and `Client.Drop(id, reason)` ends any
+open connection by that id:
+
+```go
+c.Events = pfrelay.Events{
+	OnOpen:  func(ci pfrelay.ConnInfo) { log.Printf("%s opened", ci.ID) },
+	OnClose: func(ci pfrelay.ConnInfo, err error) { log.Printf("%s closed: %v", ci.ID, err) },
+	OnRefuse: func(id pfrelay.ConnID, why string) { log.Printf("%s refused: %s", id, why) },
+	OnServing: func(up bool) { log.Printf("registered: %v", up) },
+}
+// e.g. no connection may last longer than an hour
+go func() {
+	for range time.Tick(time.Minute) {
+		for _, ci := range c.Conns() {
+			if time.Since(ci.Opened) > time.Hour {
+				c.Drop(ci.ID, "connections are limited to an hour")
+			}
+		}
+	}
+}()
+```
+
 SDKs for other languages are under [`sdk/`](sdk). All of them speak the
 same protocol, which is specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 Every SDK has to pass the conformance suite in

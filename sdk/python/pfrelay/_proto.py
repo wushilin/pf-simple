@@ -25,6 +25,9 @@ __all__ = [
     "RemoteError",
     "LinkError",
     "ClosedError",
+    "DroppedError",
+    "ConnID",
+    "Side",
     "ServerInfo",
     "new_word",
     "normalize_word",
@@ -152,6 +155,62 @@ class LinkError(PfRelayError, ConnectionError):
 
 class ClosedError(PfRelayError):
     """The connection or listener was closed by this side."""
+
+
+class DroppedError(PfRelayError):
+    """How a connection ended that this side dropped, with Conn.fail or
+    Client.drop."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+    def __str__(self) -> str:
+        return f"dropped by this side: {self.reason}"
+
+
+class ConnID:
+    """Names one connection through the tunnel: the id the hub gave it, the
+    same on both ends. It is opaque: compare it, hash it, print it with
+    str(). ConnID("") names nothing and is falsy."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str = ""):
+        object.__setattr__(self, "_value", str(value))
+
+    def __setattr__(self, name, value):
+        raise AttributeError("ConnID is immutable")
+
+    def __str__(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return f"ConnID({self._value!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ConnID) and other._value == self._value
+
+    def __hash__(self) -> int:
+        return hash((ConnID, self._value))
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+    @property
+    def short(self) -> str:
+        """The start of the id, enough to tell connections apart in a log."""
+        return self._value[:8]
+
+
+class Side(str, enum.Enum):
+    """Which end of the tunnel a connection belongs to."""
+
+    CONNECT = "connect"  # opened by dial or the connect forwarder
+    SERVE = "serve"  # brought in by listen or the serve forwarder
+
+    def __str__(self) -> str:
+        return self.value
 
 
 def _release_of(proto: int) -> str:
@@ -293,8 +352,8 @@ def error_text(body: bytes) -> str:
     body = body[:2048]
     try:
         parsed = json.loads(body.decode("utf-8"))
-        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str) and parsed["error"]:
-            return parsed["error"]
+        if isinstance(parsed, dict) and isinstance(parsed.get(ERROR_FIELD), str) and parsed[ERROR_FIELD]:
+            return parsed[ERROR_FIELD]
     except (ValueError, UnicodeDecodeError):
         pass
     text = body.decode("utf-8", "replace").strip()
@@ -315,6 +374,29 @@ def clean_reason(s: str) -> str:
     return "".join(out)
 
 
+class Endpoint(str, enum.Enum):
+    """The hub's endpoints, under API_PATH (PROTOCOL.md 6)."""
+
+    SERVE = "serve"
+    CONNECT = "connect"
+    ACCEPT = "accept"
+    CHECK = "check"
+    VERSION = "version"
+
+    def __str__(self) -> str:
+        return self.value
+
+    @property
+    def path(self) -> str:
+        return f"{API_PATH}/{self.value}"
+
+
+# The control channel's message (PROTOCOL.md 7): {"open": "<id>"}.
+CONTROL_OPEN = "open"
+# A refusal's body (PROTOCOL.md 6): {"error": "<message>"}.
+ERROR_FIELD = "error"
+
+
 @dataclass(frozen=True)
 class ServerInfo:
     """The answer to a version probe."""
@@ -324,11 +406,27 @@ class ServerInfo:
     proto_max: int
     token: str
 
+    # The answer's field names on the wire.
+    FIELD_VERSION = "version"
+    FIELD_PROTO_MIN = "protoMin"
+    FIELD_PROTO_MAX = "protoMax"
+    FIELD_TOKEN = "token"
+
     def to_dict(self) -> dict:
         """The answer with the wire's field names."""
         return {
-            "version": self.version,
-            "protoMin": self.proto_min,
-            "protoMax": self.proto_max,
-            "token": self.token,
+            self.FIELD_VERSION: self.version,
+            self.FIELD_PROTO_MIN: self.proto_min,
+            self.FIELD_PROTO_MAX: self.proto_max,
+            self.FIELD_TOKEN: self.token,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServerInfo":
+        """Read the hub's answer; fields this SDK does not know are ignored."""
+        return cls(
+            version=str(d[cls.FIELD_VERSION]),
+            proto_min=int(d.get(cls.FIELD_PROTO_MIN, 0)),
+            proto_max=int(d.get(cls.FIELD_PROTO_MAX, 0)),
+            token=str(d.get(cls.FIELD_TOKEN, "")),
+        )

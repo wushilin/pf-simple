@@ -6,10 +6,12 @@ description = "Rust SDK for the pf-simple relay hub: serve a tunnel or connect t
 readme = "README.md"
 keywords = ["tunnel", "relay", "websocket", "pf-simple"]
 categories = ["network-programming", "asynchronous"]
-# TODO: license (the repository has no LICENSE file yet), repository
+repository = "https://github.com/wushilin/pf-simple"
+homepage = "https://github.com/wushilin/pf-simple"
+# TODO: license (the repository has no LICENSE file yet); crates.io refuses a crate without one
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["net", "io-util", "io-std", "time", "sync", "rt", "rt-multi-thread", "macros", "signal"] }
 tokio-util = "0.7"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }

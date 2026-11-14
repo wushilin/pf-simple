@@ -77,3 +77,11 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+
+  # The Go SDK (github.com/wushilin/pf-simple/pfrelay) is published by the
+  # tag itself: no registry, no login. Asking the Go module proxy for the
+  # new version makes it available at once, and lists it on pkg.go.dev.
+  go-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS "https://proxy.golang.org/github.com/wushilin/pf-simple/@v/${GITHUB_REF_NAME}.info"

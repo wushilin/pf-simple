@@ -34,10 +34,6 @@ import java.util.concurrent.locks.ReentrantLock;
  * threads.
  */
 public final class Conn implements Closeable {
-    // Timing; package-private so tests can shorten them.
-    static volatile long pingEveryMs = 10_000;
-    static volatile int linkSilenceMs = 30_000;
-
     static final int CHUNK = 64 << 10;
     static final int MAX_DATA_FRAME = 1 << 20;
     static final int MAX_TEXT_FRAME = 1024;
@@ -45,8 +41,9 @@ public final class Conn implements Closeable {
     private static final Object EOF_MARK = new Object();
 
     private final WebSocket ws;
-    private final Registry registry;
+    private final Client client;
     private final Registry.Record rec;
+    private final int linkSilenceMs;
 
     // reading: the reader thread hands chunks over, at most a few ahead
     private final ArrayBlockingQueue<Object> chunks = new ArrayBlockingQueue<>(4);
@@ -60,7 +57,8 @@ public final class Conn implements Closeable {
     private final AtomicBoolean readEOF = new AtomicBoolean();
     private final AtomicBoolean wroteEOF = new AtomicBoolean();
     private final AtomicBoolean failed = new AtomicBoolean();
-    private final AtomicReference<IOException> failure = new AtomicReference<>();
+    private final AtomicReference<IOException> failure = new AtomicReference<>(); // what the reader saw
+    private final AtomicReference<IOException> broke = new AtomicReference<>(); // what broke it here
     private volatile String goneReason;
     private final CountDownLatch gone = new CountDownLatch(1);
     private volatile boolean closed; // close has begun: errors from here on are our own doing
@@ -72,16 +70,19 @@ public final class Conn implements Closeable {
     private final InputStream input = new In();
     private final OutputStream output = new Out();
 
-    Conn(WebSocket ws, Registry registry, String id, Side side) throws IOException {
+    /** Takes over ws, and reports the connection opened. */
+    Conn(WebSocket ws, Client client, ConnId id, Side side) throws IOException {
         this.ws = ws;
-        this.registry = registry;
-        this.rec = registry.add(id, side);
-        rec.conn = this;
+        this.client = client;
+        Timing timing = client.timing();
+        this.linkSilenceMs = timing.linkSilenceMs();
         ws.setWriteTimeout(0); // data may be held back by the network for as long as it likes
         ws.setReadTimeout(linkSilenceMs);
+        this.rec = client.registry.add(id, side);
+        rec.conn = this;
         // Pings come from a timer of their own, not in reply to the peer's, so
         // reading never has to write and the two directions stay independent.
-        pinger = Sched.every(pingEveryMs, () -> {
+        pinger = Sched.every(timing.pingEveryMs(), () -> {
             try {
                 ws.tryWriteFrame(WebSocket.OP_PING, new byte[0]);
             } catch (IOException e) {
@@ -89,10 +90,11 @@ public final class Conn implements Closeable {
             }
         });
         Sched.go(this::readLoop);
+        client.opened(rec);
     }
 
-    /** The hub's id for this connection. */
-    public String id() {
+    /** The hub's id for this connection, the same on both ends. */
+    public ConnId id() {
         return rec.id;
     }
 
@@ -156,11 +158,17 @@ public final class Conn implements Closeable {
                 ws.writeFrame(WebSocket.OP_TEXT, EOF_TEXT);
             }
         } catch (IOException e) {
-            failed.set(true);
+            broke(e);
             throw e;
         } finally {
             wlock.unlock();
         }
+    }
+
+    /** Records the first error that broke the connection on this side. */
+    private void broke(IOException e) {
+        failed.set(true);
+        broke.compareAndSet(null, e);
     }
 
     /**
@@ -186,7 +194,12 @@ public final class Conn implements Closeable {
      * {@link RemoteException} with this reason.
      */
     public void fail(String reason) {
-        failed.set(true);
+        failWith(reason, new DroppedException(reason));
+    }
+
+    /** Drops the connection, telling the far end reason; cause is how it ended here. */
+    void failWith(String reason, IOException cause) {
+        broke(cause);
         if (!closeOnce.compareAndSet(false, true)) {
             return;
         }
@@ -203,7 +216,47 @@ public final class Conn implements Closeable {
             // the link is gone already
         }
         ws.abort();
-        registry.finish(rec, true);
+        client.closed(rec, broke.get());
+    }
+
+    /**
+     * Drops the stream for {@link Client#drop}: the far end hears reason,
+     * and this end's reads and writes fail from now on. The connection is
+     * retired, and reported closed, when whoever holds it closes it.
+     */
+    void cut(String reason) {
+        failed.set(true);
+        closed = true;
+        pinger.cancel(false);
+        ws.beginClose();
+        Sched.go(() -> {
+            try {
+                if (sentClose.compareAndSet(false, true)) {
+                    ws.writeFrame(WebSocket.OP_TEXT, ("err:" + cleanReason(reason, 200))
+                            .getBytes(StandardCharsets.UTF_8));
+                    ws.writeFrame(WebSocket.OP_CLOSE, new byte[0]);
+                }
+            } catch (IOException ignored) {
+                // the link is gone already
+            }
+            ws.abort();
+        });
+    }
+
+    /** Cuts the connection without a word to the far end; cause is how it ended here. */
+    void abortWith(IOException cause) {
+        broke(cause);
+        close();
+    }
+
+    /** Whether the far end is gone for good: it closed the stream, or the link died. */
+    boolean isGone() {
+        return gone.getCount() == 0;
+    }
+
+    /** What the far end said when it went, after its half-close; null if nothing. */
+    String goneReason() {
+        return goneReason;
     }
 
     /**
@@ -245,7 +298,8 @@ public final class Conn implements Closeable {
             }
         }
         ws.abort();
-        registry.finish(rec, failed.get() || error() != null);
+        IOException err = broke.get();
+        client.closed(rec, err != null ? err : error());
     }
 
     // ---------- the reader thread ----------
@@ -432,7 +486,7 @@ public final class Conn implements Closeable {
                     readDone = true;
                 } else if (o instanceof IOException) {
                     readErr = (IOException) o;
-                    failed.set(true);
+                    broke(readErr);
                 } else {
                     byte[] chunk = (byte[]) o;
                     if (chunk.length > 0) {
@@ -474,7 +528,7 @@ public final class Conn implements Closeable {
                 rec.sent.addAndGet(n);
             }
         } catch (IOException e) {
-            failed.set(true);
+            broke(e);
             throw e;
         } finally {
             wlock.unlock();

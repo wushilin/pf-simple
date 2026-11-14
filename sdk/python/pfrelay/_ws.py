@@ -88,6 +88,14 @@ def encode_frame(op: int, payload: bytes, *, mask: bool = True, fin: bool = True
     return head + key + mask_bytes(payload, key)
 
 
+class SilentLinkError(LinkError):
+    """The link was silent for longer than allowed: it counts as dead."""
+
+
+class PeerClosedError(LinkError):
+    """The far end closed a stream that had not finished."""
+
+
 class FrameError(LinkError):
     """The far end broke the framing rules."""
 
@@ -150,11 +158,11 @@ class WebSocket:
             return await self.reader.readexactly(n)
         except asyncio.IncompleteReadError:
             if self.timed_out:
-                raise LinkError("the link to the server was silent for too long") from None
+                raise SilentLinkError("the link to the server was silent for too long") from None
             raise LinkError("the connection to the server ended") from None
         except (ConnectionError, OSError, ssl.SSLError) as e:
             if self.timed_out:
-                raise LinkError("the link to the server was silent for too long") from None
+                raise SilentLinkError("the link to the server was silent for too long") from None
             raise LinkError(f"the connection to the server was lost ({e})") from None
         finally:
             self._waiting = False

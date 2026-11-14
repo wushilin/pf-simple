@@ -39,14 +39,18 @@
 mod client;
 mod conn;
 mod error;
+mod events;
+mod forward;
 mod http;
 mod listener;
 mod proto;
 mod values;
 mod ws;
 
-pub use client::{Client, ClientBuilder, ServerInfo, DEFAULT_AGENT, DEFAULT_NAME};
+pub use client::{Client, ClientBuilder, ServerInfo, Timing, DEFAULT_AGENT, DEFAULT_NAME};
+pub use events::{ConnId, Events};
 pub use conn::{Conn, ConnInfo, Side, Stats, LINK_SILENCE, PING_EVERY};
+pub use forward::{TARGET_DIAL_TIMEOUT, TARGET_UNREACHABLE};
 pub use error::{Error, ProtoError, RemoteError, Result};
 pub use listener::{Listener, CONTROL_PING, CONTROL_SILENCE, LISTEN_BACKLOG};
 pub use proto::{negotiate, parse_proto_range, proto_range, server_proto, Feature, PROTO_MAX, PROTO_MIN};
@@ -59,3 +63,8 @@ pub const STDIO_TARGET: &str = "stdio";
 /// Re-exported so a TLS configuration can be built without depending on
 /// rustls directly.
 pub use tokio_rustls::rustls;
+
+#[cfg(test)]
+mod testhub;
+#[cfg(test)]
+mod tests;

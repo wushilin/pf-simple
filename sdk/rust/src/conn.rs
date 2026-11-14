@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
@@ -16,6 +16,7 @@ use tokio::time::Instant;
 use tokio_util::sync::PollSender;
 
 use crate::error::{Error, RemoteError, Result};
+use crate::events::{ConnId, Events};
 use crate::http::{Stream as Tls, Upgraded};
 use crate::values::clean_reason;
 use crate::ws::{self, FrameReader, CHUNK, OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_TEXT, STREAM_LIMITS};
@@ -33,8 +34,10 @@ const WRITE_QUEUE: usize = 8;
 const READ_QUEUE: usize = 4;
 const CLOSE_NORMAL: [u8; 2] = [0x03, 0xE8];
 
-/// Which end of the tunnel a connection belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Which end of the tunnel a connection belongs to. It prints, parses and
+/// serializes as `connect` or `serve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Side {
     /// Opened by [`Client::dial`](crate::Client::dial).
     Connect,
@@ -43,6 +46,8 @@ pub enum Side {
 }
 
 impl Side {
+    pub const ALL: [Side; 2] = [Side::Connect, Side::Serve];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Side::Connect => "connect",
@@ -51,11 +56,27 @@ impl Side {
     }
 }
 
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Side {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Side> {
+        Side::ALL
+            .into_iter()
+            .find(|side| side.as_str() == s)
+            .ok_or_else(|| Error::Config(format!("unknown side {s:?}")))
+    }
+}
+
 /// A snapshot of one connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnInfo {
     /// The hub's connection id.
-    pub id: String,
+    pub id: ConnId,
     pub side: Side,
     /// When the connection was opened.
     pub opened: SystemTime,
@@ -86,7 +107,7 @@ pub struct Stats {
 
 pub(crate) struct Record {
     key: u64,
-    id: String,
+    id: ConnId,
     side: Side,
     opened: SystemTime,
     sent: AtomicI64,
@@ -94,6 +115,10 @@ pub(crate) struct Record {
     wrote_eof: AtomicBool,
     read_eof: AtomicBool,
     finished: AtomicBool,
+    /// The reason this side dropped it with, if it did.
+    dropped: Mutex<Option<String>>,
+    /// The stream, for `drop_conn`.
+    stream: OnceLock<Weak<Shared>>,
 }
 
 impl Record {
@@ -119,18 +144,23 @@ struct Totals {
     received: i64,
 }
 
-/// A client's live connections and its totals.
+/// A client's live connections, its totals, and its event handlers.
 #[derive(Default)]
 pub(crate) struct Registry {
     next: AtomicU64,
     totals: Mutex<Totals>,
+    pub(crate) events: Events,
 }
 
 impl Registry {
-    fn add(&self, id: String, side: Side) -> Arc<Record> {
+    pub(crate) fn new(events: Events) -> Registry {
+        Registry { events, ..Registry::default() }
+    }
+
+    fn add(&self, id: &str, side: Side) -> Arc<Record> {
         let rec = Arc::new(Record {
             key: self.next.fetch_add(1, Ordering::Relaxed),
-            id,
+            id: ConnId::new(id),
             side,
             opened: SystemTime::now(),
             sent: AtomicI64::new(0),
@@ -138,6 +168,8 @@ impl Registry {
             wrote_eof: AtomicBool::new(false),
             read_eof: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            dropped: Mutex::new(None),
+            stream: OnceLock::new(),
         });
         let mut t = self.totals.lock().unwrap();
         t.live.insert(rec.key, rec.clone());
@@ -145,17 +177,43 @@ impl Registry {
         rec
     }
 
-    fn finish(&self, rec: &Record, failed: bool) {
+    /// Moves `rec` out of the live set and reports it, once. `err` is why it
+    /// failed; a connection this side dropped reads as [`Error::Dropped`].
+    fn finish(&self, rec: &Record, err: Option<Error>) -> bool {
         if rec.finished.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
-        let mut t = self.totals.lock().unwrap();
-        t.live.remove(&rec.key);
-        if failed {
-            t.failed += 1;
+        let err = match (err, rec.dropped.lock().unwrap().clone()) {
+            (Some(_), Some(reason)) => Some(Error::Dropped { reason }),
+            (err, _) => err,
+        };
+        {
+            let mut t = self.totals.lock().unwrap();
+            t.live.remove(&rec.key);
+            if err.is_some() {
+                t.failed += 1;
+            }
+            t.sent += rec.sent.load(Ordering::Relaxed);
+            t.received += rec.received.load(Ordering::Relaxed);
         }
-        t.sent += rec.sent.load(Ordering::Relaxed);
-        t.received += rec.received.load(Ordering::Relaxed);
+        if let Some(f) = &self.events.close {
+            f(&rec.info(), err.as_ref());
+        }
+        true
+    }
+
+    /// Drops the open connection `id` and tells the far end `reason`.
+    pub(crate) fn drop_conn(&self, id: &ConnId, reason: &str) -> bool {
+        let rec = self.totals.lock().unwrap().live.values().find(|r| &r.id == id).cloned();
+        let Some(sh) = rec.as_ref().and_then(|r| r.stream.get()).and_then(Weak::upgrade) else {
+            return false;
+        };
+        let reason = clean_local(reason);
+        sh.rec.dropped.lock().unwrap().get_or_insert(reason.clone());
+        sh.set_failure(Failure::Dropped(reason.clone()));
+        sh.closing.send_replace(true);
+        let _ = sh.ctl.send(Ctl::Fail(reason));
+        true
     }
 
     pub(crate) fn stats(&self) -> Stats {
@@ -188,6 +246,7 @@ enum Failure {
     Silent,
     Lost(String),
     Protocol(String),
+    Dropped(String),
     Closed,
 }
 
@@ -202,6 +261,7 @@ impl Failure {
             )),
             Failure::Lost(why) => Error::Link(format!("the link to the server was lost ({why})")),
             Failure::Protocol(why) => Error::Protocol(why.clone()),
+            Failure::Dropped(reason) => Error::Dropped { reason: reason.clone() },
             Failure::Closed => Error::Closed,
         }
     }
@@ -212,6 +272,7 @@ impl Failure {
             Failure::PeerClosed | Failure::Lost(_) => io::ErrorKind::ConnectionReset,
             Failure::Silent => io::ErrorKind::TimedOut,
             Failure::Protocol(_) => io::ErrorKind::InvalidData,
+            Failure::Dropped(_) => io::ErrorKind::ConnectionAborted,
             Failure::Closed => io::ErrorKind::NotConnected,
         };
         io::Error::new(kind, self.to_error())
@@ -244,6 +305,8 @@ struct Shared {
     peer_close: Notify,
     /// This end failed: a broken read or write, or `fail`.
     failed: AtomicBool,
+    /// Tells the writer to close or fail the stream.
+    ctl: mpsc::UnboundedSender<Ctl>,
 }
 
 impl Shared {
@@ -303,7 +366,6 @@ pub struct Conn {
     registry: Arc<Registry>,
     rd: Mutex<ReadState>,
     wr: Mutex<WriteState>,
-    ctl: mpsc::UnboundedSender<Ctl>,
     writer: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
 }
@@ -315,8 +377,9 @@ impl std::fmt::Debug for Conn {
 }
 
 impl Conn {
-    pub(crate) fn start(up: Upgraded, id: String, side: Side, registry: Arc<Registry>) -> Conn {
+    pub(crate) fn start(up: Upgraded, id: &str, side: Side, registry: Arc<Registry>) -> Conn {
         let rec = registry.add(id, side);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             rec,
             failure: Mutex::new(None),
@@ -326,27 +389,31 @@ impl Conn {
             closing: watch::channel(false).0,
             peer_close: Notify::new(),
             failed: AtomicBool::new(false),
+            ctl: ctl_tx,
         });
+        let _ = shared.rec.stream.set(Arc::downgrade(&shared));
         let (r, w) = tokio::io::split(up.stream);
         let (ev_tx, ev_rx) = mpsc::channel(READ_QUEUE);
         let (cmd_tx, cmd_rx) = mpsc::channel(WRITE_QUEUE);
-        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let frames = FrameReader::new(r, up.leftover, STREAM_LIMITS, LINK_SILENCE);
         let reader = tokio::spawn(read_loop(frames, ev_tx, shared.clone())).abort_handle();
         let writer = tokio::spawn(write_loop(w, cmd_rx, ctl_rx, shared.clone(), reader));
-        Conn {
+        let conn = Conn {
             shared,
             registry,
             rd: Mutex::new(ReadState { rx: ev_rx, pending: Vec::new(), pos: 0, end: None }),
             wr: Mutex::new(WriteState { tx: PollSender::new(cmd_tx), eof: false }),
-            ctl: ctl_tx,
             writer: Mutex::new(Some(writer)),
             closed: AtomicBool::new(false),
+        };
+        if let Some(f) = &conn.registry.events.open {
+            f(&conn.shared.rec.info());
         }
+        conn
     }
 
-    /// The hub's id for this connection.
-    pub fn id(&self) -> &str {
+    /// The hub's id for this connection, the same on both ends.
+    pub fn id(&self) -> &ConnId {
         &self.shared.rec.id
     }
 
@@ -391,9 +458,10 @@ impl Conn {
     /// a [`RemoteError`] carrying `reason`.
     pub async fn fail(&self, reason: &str) {
         self.shared.failed.store(true, Ordering::Release);
-        let reason: String = reason.chars().filter(|c| !c.is_control()).collect();
-        self.end(Ctl::Fail(reason)).await;
-        self.registry.finish(&self.shared.rec, true);
+        let reason = clean_local(reason);
+        self.end(Ctl::Fail(reason.clone())).await;
+        let err = self.local_error().unwrap_or(Error::Dropped { reason });
+        self.registry.finish(&self.shared.rec, Some(err));
     }
 
     /// Ends the connection, after sending what was written. If this end has
@@ -401,9 +469,33 @@ impl Conn {
     /// the close is clean; otherwise the far end sees the connection cut.
     pub async fn close(&self) -> Result<()> {
         self.end(Ctl::Close).await;
-        let failed = self.shared.failed.load(Ordering::Acquire) || self.err().is_some();
-        self.registry.finish(&self.shared.rec, failed);
+        self.registry.finish(&self.shared.rec, self.local_error().or_else(|| self.err()));
         Ok(())
+    }
+
+    /// Ends a broken connection: with `reason` for the far end, or cut
+    /// without one. It ends with the first error this end saw, or `err`.
+    pub(crate) async fn end_with(&self, reason: Option<&str>, err: Error) {
+        self.shared.failed.store(true, Ordering::Release);
+        let how = match reason {
+            Some(r) => Ctl::Fail(clean_local(r)),
+            None => Ctl::Close,
+        };
+        self.end(how).await;
+        let err = self.local_error().unwrap_or(err);
+        self.registry.finish(&self.shared.rec, Some(err));
+    }
+
+    /// The first error that broke this end: reading or writing.
+    fn local_error(&self) -> Option<Error> {
+        if let Some(f) = self.shared.failure.lock().unwrap().as_ref() {
+            return Some(f.to_error());
+        }
+        match self.shared.write_error.lock().unwrap().as_ref() {
+            // The far end's close after a clean finish breaks nothing.
+            None | Some(Failure::PeerClosed) => None,
+            Some(f) => Some(f.to_error()),
+        }
     }
 
     async fn end(&self, how: Ctl) {
@@ -411,7 +503,7 @@ impl Conn {
             return;
         }
         self.shared.closing.send_replace(true);
-        let _ = self.ctl.send(how);
+        let _ = self.shared.ctl.send(how);
         let writer = self.writer.lock().unwrap().take();
         if let Some(w) = writer {
             let _ = w.await;
@@ -511,7 +603,14 @@ impl Conn {
     }
 
     fn writer_gone(&self) -> io::Error {
-        self.shared.write_error.lock().unwrap().clone().unwrap_or(Failure::Closed).to_io()
+        let dropped = match self.shared.failure.lock().unwrap().as_ref() {
+            Some(f @ Failure::Dropped(_)) => Some(f.clone()),
+            _ => None,
+        };
+        dropped
+            .or_else(|| self.shared.write_error.lock().unwrap().clone())
+            .unwrap_or(Failure::Closed)
+            .to_io()
     }
 }
 
@@ -520,8 +619,9 @@ impl Drop for Conn {
         if !self.closed.swap(true, Ordering::AcqRel) {
             // The writer sees its channels close and closes as `close` would.
             self.shared.closing.send_replace(true);
-            let failed = self.shared.failed.load(Ordering::Acquire) || self.err().is_some();
-            self.registry.finish(&self.shared.rec, failed);
+            let _ = self.shared.ctl.send(Ctl::Close);
+            let err = self.local_error().or_else(|| self.err());
+            self.registry.finish(&self.shared.rec, err);
         }
     }
 }
@@ -560,6 +660,11 @@ impl AsyncWrite for Conn {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_shutdown_inner(cx)
     }
+}
+
+/// A reason this side gives, made fit for a text frame.
+fn clean_local(reason: &str) -> String {
+    reason.chars().filter(|c| !c.is_control()).collect()
 }
 
 // ---------- the reader ----------
@@ -858,7 +963,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(1 << 20);
         let reg = Arc::new(Registry::default());
         let up = Upgraded { stream: Box::new(a), leftover: Vec::new(), head: Head::default() };
-        (Conn::start(up, "8f14e45fceea167a".into(), Side::Connect, reg.clone()), Hub(b), reg)
+        (Conn::start(up, "8f14e45fceea167a", Side::Connect, reg.clone()), Hub(b), reg)
     }
 
     #[tokio::test]
