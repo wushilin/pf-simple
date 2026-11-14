@@ -156,15 +156,18 @@ function relayCard(w) {
   title.title = "The name the serving side gave this tunnel";
   const locked = el("span", "relay-chip locked", "Client token");
   locked.title = "The serving side asks for a client token: connecting needs it as well as the word";
+  const reuseChip = el("span", "relay-chip reuse", "Reuse");
+  reuseChip.title = "The serving side's connections are reused: when a connection ends cleanly, its connection to the serving side stays open and carries the next one (tunnel protocol 2)";
   const actions = el("div", "relay-actions");
+  const limits = relayButton("Reuse limits", "This word's own limits on idle connections to its serving side");
   const reset = relayButton("Reset", "End this tunnel and its connections; the serving side registers again on its own");
   const clear = relayButton("Clear binding", "Remove the binding of this word to its token, and end its tunnel", true);
-  actions.append(reset, clear);
-  head.append(chip, route, locked, title, actions);
+  actions.append(limits, reset, clear);
+  head.append(chip, route, locked, reuseChip, title, actions);
 
   const meta = el("div", "relay-meta");
   const refs = {
-    card, chip, locked, title, arrow, target, reset, clear, sessions: new Map(),
+    card, chip, locked, reuseChip, title, arrow, target, reset, clear, sessions: new Map(), idleRows: new Map(),
     owner: relayFact(meta, "Token"),
     from: relayFact(meta, "Served from"),
     client: relayFact(meta, "By"),
@@ -175,7 +178,12 @@ function relayCard(w) {
     up: relayFact(meta, "Sent"),
     down: relayFact(meta, "Received"),
     failed: relayFact(meta, "Failed"),
+    idle: relayFact(meta, "Idle connections"),
+    reused: relayFact(meta, "Reused"),
   };
+  refs.idle.wrap.title = "Connections to the serving side kept open for this tunnel's next connections, and the tunnel's limits on them";
+  refs.reused.wrap.title = "Connections that ran on a reused connection to the serving side, of all accepted";
+  refs.limitsForm = relayLimitsForm(w, refs);
   const rows = el("div", "relay-rows");
   const cols = el("div", "r-cols r-head");
   for (const [text, cls] of [["Connection", ""], ["State", ""], ["Connecting side", ""], ["Serving side", ""], ["Opened", "r"], ["Age", "r"], ["To serving", "r"], ["To connecting", "r"], ["", ""]]) {
@@ -185,7 +193,11 @@ function relayCard(w) {
   refs.body = el("div");
   refs.note = el("div", "relay-none");
   rows.append(cols, refs.body);
-  card.append(head, meta, rows, refs.note);
+  card.append(head, meta, refs.limitsForm.wrap, rows, refs.note);
+  limits.addEventListener("click", () => {
+    refs.limitsForm.wrap.hidden = !refs.limitsForm.wrap.hidden;
+    if (!refs.limitsForm.wrap.hidden) refs.limitsForm.fill(ui.state && ui.state.relay.words.find((x) => x.id === w.id), true);
+  });
 
   reset.addEventListener("click", () => relayArmed("reset:" + w.id, reset, "Reset", () =>
     api(`api/relay/${w.id}/reset`).then(() => toast(`Reset the tunnel ${w.name || w.word}`))
@@ -207,16 +219,87 @@ function relaySessionRow(p) {
   const row = el("div", "r-cols");
   const refs = {
     row,
-    id: el("span", "mono"), state: el("span", "r-state"), client: el("span", "mono"), serve: el("span", "mono"),
+    id: el("span", "mono"), state: el("span", "r-state"), mark: el("span", "r-reused"), client: el("span", "mono"), serve: el("span", "mono"),
     opened: el("span", "r num"), age: el("span", "r num"), up: relaySpeed("tx"), down: relaySpeed("rx"),
     stop: relayButton("Stop", "Reset this connection", true),
   };
   const last = el("span", "r");
   last.append(refs.stop);
-  row.append(refs.id, refs.state, refs.client, refs.serve, refs.opened, refs.age, refs.up.cell, refs.down.cell, last);
+  const stateCell = el("span");
+  stateCell.append(refs.state, refs.mark);
+  row.append(refs.id, stateCell, refs.client, refs.serve, refs.opened, refs.age, refs.up.cell, refs.down.cell, last);
   refs.stop.addEventListener("click", () => relayArmed("stop:" + p.id, refs.stop, "Stop", () =>
     api(`api/pipes/${p.id}/stop`).catch((e) => toast(`Could not stop #${p.id}: ${e.message}`, true))));
   return refs;
+}
+
+// relayIdleRow is an idle connection to the serving side, kept for reuse.
+function relayIdleRow(w, il) {
+  const row = el("div", "r-cols idle-leg");
+  const refs = {
+    row, id: el("span", "mono", `Leg ${il.leg}`), state: el("span", "r-state idle"),
+    client: el("span", "mono", "\u2014"), serve: el("span", "mono"),
+    opened: el("span", "r num"), age: el("span", "r num"),
+    carried: el("span", "r num"), closes: el("span", "r num"),
+    close: relayButton("Close", "Close this idle connection to the serving side"),
+  };
+  refs.id.title = "A connection to the serving side, kept open for reuse";
+  const last = el("span", "r");
+  last.append(refs.close);
+  row.append(refs.id, refs.state, refs.client, refs.serve, refs.opened, refs.age, refs.carried, refs.closes, last);
+  refs.close.addEventListener("click", () => api(`api/relay/${w.id}/legs/${il.leg}/close`)
+    .then(() => toast(`Closed idle leg ${il.leg} of ${w.name || w.word}`))
+    .catch((e) => toast(`Could not close it: ${e.message}`, true)));
+  return refs;
+}
+
+// relayLimitsForm edits a word's own limits on idle connections; empty
+// fields use the hub's.
+function relayLimitsForm(w, card) {
+  const wrap = el("div", "relay-reuse-word");
+  wrap.hidden = true;
+  const form = el("form", "reuse-form");
+  form.autocomplete = "off";
+  const field = (label, title, min, max) => {
+    const l = el("label", "", label + " ");
+    const input = el("input");
+    input.type = "number"; input.min = min; if (max) input.max = max;
+    l.title = title;
+    l.append(input);
+    form.append(l);
+    return input;
+  };
+  const idle = field("Idle limit (s)", "This word's idle limit; empty uses the hub's", 1, 3600);
+  const minI = field("Min idle", "This word's min idle; empty uses the hub's", 0, 1024);
+  const maxI = field("Max idle", "This word's max idle; empty uses the hub's", 0, 1024);
+  const save = el("button", "btn btn-primary", "Save");
+  save.type = "submit";
+  const hub = el("button", "btn btn-quiet", "Use the hub's");
+  hub.type = "button";
+  const error = el("span", "tenant-error");
+  form.append(save, hub, error);
+  wrap.append(form);
+  let dirty = false;
+  form.addEventListener("input", () => { dirty = true; });
+  const send = (body) => {
+    save.disabled = hub.disabled = true;
+    setText(error, "");
+    api(`api/relay/${w.id}/reuse`, body).then(() => { dirty = false; toast(`Saved the limits of ${w.name || w.word}`); })
+      .catch((e) => setText(error, e.message))
+      .finally(() => { save.disabled = hub.disabled = false; });
+  };
+  const num = (input) => input.value === "" ? null : Number(input.value);
+  form.addEventListener("submit", (ev) => { ev.preventDefault(); send({ idleSeconds: num(idle), minIdle: num(minI), maxIdle: num(maxI) }); });
+  hub.addEventListener("click", () => { idle.value = minI.value = maxI.value = ""; send({}); });
+  const fill = (word, force) => {
+    if (!word || (!force && (dirty || form.contains(document.activeElement)))) return;
+    const own = word.wordReuse || {};
+    idle.value = own.idleSeconds ?? ""; minI.value = own.minIdle ?? ""; maxI.value = own.maxIdle ?? "";
+    const r = (ui.state && ui.state.relay.reuse) || {};
+    idle.placeholder = r.idleSeconds ?? ""; minI.placeholder = r.minIdle ?? ""; maxI.placeholder = r.maxIdle ?? "";
+    if (force) dirty = false;
+  };
+  return { wrap, fill };
 }
 
 function paintRelayWord(c, w, now) {
@@ -225,6 +308,13 @@ function paintRelayWord(c, w, now) {
   c.card.classList.toggle("idle", !w.live);
   setText(c.title, w.name || "(unnamed)");
   c.locked.hidden = !(w.live && w.clientToken);
+  c.reuseChip.hidden = !(w.live && w.reuse);
+  const idle = w.idle || [];
+  c.idle.wrap.hidden = !(w.live && w.reuse);
+  setText(c.idle.value, `${idle.length} (min ${w.minIdle} · max ${w.maxIdle} · idle limit ${w.idleSeconds} s)`);
+  c.reused.wrap.hidden = !(w.live && w.reused > 0);
+  setText(c.reused.value, `${w.reused || 0} of ${w.accepted}`);
+  c.limitsForm.fill(w, false);
   c.arrow.hidden = c.target.hidden = !w.live;
   setText(c.target, w.live ? w.target || "(target not given)" : "");
   c.reset.hidden = !w.live;
@@ -265,6 +355,9 @@ function paintRelayWord(c, w, now) {
     r.state.title = half ? (p.upDone && p.downDone ? "Both sides have finished sending; closing"
       : p.upDone ? "The connecting side has finished sending; the serving side may still send"
       : "The serving side has finished sending; the connecting side may still send") : "Open in both directions";
+    const reused = (p.carried || 0) > 1;
+    setText(r.mark, reused ? "\u21bb" : "");
+    r.mark.title = reused ? `On a reused connection to the serving side (leg ${p.leg}), which has carried ${p.carried} connections` : "";
     setText(r.id, p.connId || "#" + p.id);
     r.id.title = `Connection ${p.connId}, #${p.id} in the flow log`;
     setText(r.client, p.clientRemote);
@@ -297,7 +390,29 @@ function paintRelayWord(c, w, now) {
     if (next !== r.row) c.body.insertBefore(r.row, next);
     anchor = r.row;
   }
-  c.rows.hidden = c.sessions.size === 0;
+  // Idle connections to the serving side, after the connections.
+  const seen = new Set();
+  for (const il of idle) {
+    seen.add(il.leg);
+    let r = c.idleRows.get(il.leg);
+    if (!r) { r = relayIdleRow(w, il); c.idleRows.set(il.leg, r); }
+    const next = anchor ? anchor.nextSibling : c.body.firstChild;
+    if (next !== r.row) c.body.insertBefore(r.row, next);
+    anchor = r.row;
+    setText(r.state, il.kept ? "Idle \u00b7 kept" : "Idle");
+    r.state.title = il.kept ? "Idle past the idle limit, kept by min idle" : "Open and unused, waiting for this tunnel's next connection";
+    setText(r.serve, il.serveAddr);
+    setText(r.opened, fmtClock(il.since));
+    r.opened.title = "Idle since " + new Date(il.since).toLocaleString();
+    setText(r.age, fmtAge(now - il.since));
+    setText(r.carried, `${il.carried} carried`);
+    const left = il.since + w.idleSeconds * 1000 - now;
+    setText(r.closes, il.kept ? "kept by min idle" : left > 0 ? `closes in ${fmtAge(left)}` : "closing");
+  }
+  for (const [leg, r] of c.idleRows) {
+    if (!seen.has(leg)) { r.row.remove(); c.idleRows.delete(leg); }
+  }
+  c.rows.hidden = c.sessions.size === 0 && idle.length === 0;
   c.note.hidden = !w.live || c.sessions.size > sessions.length || (sessions.length > 0 && w.conns <= sessions.length);
   setText(c.note, sessions.length === 0 ? "No open connections. They show up here when someone connects with this word."
     : `Showing the newest ${sessions.length} of ${w.conns} connections.`);
@@ -440,6 +555,34 @@ function relaySetting(id, field, done) {
 relaySetting("relay-enabled", "enabled", (on) => on ? "The relay hub is on" : "The relay hub is off; its tunnels were closed");
 relaySetting("relay-anonymous", "anonymous", (on) => on ? "Anyone can serve without a token now" : "Serving needs a token again; anonymous tunnels were closed");
 
+// ---------- settings: reusing connections ----------
+
+function reuseFromForm() {
+  return {
+    enabled: $("relay-reuse").checked,
+    idleSeconds: Number($("reuse-idle").value), minIdle: Number($("reuse-min").value), maxIdle: Number($("reuse-max").value),
+    tenantCap: Number($("reuse-tenant").value), hubCap: Number($("reuse-hub").value),
+  };
+}
+
+function saveReuse(reuse, done) {
+  $("reuse-save").disabled = $("relay-reuse").disabled = true;
+  setText($("reuse-error"), "");
+  api("api/relay/settings", { reuse }).then(() => { ui.reuseDirty = false; toast(done); })
+    .catch((e) => { setText($("reuse-error"), e.message); $("relay-reuse").checked = !reuse.enabled; })
+    .finally(() => { $("reuse-save").disabled = $("relay-reuse").disabled = false; if (ui.state) relayPaint(ui.state.relay); });
+}
+
+$("relay-reuse").addEventListener("change", () => {
+  const reuse = { ...((ui.state && ui.state.relay.reuse) || {}), enabled: $("relay-reuse").checked };
+  saveReuse(reuse, reuse.enabled ? "Connections to serving sides are reused" : "Connections to serving sides are no longer reused; the idle ones were closed");
+});
+$("reuse-form").addEventListener("input", () => { ui.reuseDirty = true; });
+$("reuse-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  saveReuse(reuseFromForm(), "Saved the limits on reusing connections");
+});
+
 function relayPaintSettings(relay) {
   const enabled = $("relay-enabled"), anonymous = $("relay-anonymous");
   // A switch being changed keeps what the viewer chose until the answer.
@@ -453,6 +596,19 @@ function relayPaintSettings(relay) {
     : "Off: pf-client serve needs a serve token from the list below. Turn this on to let anyone who can reach this server serve without one.");
   $("relay-anonymous-row").classList.toggle("warn", relay.anonymous);
   $("relay-details").hidden = !relay.enabled;
+
+  const reuse = relay.reuse || {};
+  const box = $("relay-reuse");
+  if (!box.disabled || relay.reuseFixed) box.checked = !!reuse.enabled;
+  const inputs = ["reuse-idle", "reuse-min", "reuse-max", "reuse-tenant", "reuse-hub"].map((id) => $(id));
+  for (const i of inputs) i.disabled = relay.reuseFixed;
+  if (relay.reuseFixed) box.disabled = true;
+  $("reuse-save").hidden = relay.reuseFixed;
+  if (!ui.reuseDirty && !$("reuse-form").contains(document.activeElement)) {
+    [reuse.idleSeconds, reuse.minIdle, reuse.maxIdle, reuse.tenantCap, reuse.hubCap].forEach((v, i) => { inputs[i].value = v ?? ""; });
+  }
+  $("relay-reuse-row").hidden = !relay.enabled;
+  $("reuse-form").hidden = !reuse.enabled;
 }
 
 // ---------- paint ----------

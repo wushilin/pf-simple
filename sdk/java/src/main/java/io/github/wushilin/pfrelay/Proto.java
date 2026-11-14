@@ -11,12 +11,12 @@ public final class Proto {
     /** The lowest protocol this SDK speaks: 0, a hub that announces none. */
     public static final int MIN = 0;
     /** The highest protocol this SDK speaks. */
-    public static final int MAX = 1;
+    public static final int MAX = 2;
 
     /** The header both sides use for the protocol: a range from the client, a number from the hub. */
     public static final String HEADER = "X-PF-Tunnel-Proto";
 
-    private static final Map<Integer, String> RELEASE = Map.of(0, "0.11.0", 1, "0.14.0");
+    private static final Map<Integer, String> RELEASE = Map.of(0, "0.11.0", 1, "0.14.0", 2, "0.15.0");
 
     private Proto() {}
 

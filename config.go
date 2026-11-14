@@ -32,6 +32,7 @@ type tunnelSettings struct {
 	enabled   bool
 	anonymous bool         // "pf-client serve" needs no serve token
 	tenants   []tenantSpec // who may run "pf-client serve" here
+	reuse     reuseSettings
 }
 
 // tunnelTable is the [tunnel] table; its presence turns the relay hub on,
@@ -44,6 +45,46 @@ type tunnelTable struct {
 	// AnonymousServe lets "pf-client serve" register without a serve token.
 	AnonymousServe bool         `toml:"anonymous_serve,omitempty"`
 	Tenants        []tenantSpec `toml:"tenant,omitempty"`
+	// Reuse is [tunnel.reuse]: reusing the serving side's accept legs
+	// (tunnel protocol 2). Left out, the defaults apply.
+	Reuse *reuseTable `toml:"reuse,omitempty"`
+}
+
+// reuseTable is [tunnel.reuse]; a key left out keeps its default.
+type reuseTable struct {
+	Enabled   *bool `toml:"enabled,omitempty"`
+	IdleSec   *int  `toml:"idle_seconds,omitempty"`
+	MinIdle   *int  `toml:"min_idle,omitempty"`
+	MaxIdle   *int  `toml:"max_idle,omitempty"`
+	TenantCap *int  `toml:"tenant_cap,omitempty"`
+	HubCap    *int  `toml:"hub_cap,omitempty"`
+}
+
+// settings applies the table to the defaults.
+func (t *reuseTable) settings() reuseSettings {
+	r := defaultReuse
+	if t == nil {
+		return r
+	}
+	set := func(dst *int, v *int) {
+		if v != nil {
+			*dst = *v
+		}
+	}
+	if t.Enabled != nil {
+		r.Enabled = *t.Enabled
+	}
+	set(&r.IdleSec, t.IdleSec)
+	set(&r.MinIdle, t.MinIdle)
+	set(&r.MaxIdle, t.MaxIdle)
+	set(&r.TenantCap, t.TenantCap)
+	set(&r.HubCap, t.HubCap)
+	return r
+}
+
+// reuseTableOf is the table that writes r back.
+func reuseTableOf(r reuseSettings) *reuseTable {
+	return &reuseTable{Enabled: &r.Enabled, IdleSec: &r.IdleSec, MinIdle: &r.MinIdle, MaxIdle: &r.MaxIdle, TenantCap: &r.TenantCap, HubCap: &r.HubCap}
 }
 
 // tenantSpec is one [[tunnel.tenant]]: a name and the SHA-256 of its serve
@@ -256,7 +297,11 @@ func loadConfig(path, envPassword string) (settings, error) {
 			on := true
 			t.Enabled = &on
 		}
-		s.tunnel = &tunnelSettings{enabled: *t.Enabled, anonymous: t.AnonymousServe, tenants: t.Tenants}
+		reuse := t.Reuse.settings()
+		if msg := reuse.check(); msg != "" {
+			return settings{}, fmt.Errorf("config %s: [tunnel.reuse]: %s", path, msg)
+		}
+		s.tunnel = &tunnelSettings{enabled: *t.Enabled, anonymous: t.AnonymousServe, tenants: t.Tenants, reuse: reuse}
 		s.tunnelRaw = t
 	}
 	if len(s.forwards) == 0 && s.console == nil {

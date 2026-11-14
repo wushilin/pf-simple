@@ -121,6 +121,14 @@ type ControlMessage struct {
 	Open string `json:"open"`
 }
 
+// The text frames of protocol 2 on an accept leg that was offered reuse
+// (docs/PROTOCOL.md §12).
+const (
+	MsgIdle  = "idle"  // hub: a clean finish; client: keep this leg
+	MsgBind  = "bind"  // hub: "bind <id>", the next connection on this idle leg
+	MsgBound = "bound" // client: "bound <id>", taken
+)
+
 // StdioTarget is the target a serving side names when it offers its own
 // stdin/stdout instead of a TCP port.
 const StdioTarget = "stdio"

@@ -85,18 +85,32 @@ class Negotiation(unittest.TestCase):
 
     def test_offer(self):
         plain = self.client(serve_token=SERVE_TOKEN)
-        self.assertEqual(plain.offer("serve"), "0-1")
-        self.assertEqual(plain.offer("connect"), "0-1")
-        self.assertEqual(plain.offer("check"), "0-1")
-        self.assertEqual(plain.offer("accept"), "0-1")
-        self.assertEqual(plain.offer("version"), "0-1")
+        self.assertEqual(plain.offer("serve"), "0-2")
+        self.assertEqual(plain.offer("connect"), "0-2")
+        self.assertEqual(plain.offer("check"), "0-2")
+        self.assertEqual(plain.offer("accept"), "0-2")
+        self.assertEqual(plain.offer("version"), "0-2")
         anon = self.client()
-        self.assertEqual(anon.offer("serve"), "1-1")
-        self.assertEqual(anon.offer("connect"), "0-1")
+        self.assertEqual(anon.offer("serve"), "1-2")
+        self.assertEqual(anon.offer("connect"), "0-2")
         tok = self.client(serve_token=SERVE_TOKEN, client_token="open-sesame")
         for ep in ("serve", "connect", "check"):
-            self.assertEqual(tok.offer(ep), "1-1")
-        self.assertEqual(tok.offer("accept"), "0-1")
+            self.assertEqual(tok.offer(ep), "1-2")
+        self.assertEqual(tok.offer("accept"), "0-2")
+
+    def test_max_proto(self):
+        one = self.client(serve_token=SERVE_TOKEN, max_proto=1)
+        self.assertEqual(one.offer("serve"), "0-1")
+        tok = self.client(serve_token=SERVE_TOKEN, client_token="open-sesame", max_proto=1)
+        self.assertEqual(tok.offer("connect"), "1-1")
+        self.assertEqual(self.client(max_proto=0).offer("connect"), "0-2")
+        self.assertEqual(self.client(max_proto=9).offer("connect"), "0-2")
+        none = self.client(serve_token=SERVE_TOKEN, max_proto=-1)
+        self.assertIsNone(none.offer("serve"))
+        h = dict(none._headers(pfrelay.Endpoint.SERVE, []))
+        self.assertNotIn("X-PF-Tunnel-Proto", h)
+        self.assertNotIn("X-PF-Version", h)
+        self.assertEqual(h["X-PF-Tunnel-Word"], "k3f9-x2mq-7hpa")
 
     def test_answered(self):
         tok = self.client(serve_token=SERVE_TOKEN, client_token="open-sesame")

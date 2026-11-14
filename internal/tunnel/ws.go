@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,16 +56,21 @@ type Conn struct {
 	// expects unmasked frames; the server side is the reverse.
 	client bool
 	// writeTimeout bounds each frame write; zero means none, for tunnel data
-	// that the network may hold back for as long as it likes.
-	writeTimeout time.Duration
-	// readTimeout, when set, is how long the peer may stay silent.
-	readTimeout time.Duration
+	// that the network may hold back for as long as it likes. readTimeout,
+	// when set, is how long the peer may stay silent. Both are durations;
+	// atomic, as a leg that is handed on changes them while a ping of its
+	// last owner may still be on its way out.
+	writeTimeout atomic.Int64
+	readTimeout  atomic.Int64
 
 	wmu  sync.Mutex
 	wbuf []byte // frame under construction; guarded by wmu
 
 	// dmu orders write deadlines against BeginClose, so a writer cannot
 	// clear the closing deadline and then block forever.
+	// heard is when the last frame header arrived, in unix nanoseconds.
+	heard atomic.Int64
+
 	dmu     sync.Mutex
 	closing bool
 	expired bool // ExpireWrites was called: every write fails at once
@@ -73,7 +79,8 @@ type Conn struct {
 // SetTimeouts sets how long the peer may stay silent and how long one frame
 // write may take; zero means no limit.
 func (c *Conn) SetTimeouts(read, write time.Duration) {
-	c.readTimeout, c.writeTimeout = read, write
+	c.readTimeout.Store(int64(read))
+	c.writeTimeout.Store(int64(write))
 	if read == 0 {
 		_ = c.conn.SetReadDeadline(time.Time{})
 	}
@@ -157,7 +164,9 @@ func Upgrade(w http.ResponseWriter, r *http.Request, extra http.Header) (*Conn, 
 		return nil, err
 	}
 	_ = conn.SetDeadline(time.Time{})
-	return &Conn{conn: conn, rd: rw.Reader, writeTimeout: WriteTimeout}, nil
+	c := &Conn{conn: conn, rd: rw.Reader}
+	c.writeTimeout.Store(int64(WriteTimeout))
+	return c, nil
 }
 
 // StatusError is a handshake the server answered with something other than
@@ -269,7 +278,9 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 		return nil, errors.New("the server's websocket handshake is invalid")
 	}
 	_ = conn.SetDeadline(time.Time{})
-	return &Conn{conn: conn, rd: rd, Header: resp.Header, client: true, writeTimeout: WriteTimeout}, nil
+	c := &Conn{conn: conn, rd: rd, Header: resp.Header, client: true}
+	c.writeTimeout.Store(int64(WriteTimeout))
+	return c, nil
 }
 
 func (c *Conn) WriteFrame(op byte, payload []byte) error {
@@ -309,8 +320,8 @@ func (c *Conn) WriteFrame(op byte, payload []byte) error {
 		_ = c.conn.SetWriteDeadline(time.Unix(1, 0))
 	case c.closing:
 		_ = c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
-	case c.writeTimeout > 0:
-		_ = c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	case c.writeTimeout.Load() > 0:
+		_ = c.conn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout.Load())))
 	default:
 		_ = c.conn.SetWriteDeadline(time.Time{})
 	}
@@ -325,6 +336,37 @@ func (c *Conn) BeginClose() {
 	c.closing = true
 	_ = c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
 	c.dmu.Unlock()
+}
+
+// Heard is when a frame last arrived from the peer; zero if none has.
+func (c *Conn) Heard() time.Time {
+	if n := c.heard.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
+}
+
+// KeepAlive pings the peer every interval until stop is called, or a ping
+// cannot be sent, which closes the connection to wake its reader.
+func (c *Conn) KeepAlive(every time.Duration) (stop func()) {
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if c.WriteFrame(OpPing, nil) != nil {
+					_ = c.Close()
+					return
+				}
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // ExpireWrites fails every write from now on, including one already
@@ -347,14 +389,15 @@ type frame struct {
 }
 
 func (c *Conn) readHeader() (frame, error) {
-	if c.readTimeout > 0 {
-		_ = c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	if rt := time.Duration(c.readTimeout.Load()); rt > 0 {
+		_ = c.conn.SetReadDeadline(time.Now().Add(rt))
 	}
 	var b [8]byte
 	var f frame
 	if _, err := io.ReadFull(c.rd, b[:2]); err != nil {
 		return f, err
 	}
+	c.heard.Store(time.Now().UnixNano())
 	f.op = b[0] & 0x0F
 	f.masked = b[1]&0x80 != 0
 	if f.masked == c.client {
@@ -389,8 +432,8 @@ func (c *Conn) readBody(f *frame, p []byte) (int, error) {
 	if uint64(len(p)) > f.left {
 		p = p[:f.left]
 	}
-	if c.readTimeout > 0 {
-		_ = c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	if rt := time.Duration(c.readTimeout.Load()); rt > 0 {
+		_ = c.conn.SetReadDeadline(time.Now().Add(rt))
 	}
 	n, err := c.rd.Read(p)
 	if f.masked {

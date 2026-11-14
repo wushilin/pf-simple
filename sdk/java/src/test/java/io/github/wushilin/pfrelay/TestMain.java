@@ -28,8 +28,15 @@ public final class TestMain {
     public static void main(String[] args) throws Exception {
         List<String> failed = new ArrayList<>();
         int ran = 0;
-        for (Method m : TestMain.class.getDeclaredMethods()) {
-            if (!m.getName().startsWith("test") || !Modifier.isStatic(m.getModifiers())) {
+        List<Method> methods = new ArrayList<>();
+        for (Class<?> k : List.of(TestMain.class, ReuseTest.class)) {
+            List<Method> ms = new ArrayList<>(Arrays.asList(k.getDeclaredMethods()));
+            ms.sort(java.util.Comparator.comparing(Method::getName));
+            methods.addAll(ms);
+        }
+        for (Method m : methods) {
+            if (!m.getName().startsWith("test") || !Modifier.isStatic(m.getModifiers())
+                    || !Modifier.isPublic(m.getModifiers())) {
                 continue;
             }
             if (args.length > 0 && Arrays.stream(args).noneMatch(a -> m.getName().contains(a))) {
@@ -168,19 +175,19 @@ public final class TestMain {
     public static void testOffer() {
         String tok = "t".repeat(32);
         Client plain = Client.builder().server("https://h").word("aaaa-bbbb-cccc").serveToken(tok).build();
-        eq("0-1", plain.offer(Endpoint.SERVE), "plain serve");
-        eq("0-1", plain.offer(Endpoint.CONNECT), "plain connect");
-        eq("0-1", plain.offer(Endpoint.ACCEPT), "accept");
+        eq("0-2", plain.offer(Endpoint.SERVE), "plain serve");
+        eq("0-2", plain.offer(Endpoint.CONNECT), "plain connect");
+        eq("0-2", plain.offer(Endpoint.ACCEPT), "accept");
         Client anon = Client.builder().server("https://h").word("aaaa-bbbb-cccc").build();
-        eq("1-1", anon.offer(Endpoint.SERVE), "anonymous serve");
-        eq("0-1", anon.offer(Endpoint.CONNECT), "connect needs no serve token");
+        eq("1-2", anon.offer(Endpoint.SERVE), "anonymous serve");
+        eq("0-2", anon.offer(Endpoint.CONNECT), "connect needs no serve token");
         Client ct = Client.builder().server("https://h").word("aaaa-bbbb-cccc").serveToken(tok)
                 .clientToken("open-sesame").build();
-        eq("1-1", ct.offer(Endpoint.SERVE), "serve with a client token");
-        eq("1-1", ct.offer(Endpoint.CONNECT), "connect with a client token");
-        eq("1-1", ct.offer(Endpoint.CHECK), "check with a client token");
-        eq("0-1", ct.offer(Endpoint.ACCEPT), "accept needs no client token");
-        eq("0-1", ct.offer(Endpoint.VERSION), "version");
+        eq("1-2", ct.offer(Endpoint.SERVE), "serve with a client token");
+        eq("1-2", ct.offer(Endpoint.CONNECT), "connect with a client token");
+        eq("1-2", ct.offer(Endpoint.CHECK), "check with a client token");
+        eq("0-2", ct.offer(Endpoint.ACCEPT), "accept needs no client token");
+        eq("0-2", ct.offer(Endpoint.VERSION), "version");
     }
 
     public static void testAnswered() throws Exception {
@@ -505,7 +512,7 @@ public final class TestMain {
         }
     }
 
-    static final Timing FAST_STREAM = new Timing(1000, 30_000, 60_000, 30_000, 20_000, 60_000, 100, 400);
+    static final Timing FAST_STREAM = new Timing(1000, 30_000, 60_000, 30_000, 20_000, 60_000, 100, 400, 3000);
 
     public static void testKeepalive() throws Exception {
         try (Pair p = new Pair()) {
@@ -603,7 +610,7 @@ public final class TestMain {
     }
 
     static Timing fastRetry(long min, long max) {
-        return new Timing(min, max, 60_000, 30_000, 20_000, 60_000, 10_000, 30_000);
+        return new Timing(min, max, 60_000, 30_000, 20_000, 60_000, 10_000, 30_000, 3000);
     }
 
     public static void testTLSVerification() throws Exception {
@@ -640,7 +647,7 @@ public final class TestMain {
                 eq(List.of("serving true"), ev.lines, "events");
                 // what it sent: the protocol range, the agent, and the registration's headers
                 Map<String, String> h = tries.get(5).headers;
-                eq("0-1", h.get("X-PF-Tunnel-Proto"), "offer");
+                eq("0-2", h.get("X-PF-Tunnel-Proto"), "offer");
                 eq(Client.DEFAULT_AGENT, h.get("X-PF-Version"), "agent");
                 eq("aaaa-bbbb-cccc", h.get("X-PF-Tunnel-Word"), "word");
                 eq("test+tunnel", h.get("X-PF-Tunnel-Name"), "name");
@@ -669,7 +676,7 @@ public final class TestMain {
             ProtoException e = throwsA(ProtoException.class,
                     () -> hub.client().serveToken(null).build().listen(), "protocol 0 hub");
             eq(Feature.ANONYMOUS_SERVE, e.need(), "feature");
-            eq("1-1", hub.requests("serve").get(0).headers.get("X-PF-Tunnel-Proto"), "min raised");
+            eq("1-2", hub.requests("serve").get(0).headers.get("X-PF-Tunnel-Proto"), "min raised");
         }
     }
 
@@ -894,7 +901,7 @@ public final class TestMain {
             r.respond(i < script.length ? script[i] : 403, i < script.length && script[i] == 204 ? null : "no");
         })) {
             Recorder ev = new Recorder();
-            Timing t = new Timing(50, 200, 60_000, 100, 20_000, 60_000, 10_000, 30_000);
+            Timing t = new Timing(50, 200, 60_000, 100, 20_000, 60_000, 10_000, 30_000, 3000);
             try (Watcher w = hub.client().clientToken("open-sesame").timing(t).events(ev).build().watch()) {
                 waitFor("down, up, down", () -> ev.lines.size() >= 3);
                 Thread.sleep(400); // more checks, and no more changes
@@ -904,7 +911,7 @@ public final class TestMain {
             List<FakeHub.Req> checks = hub.requests("check");
             check(checks.size() >= 6, "kept checking: " + checks.size());
             eq("open-sesame", checks.get(0).headers.get("X-PF-Client-Token"), "the client token is sent");
-            eq("1-1", checks.get(0).headers.get("X-PF-Tunnel-Proto"), "and needs protocol 1");
+            eq("1-2", checks.get(0).headers.get("X-PF-Tunnel-Proto"), "and needs protocol 1");
             // down: 50 ms, then 100; up: 100 (the recheck)
             long[] want = {50, 100, 100};
             for (int i = 0; i < want.length; i++) {

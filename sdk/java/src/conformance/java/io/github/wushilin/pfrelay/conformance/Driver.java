@@ -8,6 +8,7 @@ import io.github.wushilin.pfrelay.ConnId;
 import io.github.wushilin.pfrelay.ConnInfo;
 import io.github.wushilin.pfrelay.Forwarder;
 import io.github.wushilin.pfrelay.Listener;
+import io.github.wushilin.pfrelay.Proto;
 import io.github.wushilin.pfrelay.ProtoException;
 import io.github.wushilin.pfrelay.ServerInfo;
 import io.github.wushilin.pfrelay.Side;
@@ -43,7 +44,9 @@ import java.util.stream.Collectors;
 public final class Driver {
     /** What the suite asks the driver to do. */
     enum Command {
-        SERVE, CONNECT, CHECK, VERSION;
+        SERVE, CONNECT, CHECK, VERSION,
+        /** Prints the range of tunnel protocols the driver speaks. */
+        PROTOCOLS;
 
         String wire() {
             return name().toLowerCase(Locale.ROOT);
@@ -83,7 +86,9 @@ public final class Driver {
     /** The command line's flags. */
     enum Flag {
         SERVER("server"), CA("ca"), WORD("word"), SERVE_TOKEN("serve-token"), CLIENT_TOKEN("client-token"),
-        NAME("name"), TARGET("target"), LISTEN("listen"), MODE("mode"), NO_ACCEPT("no-accept", false);
+        NAME("name"), TARGET("target"), LISTEN("listen"), MODE("mode"), NO_ACCEPT("no-accept", false),
+        /** The newest protocol to offer; 0: announce none, like a client from before 0.14. */
+        PROTO_MAX("proto-max");
 
         final String wire;
         final boolean takesValue;
@@ -230,6 +235,19 @@ public final class Driver {
             }
             flags.put(f, v);
         }
+        if (cmd == Command.PROTOCOLS) {
+            say(Proto.range(Proto.MIN, Proto.MAX));
+            exit(Exit.OK, null);
+        }
+        int protoMax = Proto.MAX;
+        try {
+            protoMax = Integer.parseInt(flags.getOrDefault(Flag.PROTO_MAX, Integer.toString(Proto.MAX)));
+        } catch (NumberFormatException e) {
+            protoMax = -1;
+        }
+        if (protoMax < 0 || protoMax > Proto.MAX) {
+            exit(Exit.USAGE, "--proto-max must be from 0 to " + Proto.MAX);
+        }
         Mode mode = Mode.parse(flags.getOrDefault(Flag.MODE, Mode.LISTEN.wire())).orElse(null);
         if (mode == null) {
             exit(Exit.USAGE, "unknown mode " + flags.get(Flag.MODE));
@@ -277,6 +295,7 @@ public final class Driver {
                 .target(flags.get(Flag.TARGET))
                 .agent(Client.DEFAULT_AGENT + " conformance")
                 .events(events)
+                .maxProto(protoMax == 0 ? -1 : protoMax) // 0: announce no protocol at all
                 .logger(msg -> System.err.println("pfrelay: " + msg));
         if (flags.containsKey(Flag.CA)) {
             b.caFile(Path.of(flags.get(Flag.CA)));

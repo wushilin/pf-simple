@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::client::Client;
 use crate::conn::{Conn, Side, LINK_SILENCE};
 use crate::error::{Error, Result};
+use crate::events::ConnId;
 use crate::listener::{refuse, serve_loop, short, Handler, Shared};
-use crate::proto::Endpoint;
+use crate::reuse::{fail_leg, Leg, Registration};
 use crate::ws::CHUNK;
 
 /// How long the forwarder gives the target to answer.
@@ -67,29 +68,41 @@ impl Client {
     }
 }
 
-/// Carries connection `id` of a forwarding tunnel to `target`.
-pub(crate) async fn serve_one(c: &Client, cancel: &CancellationToken, id: &str, target: &str) {
-    let tcp = match tokio::time::timeout(TARGET_DIAL_TIMEOUT, TcpStream::connect(target)).await {
+/// Carries connection `id` of a forwarding tunnel to `target`. `leg` is
+/// its stream when it arrived on a reused leg, which has already answered
+/// `bound`; `None` when this side brings a leg to `accept`.
+pub(crate) async fn serve_one(c: &Client, reg: &Arc<Registration>, id: &str, target: &str, leg: Option<Leg>) {
+    let dialed = tokio::time::timeout(TARGET_DIAL_TIMEOUT, TcpStream::connect(target)).await;
+    let tcp = match dialed {
         Ok(Ok(tcp)) => tcp,
-        Ok(Err(e)) => {
-            c.log(&format!("connection {} failed: cannot reach the target {target}: {e}", short(id)));
-            return refuse(c, id, TARGET_UNREACHABLE).await;
-        }
-        Err(_) => {
-            c.log(&format!("connection {} failed: the target {target} did not answer", short(id)));
-            return refuse(c, id, TARGET_UNREACHABLE).await;
+        failed => {
+            let why = match failed {
+                Ok(Err(e)) => e.to_string(),
+                _ => "it did not answer".to_string(),
+            };
+            c.log(&format!("connection {} failed: cannot reach the target {target}: {why}", short(id)));
+            return match leg {
+                Some(leg) => {
+                    // After "bound", a refusal is an err: (§12.7).
+                    c.events().refused(&ConnId::new(id), TARGET_UNREACHABLE);
+                    fail_leg(leg, TARGET_UNREACHABLE).await
+                }
+                None => refuse(c, id, TARGET_UNREACHABLE).await,
+            };
         }
     };
-    let up = match c.upgrade(Endpoint::Accept, c.accept_headers(id)).await {
-        Ok(up) => up,
-        Err(e) => {
-            c.log(&format!("connection {} failed: cannot bring it to the server: {e}", short(id)));
-            return;
-        }
+    let conn = match leg {
+        Some(leg) => Conn::on_leg(leg, id, Side::Serve, c.inner.registry.clone(), Some(reg.clone())),
+        None => match c.accept(id, reg.session.as_deref()).await {
+            Ok((up, offered)) => Conn::start(up, id, Side::Serve, c.inner.registry.clone(), offered.then(|| reg.clone())),
+            Err(e) => {
+                c.log(&format!("connection {} failed: cannot bring it to the server: {e}", short(id)));
+                return;
+            }
+        },
     };
-    let conn = Conn::start(up, id, Side::Serve, c.inner.registry.clone());
     c.log(&format!("connection {} open: tunnel -> {target}", short(id)));
-    bridge(c, conn, tcp, &SERVE, cancel).await;
+    bridge(c, conn, tcp, &SERVE, &reg.sh.cancel).await;
 }
 
 /// The ends of the chain as one side sees them, so that a reason can say

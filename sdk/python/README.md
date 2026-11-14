@@ -3,7 +3,7 @@
 The Python SDK for the relay hub of [pf-simple](../../README.md): serve a
 tunnel, or connect through one, from your own asyncio program. It speaks the
 tunnel protocol described in [docs/PROTOCOL.md](../../docs/PROTOCOL.md)
-(protocols 0 and 1) and mirrors the Go SDK, [`pfrelay`](../../pfrelay).
+(protocols 0, 1 and 2) and mirrors the Go SDK, [`pfrelay`](../../pfrelay).
 
 - Python 3.10 or later, standard library only (asyncio and ssl).
 - Its own minimal RFC 6455 WebSocket client over TLS, HTTP/1.1 only.
@@ -130,6 +130,40 @@ reached and reports through `events.on_tunnel`: the first result, then
 every change. A tunnel that is up is checked every 30 s; one that is down
 from 1 s, doubling to 30 s.
 
+## Protocol 2: reused legs
+
+Against a hub that speaks protocol 2 (pf-simple 0.15.0 or later), the
+serving side reuses its connections to the hub ("accept legs") instead of
+opening a new TLS WebSocket for every connection (PROTOCOL.md §12):
+
+- The client offers `0-2` by default. The minimum is still that of the
+  features a request depends on (`1` with a client token, or when serving
+  without a serve token).
+- After a connection on an offered leg finishes cleanly, the client waits
+  up to 3 seconds (`Client.verdict_wait`) for the hub's verdict. Only then
+  does it report the connection closed: `idle` is a clean finish, and
+  `err:` a failure. A close, or silence, is judged by the protocol 1 rules.
+  It keeps the leg idle if it has room.
+- The hub hands an idle leg the next connection with `bind <id>`. The client
+  answers `bound <id>` at once, and the connection arrives like any other,
+  through `listener.accept()` or the `serve()` forwarder, with its own
+  events. A connection that cannot be carried after `bound` (unreachable
+  target, full backlog) is refused with `err:<reason>` on that leg.
+- When the registration's control channel ends, its idle legs are closed.
+
+It needs no code from the application. The options are:
+
+| Option | Default | |
+|---|---|---|
+| `no_reuse=True` | `False` | never keep legs: every connection gets a new one |
+| `max_idle_legs=N` | 16 | the most idle legs kept; the hub's further offers are answered with a close |
+| `max_proto=N` | `None` | offer no protocol newer than N: `1` behaves like pf-client 0.14, `-1` announces none, like a client from before 0.14; `None` or `0` means the newest |
+
+**Older hubs.** Against a protocol 1 hub (pf-simple 0.14) the client falls
+back to protocol 1, and against a hub from before 0.14 to protocol 0. Each
+connection then gets its own leg, as before. Reuse is an optimization,
+never a requirement, so not getting it is never an error.
+
 ## TLS
 
 The hub's certificate is verified normally. Pass `ca_file=` to trust a
@@ -139,14 +173,14 @@ particular CA, or a ready `ssl_context=` (its ALPN is set to `http/1.1`).
 
 The retry and watch timing are class attributes of `Client`, which an
 instance may override (tests do): `retry_min = 1.0`, `retry_max = 30.0`,
-`settled = 60.0` (a control channel this old starts the pause again) and
-`recheck = 30.0`.
+`settled = 60.0` (a control channel this old starts the pause again),
+`recheck = 30.0` and `verdict_wait = 3.0` (protocol 2).
 
 ## API overview
 
 | | |
 |---|---|
-| `Client(server, word, *, ca_file, ssl_context, serve_token, client_token, name, target, agent, events)` | one hub, one tunnel; checks the URL, word and tokens |
+| `Client(server, word, *, ca_file, ssl_context, serve_token, client_token, name, target, agent, events, max_proto, no_reuse, max_idle_legs)` | one hub, one tunnel; checks the URL, word and tokens |
 | `await client.listen()` → `Listener` | register and serve |
 | `await listener.accept()` → `Conn` | the next connection; `ClosedError` after `close()` |
 | `listener.up`, `listener.error`, `await listener.close()` | registered right now; why serving stopped for good |

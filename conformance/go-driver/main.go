@@ -36,10 +36,11 @@ const (
 type Command string
 
 const (
-	CmdServe   Command = "serve"
-	CmdConnect Command = "connect"
-	CmdCheck   Command = "check"
-	CmdVersion Command = "version"
+	CmdServe     Command = "serve"
+	CmdConnect   Command = "connect"
+	CmdCheck     Command = "check"
+	CmdVersion   Command = "version"
+	CmdProtocols Command = "protocols" // prints the protocol range the driver speaks
 )
 
 // Query is a question the suite asks on stdin while serve or connect runs.
@@ -105,7 +106,15 @@ func main() {
 	listen := fs.String("listen", "", "connect: host:port to listen on")
 	modeFlag := fs.String("mode", string(ModeListen), "listen: the SDK's listen/accept and dial API; forward: its forwarders")
 	noAccept := fs.Bool("no-accept", false, "serve: register, but never accept a connection")
+	protoMax := fs.Int("proto-max", pfrelay.ProtoMax, "the newest tunnel protocol to offer; 0: announce none, like a client from before 0.14")
 	_ = fs.Parse(os.Args[2:])
+	if cmd == CmdProtocols {
+		say(pfrelay.ProtoRange(pfrelay.ProtoMin, pfrelay.ProtoMax))
+		return
+	}
+	if *protoMax < 0 || *protoMax > pfrelay.ProtoMax {
+		fail(2, "--proto-max must be from 0 to "+pfrelay.ProtoRange(0, pfrelay.ProtoMax))
+	}
 	mode := Mode(*modeFlag)
 	if mode != ModeListen && mode != ModeForward {
 		fail(2, "unknown mode "+*modeFlag)
@@ -130,6 +139,10 @@ func main() {
 	}
 	c.ServeToken, c.ClientToken, c.Name, c.Target = *serveToken, *clientToken, *name, *target
 	c.Agent = "pfrelay-go conformance"
+	c.MaxProto = *protoMax
+	if *protoMax == 0 {
+		c.MaxProto = -1 // announce no protocol at all
+	}
 	var ready sync.Once
 	c.Events = pfrelay.Events{
 		OnServing: func(up bool) {

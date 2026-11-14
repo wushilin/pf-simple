@@ -128,11 +128,61 @@ exactly once for each `on_open`, with the final byte counts; its error is
 `None` after a clean finish, `Error::Remote` when the far end said why, and
 `Error::Dropped` when this side dropped the connection.
 
+## Protocol 2: reused accept legs
+
+Against a hub that speaks protocol 2 (pf-simple 0.15.0 or later), a serving
+client reuses its `accept` legs (PROTOCOL.md §12). Nothing changes for the
+application: every connection still arrives through `accept` or the
+forwarder, with its own id, events and figures.
+
+- The registration's 101 carries a session secret, which each `accept`
+  sends back. The hub may then offer reuse (`X-PF-Tunnel-Keep-Alive`).
+- When a connection on an offered leg finishes cleanly, the client waits up
+  to 3 seconds for the hub's verdict. On `idle` it keeps the leg (up to
+  `max_idle_legs`, 16 by default) and reports the connection as finished
+  cleanly; on `err:` the connection failed; on a close or no answer,
+  protocol 1 rules apply. `on_close` comes only after the verdict.
+- An idle leg pings every 10 seconds and is dead after 30 of silence. The
+  hub's `bind <id>` is answered at once with `bound <id>`, and the
+  connection is carried like any other. A forwarder answers `bound` before
+  it dials its target; if the target cannot be reached, or a listener's
+  backlog is full, it refuses with `err:<reason>` and calls `on_refuse`.
+- If the hub asks again for an id still open here (its leg died before
+  the hub heard `bound`), the old attempt ends as failed with
+  `Error::Dropped` ("the leg was lost before the server took the
+  connection"), and the new one is carried.
+- When the registration's control channel ends, its idle legs are closed.
+- On an idle leg, unknown text frames are ignored; binary data, or a known
+  frame in the wrong state (`eof`, `err:`, `idle`, `bound`, ...), closes
+  the leg.
+- `drop_conn` on a connection whose writer is already waiting for the
+  hub's verdict is ignored: by then all its data has been sent, so the
+  verdict decides how it ends (and the leg may be kept).
+
+**Older hubs, older clients.** The client offers `0-2` (raised to `1-2`
+when a client token, or serving without a serve token, needs protocol 1).
+A protocol 1 hub answers 1, and a hub from before 0.14 answers nothing
+(protocol 0): legs are then simply never reused, and everything else works
+as before. Reuse is an optimization, never a requirement, so its absence is
+never an error.
+
+```rust
+use pfrelay::{Client, ProtoLimit};
+
+let client = Client::builder("https://hub.example/", "k3f9-x2mq-7hpa")
+    .serve_token(token)
+    .max_idle_legs(4)                      // keep fewer idle legs (default 16)
+    // .no_reuse()                         // never reuse legs
+    // .max_proto(ProtoLimit::UpTo(1))     // behave like pf-client 0.14
+    // .max_proto(ProtoLimit::Unannounced) // like a client from before 0.14
+    .build()?;
+```
+
 ## API overview
 
 | Item | What it is |
 |---|---|
-| `Client::builder(server, word)` | `.serve_token()`, `.client_token()`, `.name()`, `.target()`, `.agent()`, `.ca_file()`, `.ca_pem()`, `.tls_config()`, `.logger()`, `.events(Events)`, `.timing(Timing)`, `.build()` |
+| `Client::builder(server, word)` | `.serve_token()`, `.client_token()`, `.name()`, `.target()`, `.agent()`, `.ca_file()`, `.ca_pem()`, `.tls_config()`, `.logger()`, `.events(Events)`, `.timing(Timing)`, `.max_proto(ProtoLimit)`, `.no_reuse()`, `.max_idle_legs(n)`, `.build()` |
 | `client.listen().await -> Listener` | registers the tunnel; `listener.accept().await -> Conn`, `.is_up()`, `.close()` |
 | `client.dial().await -> Conn` | one connection through the tunnel |
 | `client.check().await` | `Ok(())` when the word is served (and the client token is right) |
@@ -144,11 +194,12 @@ exactly once for each `on_open`, with the final byte counts; its error is
 | `ConnId` | the hub's opaque connection id: `Clone + Eq + Hash + Ord + Display + Serialize`, `.short()` |
 | `Side` | `Connect` or `Serve`; `Display`/`FromStr`/serde as `connect`/`serve` |
 | `Events` | `on_serving`, `on_tunnel`, `on_open`, `on_close`, `on_refuse` |
-| `Timing` | `retry_min` (1s), `retry_max` (30s), `settled` (60s), `recheck` (30s); change only to test |
+| `Timing` | `retry_min` (1s), `retry_max` (30s), `settled` (60s), `recheck` (30s), `verdict_wait` (3s); change only to test |
+| `ProtoLimit` | `Newest` (default, protocol 2), `UpTo(n)`, `Unannounced` (no `X-PF-Tunnel-Proto` or `X-PF-Version`) |
 | `Conn` | `AsyncRead + AsyncWrite` (also `&Conn`, to read and write from two tasks); `shutdown` half-closes; `.close()`, `.fail(reason)`, `.err()`, `.finished()`, `.id()`, `.side()`, `.info()` |
 | `Error` | `Config`, `AccessDenied`, `Status{code,message}`, `NoRelay`, `NoProbe`, `Proto(ProtoError)`, `Remote(RemoteError)`, `Dropped{reason}`, `Link`, `Protocol`, `Tls`, `Closed`, `Io`; `is_final()`; `Error::from_io(&io_err)` for errors from a `Conn`'s reads and writes |
 | `new_word()`, `normalize_word()`, `check_serve_token()`, `check_client_token()`, `check_name()` | the values of PROTOCOL.md §3 |
-| `PROTO_MIN`, `PROTO_MAX`, `negotiate()`, `proto_range()`, `parse_proto_range()`, `server_proto()` | protocol versions (§5) |
+| `PROTO_MIN` (0), `PROTO_MAX` (2), `Feature`, `negotiate()`, `proto_range()`, `parse_proto_range()`, `server_proto()` | protocol versions (§5) |
 
 Notes:
 
@@ -172,7 +223,9 @@ Notes:
 
 `src/bin/driver.rs` is the conformance driver
 ([`conformance/README.md`](../../conformance/README.md)): both modes
-(`listen`, `forward`), the event lines and the stdin queries. The unit
+(`listen`, `forward`), the event lines, the stdin queries, `protocols` and
+`--proto-max N`, so the suite runs it at every combination of hub and
+client protocol. The unit
 tests (`cargo test`) run the client against a fake hub over in-memory
 pipes, with tokio's clock paused where timing matters. From the
 repository root:
@@ -181,7 +234,7 @@ repository root:
 cargo build --release --manifest-path sdk/rust/Cargo.toml
 cargo test --manifest-path sdk/rust/Cargo.toml
 PF_CONFORMANCE_DRIVER="sdk/rust/target/release/driver" go test -count=1 -run TestConformance .
-PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="sdk/rust/target/release/driver" go test -count=1 -run 'TestConformance/idle' .
+PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="sdk/rust/target/release/driver" go test -count=1 -run 'TestConformance/hub_2,_client_2/idle' .
 ```
 
 ## License

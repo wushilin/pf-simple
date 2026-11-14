@@ -436,3 +436,20 @@ async fn watch_reports_the_first_result_and_every_change() {
     // Checked at 0, 1, 3 and 33s; then down again, so sooner: 34 and 36s.
     assert_eq!(checks.load(Ordering::SeqCst), 6);
 }
+
+#[tokio::test]
+async fn fail_and_close_race_and_one_wins_once() {
+    for _ in 0..20 {
+        let heard = Heard::default();
+        let c = client(echo_hub(Default::default()), |b| b.events(heard.events()));
+        let conn = c.dial().await.unwrap();
+        let id = conn.id().clone();
+        tokio::join!(conn.fail("failed by a test"), async { conn.close().await.unwrap() }, async {
+            c.drop_conn(&id, "dropped by a test");
+        });
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(heard.starting("close").len(), 1, "{:?}", heard.all());
+        assert_eq!(c.stats().active, 0);
+    }
+}

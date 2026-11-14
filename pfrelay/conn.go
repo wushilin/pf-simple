@@ -162,8 +162,10 @@ type Conn struct {
 	rdl *deadline
 	wdl *deadline
 
-	failed    atomic.Bool
-	failure   atomic.Pointer[error] // the first error that broke the connection here
+	failed  atomic.Bool
+	failure atomic.Pointer[error] // the first error that broke the connection here
+	// finish ends a clean finish on a reusable leg (protocol 2); nil else.
+	finish    func(*tunnel.Stream) error
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -350,11 +352,15 @@ func (c *Conn) Close() error {
 			_ = c.s.CloseWrite()
 		}
 		close(c.done)
-		_ = c.s.Close()
 		var err error
+		if c.finish != nil && !c.failed.Load() && c.s.Reusable() && c.s.Clean() {
+			err = c.finish(c.s) // the hub's verdict, and the leg kept if it may be
+		} else {
+			_ = c.s.Close()
+		}
 		if f := c.failure.Load(); f != nil {
 			err = *f
-		} else {
+		} else if err == nil {
 			err = c.Err()
 		}
 		c.c.closed(c.rec, err)
@@ -435,7 +441,9 @@ func (c *Client) Listen(ctx context.Context) (*Listener, error) {
 		target = "listener"
 	}
 	served := make(chan error, 1)
-	go func() { served <- c.serve(lctx, target, func(id string) { l.open(lctx, id) }, up) }()
+	go func() {
+		served <- c.serve(lctx, target, func(reg *registration, id string, leg *tunnel.Stream) { l.open(lctx, reg, id, leg) }, up)
+	}()
 	select {
 	case <-registered:
 		return l, nil
@@ -451,8 +459,10 @@ func (c *Client) Listen(ctx context.Context) (*Listener, error) {
 	}
 }
 
-// open answers the server's request for connection id.
-func (l *Listener) open(ctx context.Context, id string) {
+// open answers the server's request for connection id. leg is its stream
+// when it arrived on a reused leg (protocol 2); nil when this side brings a
+// leg to accept.
+func (l *Listener) open(ctx context.Context, reg *registration, id string, leg *tunnel.Stream) {
 	c := l.c
 	select {
 	case l.slots <- struct{}{}:
@@ -460,18 +470,26 @@ func (l *Listener) open(ctx context.Context, id string) {
 		const reason = "the serving side is not accepting connections fast enough"
 		c.logf("connection %s refused: %d connections are waiting to be accepted", short(id), listenBacklog)
 		c.refused(id, reason)
+		if leg != nil {
+			leg.Fail(reason) // after "bound", a refusal is an err: (§12.7)
+			return
+		}
 		h := c.header(id)
 		h.Set(tunnel.HeaderError, reason)
 		_ = c.get(ctx, "accept", h)
 		return
 	}
-	ws, err := c.dial(ctx, "accept", c.header(id))
-	if err != nil {
-		<-l.slots
-		c.logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
-		return
+	stream := leg
+	if stream == nil {
+		var err error
+		if stream, err = c.accept(ctx, reg, id, true); err != nil {
+			<-l.slots
+			c.logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
+			return
+		}
 	}
-	conn := c.newConn(tunnel.NewStream(ws), id, SideServe)
+	conn := c.newConn(stream, id, SideServe)
+	conn.finish = reg.finisher()
 	select {
 	case l.conns <- conn:
 	case <-l.done:

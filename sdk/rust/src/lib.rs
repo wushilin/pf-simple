@@ -44,16 +44,18 @@ mod forward;
 mod http;
 mod listener;
 mod proto;
+mod reuse;
 mod values;
 mod ws;
 
-pub use client::{Client, ClientBuilder, ServerInfo, Timing, DEFAULT_AGENT, DEFAULT_NAME};
+pub use client::{Client, ClientBuilder, ServerInfo, Timing, DEFAULT_AGENT, DEFAULT_MAX_IDLE_LEGS, DEFAULT_NAME};
 pub use events::{ConnId, Events};
 pub use conn::{Conn, ConnInfo, Side, Stats, LINK_SILENCE, PING_EVERY};
 pub use forward::{TARGET_DIAL_TIMEOUT, TARGET_UNREACHABLE};
 pub use error::{Error, ProtoError, RemoteError, Result};
 pub use listener::{Listener, CONTROL_PING, CONTROL_SILENCE, LISTEN_BACKLOG};
-pub use proto::{negotiate, parse_proto_range, proto_range, server_proto, Feature, PROTO_MAX, PROTO_MIN};
+pub use proto::{negotiate, parse_proto_range, proto_range, server_proto, Feature, ProtoLimit, PROTO_MAX, PROTO_MIN};
+pub use reuse::REASON_LEG_LOST;
 pub use values::{check_client_token, check_name, check_serve_token, new_word, normalize_word, query_escape};
 
 /// The target a serving side names when it offers stdin/stdout instead of a
@@ -68,3 +70,5 @@ pub use tokio_rustls::rustls;
 mod testhub;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod reuse_tests;

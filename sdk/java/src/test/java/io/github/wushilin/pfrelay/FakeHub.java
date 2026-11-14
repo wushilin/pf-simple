@@ -65,8 +65,13 @@ final class FakeHub implements AutoCloseable {
 
         /** Answers 101, with extra headers as name, value, ...; returns the hub's side of the WebSocket. */
         WebSocket upgrade(String... extra) throws IOException {
+            return upgradeAs(1, extra);
+        }
+
+        /** upgrade, answering as a hub that chose protocol proto. */
+        WebSocket upgradeAs(int proto, String... extra) throws IOException {
             StringBuilder b = new StringBuilder("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                    + "Connection: Upgrade\r\nX-Pf-Tunnel-Proto: 1\r\nSec-WebSocket-Accept: "
+                    + "Connection: Upgrade\r\nX-Pf-Tunnel-Proto: " + proto + "\r\nSec-WebSocket-Accept: "
                     + Http.accept(headers.get("Sec-WebSocket-Key")) + "\r\n");
             for (int i = 0; i < extra.length; i += 2) {
                 b.append(extra[i]).append(": ").append(extra[i + 1]).append("\r\n");

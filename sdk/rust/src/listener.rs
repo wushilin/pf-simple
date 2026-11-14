@@ -14,6 +14,7 @@ use crate::conn::{Conn, Side};
 use crate::error::{Error, Result};
 use crate::events::ConnId;
 use crate::http::Upgraded;
+use crate::reuse::{fail_leg, session_of, Leg, Registration, REASON_LEG_LOST};
 use crate::proto::Endpoint;
 use crate::ws::{self, FrameReader, CONTROL_LIMITS, OP_CLOSE, OP_PING, OP_PONG, OP_TEXT};
 
@@ -230,7 +231,9 @@ pub(crate) async fn serve_loop(
                 }
                 c.events().serving(true);
                 let started = Instant::now();
-                let why = control(&c, &sh, &handler, up).await;
+                let reg = Registration::new(c.clone(), sh.clone(), handler.clone(), session_of(&c, &up.head));
+                let why = control(&c, &reg, up).await;
+                reg.cancel.cancel(); // its idle legs go with it
                 sh.up.store(false, Ordering::Release);
                 c.events().serving(false);
                 if sh.cancel.is_cancelled() {
@@ -259,7 +262,8 @@ pub(crate) fn parse_open(payload: &[u8]) -> Option<String> {
 }
 
 /// Runs one control channel until it ends, and says why.
-async fn control(c: &Client, sh: &Arc<Shared>, handler: &Handler, up: Upgraded) -> String {
+async fn control(c: &Client, reg: &Arc<Registration>, up: Upgraded) -> String {
+    let sh = &reg.sh;
     let (r, mut w) = tokio::io::split(up.stream);
     let mut frames = FrameReader::new(r, up.leftover, CONTROL_LIMITS, CONTROL_SILENCE);
     let mut ping = tokio::time::interval_at(Instant::now() + CONTROL_PING, CONTROL_PING);
@@ -282,7 +286,9 @@ async fn control(c: &Client, sh: &Arc<Shared>, handler: &Handler, up: Upgraded) 
                 Ok(f) => match f.op {
                     OP_TEXT if f.fin => {
                         if let Some(id) = parse_open(&f.payload) {
-                            tokio::spawn(open(c.clone(), sh.clone(), handler.clone(), id));
+                            // An id that comes back is a new attempt (§12.7).
+                            c.inner.registry.drop_conn(&ConnId::new(&id), REASON_LEG_LOST);
+                            tokio::spawn(open(c.clone(), reg.clone(), id, None));
                         }
                     }
                     OP_PING => {
@@ -322,12 +328,17 @@ pub(crate) async fn refuse(c: &Client, id: &str, reason: &str) {
     }
 }
 
-/// Answers the hub's open message for connection `id`.
-async fn open(c: Client, sh: Arc<Shared>, handler: Handler, id: String) {
-    let tx = match handler {
-        Handler::Forward(target) => return crate::forward::serve_one(&c, &sh.cancel, &id, &target).await,
-        Handler::Listen(tx) => tx,
+/// Carries connection `id`: with an open message (`leg` is `None`: bring
+/// one to `accept`), or on an idle leg that answered `bound`.
+pub(crate) async fn open(c: Client, reg: Arc<Registration>, id: String, leg: Option<Leg>) {
+    let tx = match &reg.handler {
+        Handler::Forward(target) => {
+            let target = target.clone();
+            return crate::forward::serve_one(&c, &reg, &id, &target, leg).await;
+        }
+        Handler::Listen(tx) => tx.clone(),
     };
+    let sh = &reg.sh;
     let slot = match sh.slots.clone().try_acquire_owned() {
         Ok(slot) => slot,
         Err(_) => {
@@ -335,17 +346,28 @@ async fn open(c: Client, sh: Arc<Shared>, handler: Handler, id: String) {
                 "connection {} refused: {LISTEN_BACKLOG} connections are waiting to be accepted",
                 short(&id)
             ));
-            return refuse(&c, &id, BACKLOG_FULL).await;
+            return match leg {
+                Some(leg) => {
+                    // After "bound", a refusal is an err: (§12.7).
+                    c.events().refused(&ConnId::new(&id), BACKLOG_FULL);
+                    fail_leg(leg, BACKLOG_FULL).await
+                }
+                None => refuse(&c, &id, BACKLOG_FULL).await,
+            };
         }
     };
-    let up = match c.upgrade(Endpoint::Accept, c.accept_headers(&id)).await {
-        Ok(up) => up,
-        Err(e) => {
-            c.log(&format!("connection {} failed: cannot bring it to the server: {e}", short(&id)));
-            return;
-        }
+    let conn = match leg {
+        Some(leg) => Conn::on_leg(leg, &id, Side::Serve, c.inner.registry.clone(), Some(reg.clone())),
+        None => match c.accept(&id, reg.session.as_deref()).await {
+            Ok((up, offered)) => {
+                Conn::start(up, &id, Side::Serve, c.inner.registry.clone(), offered.then(|| reg.clone()))
+            }
+            Err(e) => {
+                c.log(&format!("connection {} failed: cannot bring it to the server: {e}", short(&id)));
+                return;
+            }
+        },
     };
-    let conn = Conn::start(up, &id, Side::Serve, c.inner.registry.clone());
     if sh.cancel.is_cancelled() {
         conn.fail(STOPPED_LISTENING).await;
         return;

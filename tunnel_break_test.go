@@ -176,7 +176,12 @@ func TestRelayBrokenConnections(t *testing.T) {
 		// pf-client serve, must say: the hop that broke, named the same way
 		// at both ends.
 		why [2]string
-		brk func(e *brokenEnv)
+		// why2 replaces why under tunnel protocol 2 where it differs; "a|b"
+		// accepts either. There
+		// the hub passes a reason from the serving side on to the
+		// connecting side at once (docs/PROTOCOL.md §12).
+		why2 *[2]string
+		brk  func(e *brokenEnv)
 	}{
 		// 1. The application.
 		{name: "the application closes its connection", why: [2]string{"the application closed its end, the target kept its own open, and the connection was idle for 30s", "the application closed its end, and the connection was idle for 30s"}, limit: idle, appGone: true,
@@ -235,170 +240,183 @@ func TestRelayBrokenConnections(t *testing.T) {
 			}},
 		// 6. pf-client serve.
 		{name: "pf-client serve stops", why: [2]string{"the tunnel was closed on the server: the serving side disconnected", "pf-client serve is stopping"}, limit: idle, prompt: []string{connect, serve}, tunnelGone: true,
-			brk: func(e *brokenEnv) { e.stopServe() }},
+			// Its own reason and the hub's closing of the tunnel race.
+			why2: &[2]string{"pf-client serve is stopping|the tunnel was closed on the server: the serving side disconnected", "pf-client serve is stopping"},
+			brk:  func(e *brokenEnv) { e.stopServe() }},
 		// 7. The target.
 		{name: "the target closes the connection", why: [2]string{"the target closed its end, and the connection was idle for 30s", "the target closed its end, the application kept its own open, and the connection was idle for 30s"}, limit: idle, targetGone: true,
 			brk: func(e *brokenEnv) { e.target.Close() }},
 		{name: "the target resets the connection", why: [2]string{"the target reset its connection to pf-client serve", "the target reset its connection to pf-client serve"}, limit: idle, prompt: []string{serve}, targetGone: true,
 			brk: func(e *brokenEnv) { reset(e.target) }},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			f := newRelayFixture(t, "")
-			backend := strings.TrimPrefix(f.srv.URL, "https://")
-			e := &brokenEnv{t: t, hub: f.hub, connectLink: newFlakyLink(t, backend), serveLink: newFlakyLink(t, backend)}
-			connectCtx, stopConnect := context.WithCancel(context.Background())
-			serveCtx, stopServe := context.WithCancel(context.Background())
-			defer stopConnect()
-			defer stopServe()
-			e.stopConnect, e.stopServe = stopConnect, stopServe
-
-			// A target that answers once and then holds the connection
-			// without a word, even after its peer half-closes: the worst
-			// case, since nothing it does will end the connection.
-			targetLn, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
+	for _, proto := range []int{1, 2} {
+		for _, tc := range cases {
+			if proto == 2 && tc.why2 != nil {
+				tc.why = *tc.why2
 			}
-			defer targetLn.Close()
-			accepted := make(chan *net.TCPConn, 1)
-			go func() {
-				c, err := targetLn.Accept()
-				if err != nil {
-					return
-				}
-				hello := make([]byte, 5)
-				if _, err := io.ReadFull(c, hello); err == nil {
-					_, _ = c.Write(hello)
-				}
-				accepted <- c.(*net.TCPConn)
-				_, _ = io.Copy(io.Discard, c)
-			}()
+			t.Run(fmt.Sprintf("protocol %d/%s", proto, tc.name), func(t *testing.T) {
+				t.Parallel()
+				f := newRelayFixture(t, "")
+				backend := strings.TrimPrefix(f.srv.URL, "https://")
+				e := &brokenEnv{t: t, hub: f.hub, connectLink: newFlakyLink(t, backend), serveLink: newFlakyLink(t, backend)}
+				connectCtx, stopConnect := context.WithCancel(context.Background())
+				serveCtx, stopServe := context.WithCancel(context.Background())
+				defer stopConnect()
+				defer stopServe()
+				e.stopConnect, e.stopServe = stopConnect, stopServe
 
-			// Each client reports the end of a connection in its log, with
-			// how long it lasted, what it carried and why it ended.
-			var reasons sync.Map
-			ended := func(c *pfrelay.Client) <-chan time.Time {
-				ch := make(chan time.Time, 1)
-				c.Logf = func(format string, args ...any) {
-					if strings.HasPrefix(format, "connection %s closed after") {
-						reasons.Store(c, fmt.Sprintf(format, args...))
-						select {
-						case ch <- time.Now():
-						default:
-						}
-					}
-				}
-				return ch
-			}
-			newClient := func(l *flakyLink) *pfrelay.Client {
-				c, err := pfrelay.NewClient(l.url(), testWord, f.tls)
+				// A target that answers once and then holds the connection
+				// without a word, even after its peer half-closes: the worst
+				// case, since nothing it does will end the connection.
+				targetLn, err := net.Listen("tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
 				}
-				c.ServeToken, c.Name = testServeToken, "Test tunnel"
-				return c
-			}
-			server, connector := newClient(e.serveLink), newClient(e.connectLink)
-			serveEnded, connectEnded := ended(server), ended(connector)
-			go server.Serve(serveCtx, targetLn.Addr().String())
-			waitFor(t, "the word to be served", func() bool { return connector.Check(connectCtx) == nil })
-			local, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			go connector.Connect(connectCtx, local)
+				defer targetLn.Close()
+				accepted := make(chan *net.TCPConn, 1)
+				go func() {
+					c, err := targetLn.Accept()
+					if err != nil {
+						return
+					}
+					hello := make([]byte, 5)
+					if _, err := io.ReadFull(c, hello); err == nil {
+						_, _ = c.Write(hello)
+					}
+					accepted <- c.(*net.TCPConn)
+					_, _ = io.Copy(io.Discard, c)
+				}()
 
-			app, err := net.Dial("tcp", local.Addr().String())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer app.Close()
-			e.app = app.(*net.TCPConn)
-			_ = app.SetDeadline(time.Now().Add(20 * time.Second))
-			hello := make([]byte, 5)
-			if _, err := app.Write([]byte("hello")); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := io.ReadFull(app, hello); err != nil {
-				t.Fatalf("the connection never worked: %v", err)
-			}
-			_ = app.SetDeadline(time.Time{})
-			e.target = <-accepted
-			defer e.target.Close()
-			sessions := f.hub.snapshot().Words[0].Sessions
-			if len(sessions) != 1 {
-				t.Fatalf("the hub holds %d connections before the break, want 1", len(sessions))
-			}
-			pipeID := sessions[0].ID
+				// Each client reports the end of a connection in its log, with
+				// how long it lasted, what it carried and why it ended.
+				var reasons sync.Map
+				ended := func(c *pfrelay.Client) <-chan time.Time {
+					ch := make(chan time.Time, 1)
+					c.Logf = func(format string, args ...any) {
+						if strings.HasPrefix(format, "connection %s closed after") {
+							reasons.Store(c, fmt.Sprintf(format, args...))
+							select {
+							case ch <- time.Now():
+							default:
+							}
+						}
+					}
+					return ch
+				}
+				newClient := func(l *flakyLink) *pfrelay.Client {
+					c, err := pfrelay.NewClient(l.url(), testWord, f.tls)
+					if err != nil {
+						t.Fatal(err)
+					}
+					c.ServeToken, c.Name = testServeToken, "Test tunnel"
+					c.MaxProto = proto
+					return c
+				}
+				server, connector := newClient(e.serveLink), newClient(e.connectLink)
+				serveEnded, connectEnded := ended(server), ended(connector)
+				go server.Serve(serveCtx, targetLn.Addr().String())
+				waitFor(t, "the word to be served", func() bool { return connector.Check(connectCtx) == nil })
+				local, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				go connector.Connect(connectCtx, local)
 
-			start := time.Now()
-			tc.brk(e)
+				app, err := net.Dial("tcp", local.Addr().String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer app.Close()
+				e.app = app.(*net.TCPConn)
+				_ = app.SetDeadline(time.Now().Add(20 * time.Second))
+				hello := make([]byte, 5)
+				if _, err := app.Write([]byte("hello")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.ReadFull(app, hello); err != nil {
+					t.Fatalf("the connection never worked: %v", err)
+				}
+				_ = app.SetDeadline(time.Time{})
+				e.target = <-accepted
+				defer e.target.Close()
+				sessions := f.hub.snapshot().Words[0].Sessions
+				if len(sessions) != 1 {
+					t.Fatalf("the hub holds %d connections before the break, want 1", len(sessions))
+				}
+				pipeID := sessions[0].ID
 
-			// The two clients.
-			deadline := time.After(tc.limit)
-			took := map[string]time.Duration{}
-			for len(took) < 2 {
-				select {
-				case at := <-serveEnded:
-					took[serve] = at.Sub(start)
-				case at := <-connectEnded:
-					took[connect] = at.Sub(start)
-				case <-deadline:
-					t.Fatalf("after %s the connection is still held; let go so far: %v", tc.limit, took)
+				start := time.Now()
+				tc.brk(e)
+
+				// The two clients.
+				deadline := time.After(tc.limit)
+				took := map[string]time.Duration{}
+				for len(took) < 2 {
+					select {
+					case at := <-serveEnded:
+						took[serve] = at.Sub(start)
+					case at := <-connectEnded:
+						took[connect] = at.Sub(start)
+					case <-deadline:
+						t.Fatalf("after %s the connection is still held; let go so far: %v", tc.limit, took)
+					}
 				}
-			}
-			// The hub: the connection is gone from the tunnel and from the
-			// registry of live pipes.
-			hubHolds := func() bool {
-				if pipes.get(pipeID) != nil {
-					return true
+				// The hub: the connection is gone from the tunnel and from the
+				// registry of live pipes.
+				hubHolds := func() bool {
+					if pipes.get(pipeID) != nil {
+						return true
+					}
+					words := f.hub.snapshot().Words
+					return len(words) > 0 && words[0].Conns != 0
 				}
-				words := f.hub.snapshot().Words
-				return len(words) > 0 && words[0].Conns != 0
-			}
-			for time.Since(start) < tc.limit && hubHolds() {
-				time.Sleep(20 * time.Millisecond)
-			}
-			hubTook := time.Since(start)
-			if hubHolds() {
-				t.Fatalf("after %s the hub still holds the connection", tc.limit)
-			}
-			t.Logf("let go after: pf-client connect %s, hub %s, pf-client serve %s",
-				took[connect].Round(100*time.Millisecond), hubTook.Round(100*time.Millisecond), took[serve].Round(100*time.Millisecond))
-			for i, name := range []string{connect, serve} {
-				line, _ := reasons.Load(map[string]*pfrelay.Client{connect: connector, serve: server}[name])
-				t.Logf("  %-7s %v", name, line)
-				if text, _ := line.(string); !strings.Contains(text, "; "+tc.why[i]) {
-					t.Errorf("pf-client %s gave the wrong reason: want %q in %v", name, tc.why[i], line)
+				for time.Since(start) < tc.limit && hubHolds() {
+					time.Sleep(20 * time.Millisecond)
 				}
-				// 5 bytes went each way before the break.
-				if text, _ := line.(string); !strings.Contains(text, "app->target 5 B, target->app 5 B; ") {
-					t.Errorf("pf-client %s logged the wrong byte counts: %v", name, line)
+				hubTook := time.Since(start)
+				if hubHolds() {
+					t.Fatalf("after %s the hub still holds the connection", tc.limit)
 				}
-			}
-			for _, side := range tc.prompt {
-				if took[side] > 5*time.Second {
-					t.Errorf("pf-client %s saw the break itself but took %s to let go", side, took[side])
+				t.Logf("let go after: pf-client connect %s, hub %s, pf-client serve %s",
+					took[connect].Round(100*time.Millisecond), hubTook.Round(100*time.Millisecond), took[serve].Round(100*time.Millisecond))
+				for i, name := range []string{connect, serve} {
+					line, _ := reasons.Load(map[string]*pfrelay.Client{connect: connector, serve: server}[name])
+					t.Logf("  %-7s %v", name, line)
+					text, _ := line.(string)
+					matched := false
+					for _, want := range strings.Split(tc.why[i], "|") {
+						matched = matched || strings.Contains(text, "; "+want)
+					}
+					if !matched {
+						t.Errorf("pf-client %s gave the wrong reason: want %q in %v", name, tc.why[i], line)
+					}
+					// 5 bytes went each way before the break.
+					if text, _ := line.(string); !strings.Contains(text, "app->target 5 B, target->app 5 B; ") {
+						t.Errorf("pf-client %s logged the wrong byte counts: %v", name, line)
+					}
 				}
-			}
-			// The two ends: each client closed its TCP socket for real.
-			if !tc.appGone && !closedByPeer(e.app) {
-				t.Error("pf-client connect let go, but the application's socket is still open")
-			}
-			if !tc.targetGone && !closedByPeer(e.target) {
-				t.Error("pf-client serve let go, but the target's socket is still open")
-			}
-			// Only this connection ended; the tunnel is unharmed.
-			if !tc.tunnelGone {
-				if err := connector.Check(connectCtx); err != nil && connectCtx.Err() == nil {
-					t.Errorf("the tunnel did not survive a broken connection: %v", err)
+				for _, side := range tc.prompt {
+					if took[side] > 5*time.Second {
+						t.Errorf("pf-client %s saw the break itself but took %s to let go", side, took[side])
+					}
 				}
-				if n := len(f.hub.snapshot().Words); n != 1 || !f.hub.snapshot().Words[0].Live {
-					t.Errorf("the tunnel is no longer live after a broken connection")
+				// The two ends: each client closed its TCP socket for real.
+				if !tc.appGone && !closedByPeer(e.app) {
+					t.Error("pf-client connect let go, but the application's socket is still open")
 				}
-			}
-		})
+				if !tc.targetGone && !closedByPeer(e.target) {
+					t.Error("pf-client serve let go, but the target's socket is still open")
+				}
+				// Only this connection ended; the tunnel is unharmed.
+				if !tc.tunnelGone {
+					if err := connector.Check(connectCtx); err != nil && connectCtx.Err() == nil {
+						t.Errorf("the tunnel did not survive a broken connection: %v", err)
+					}
+					if n := len(f.hub.snapshot().Words); n != 1 || !f.hub.snapshot().Words[0].Live {
+						t.Errorf("the tunnel is no longer live after a broken connection")
+					}
+				}
+			})
+		}
 	}
 }

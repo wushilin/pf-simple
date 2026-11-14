@@ -12,9 +12,10 @@ record Timing(
         long controlPingMs,
         int controlSilenceMs,
         long pingEveryMs, // on streams
-        int linkSilenceMs) {
+        int linkSilenceMs,
+        long verdictMs) { // after a clean finish on an offered leg, the wait for the hub's verdict (§12.5)
 
-    static final Timing DEFAULT = new Timing(1000, 30_000, 60_000, 30_000, 20_000, 60_000, 10_000, 30_000);
+    static final Timing DEFAULT = new Timing(1000, 30_000, 60_000, 30_000, 20_000, 60_000, 10_000, 30_000, 3000);
 
     /** The pause after the one that was just waited. */
     long next(long backoff) {

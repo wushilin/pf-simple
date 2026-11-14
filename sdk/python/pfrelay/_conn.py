@@ -21,6 +21,10 @@ _INBOX_LIMIT = 1 << 20  # bytes read ahead of the application
 
 _EOF = b"eof"
 _ERR = b"err:"
+# Protocol 2 (PROTOCOL.md 12): the text frames on a leg offered reuse.
+MSG_IDLE = b"idle"
+MSG_BIND = b"bind"
+MSG_BOUND = b"bound"
 
 log = logging.getLogger("pfrelay")
 
@@ -159,6 +163,9 @@ class Conn:
         conn_id: Union[ConnID, str],
         side: Side,
         owner: Optional[_Owner] = None,
+        *,
+        reusable: bool = False,
+        finisher: Optional[Callable[["Conn"], Any]] = None,
     ):
         self._ws = ws
         self._id = conn_id if isinstance(conn_id, ConnID) else ConnID(conn_id)
@@ -181,7 +188,15 @@ class Conn:
         self._broke: Optional[BaseException] = None  # the first error that broke it here
         self._close_sent = False
         self._done = False
+        self._final: Optional[BaseException] = None  # why it ended, once it has
         self._dropping = False  # Client.drop has begun to fail it
+        # Protocol 2: the leg was offered reuse; the hub's verdict after a
+        # clean finish (PROTOCOL.md 12.5).
+        self._reusable = reusable
+        self._finisher = finisher  # async (conn) -> error the verdict reports
+        self._idled = False  # the hub's valid "idle" arrived; the reader stopped
+        self._detached = False  # the leg went on to its next connection
+        self._verdict = asyncio.Event()  # idle, an err: after eof, or the end
         ws.start_keepalive(self._PING_EVERY, self._SILENCE)
         self._reader = asyncio.ensure_future(self._pump())
 
@@ -242,14 +257,27 @@ class Conn:
                     if not fin:
                         raise FrameError("fragmented text frame")
                     if payload == _EOF:
+                        if self._read_eof and self._reusable:
+                            raise FrameError("a second eof")
                         if not self._read_eof:
                             self._read_eof = True
                             inbox.finish(None)
+                    elif self._reusable and payload == MSG_IDLE:
+                        if self._close_sent:
+                            continue  # it crossed our close: ignored (12.5)
+                        if not (self._read_eof and self._wrote_eof) or self._failure is not None:
+                            raise FrameError("idle in the wrong state")  # a violation (12.4)
+                        self._idled = True
+                        return  # the leg goes on; nothing here reads it any more
+                    elif self._reusable and (payload == MSG_BIND or payload.startswith(MSG_BIND + b" ")
+                                             or payload == MSG_BOUND or payload.startswith(MSG_BOUND + b" ")):
+                        raise FrameError("bind or bound on a carrying leg")  # a violation (12.4)
                     elif payload.startswith(_ERR):
                         reason = clean_reason(payload[len(_ERR):].decode("utf-8", "replace"))
                         if self._read_eof or inbox.ended:
                             if not self._gone_reason and self._failure is None:
                                 self._gone_reason = reason or "the far end dropped the connection"
+                                self._verdict.set()
                         elif not self._closing:
                             self._failure = RemoteError(reason)
                             inbox.finish(self._failure)
@@ -273,6 +301,7 @@ class Conn:
         finally:
             inbox.finish(LinkError("the connection is closed"))
             ws.stop_keepalive()
+            self._verdict.set()
             self._gone.set()
 
     async def read(self, n: int = CHUNK_SIZE) -> bytes:
@@ -380,7 +409,7 @@ class Conn:
         await self._fail(reason, DroppedError(reason))
 
     async def _fail(self, reason: str, err: BaseException) -> None:
-        if self._done:
+        if self._done or self._detached:
             return
         self._done = self._closing = True
         self._break(err)
@@ -395,21 +424,65 @@ class Conn:
         self._ws.close_transport()
         await self._end(self._broke)
 
-    async def close(self) -> None:
+    async def close(self) -> Optional[BaseException]:
         """End the connection. If this end has not half-closed, it does so
         first. When both ends had half-closed the close is clean; otherwise
-        the far end sees the connection cut."""
+        the far end sees the connection cut.
+
+        On a leg offered reuse (protocol 2), a clean finish waits up to 3
+        seconds for the hub's verdict before the connection is reported
+        closed. Returns why it ended, or None after a clean finish."""
         if self._done:
-            return
+            return self._final
         if not self._wrote_eof and not self._failed and not self._gone.is_set():
             try:
                 await self.close_write()
             except (ConnectionError, OSError, ClosedError):
                 pass
         if self._done:
-            return
+            return self._final
         self._done = self._closing = True
-        if self._read_eof and self._wrote_eof and not self._gone.is_set():
+        verdict_err: Optional[BaseException] = None
+        if self._finisher is not None and self._clean():
+            try:
+                verdict_err = await self._finisher(self)  # the hub's verdict; the leg kept if it may be
+            except Exception as e:  # never leave a connection unreported
+                log.exception("pfrelay: ending a reusable leg failed")
+                verdict_err = e
+                if not self._detached:
+                    self._ws.abort()
+        else:
+            await self._close_stream()
+        if self._broke is not None:
+            err = self._broke
+        elif verdict_err is not None:
+            err = verdict_err
+        else:
+            err = self.err
+        await self._end(err)
+        return err
+
+    def _clean(self) -> bool:
+        """Finished cleanly so far: both half-closes, nothing failed."""
+        return (
+            self._reusable
+            and self._read_eof
+            and self._wrote_eof
+            and self._failure is None
+            and not self._failed
+            and not self._dropping
+        )
+
+    async def _close_stream(self) -> None:
+        """End the stream as protocol 1 does (PROTOCOL.md 8.4)."""
+        if self._detached:
+            return
+        if self._idled:
+            # Nothing reads the leg any more: a close reply would never be
+            # seen, so do not wait for one (12.5).
+            await self._send_close()
+            self._ws.close_transport()
+        elif self._read_eof and self._wrote_eof and not self._gone.is_set():
             await self._send_close()
             try:
                 await asyncio.wait_for(self._gone.wait(), _ws.CLOSE_TIMEOUT)
@@ -420,17 +493,37 @@ class Conn:
             self._ws.close_transport()
         else:
             self._ws.abort()
-        await self._end(self._broke if self._broke is not None else self.err)
 
-    async def _close_with(self, err: Optional[BaseException]) -> None:
+    async def _await_verdict(self, timeout: float) -> tuple[bool, str]:
+        """After both half-closes, wait for the hub's verdict (12.5): (True,
+        "") on its "idle"; (False, reason) when it failed the connection;
+        (False, "") when it closed, or said nothing in time."""
+        try:
+            await asyncio.wait_for(self._verdict.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False, ""
+        if self._idled:
+            return True, ""
+        return False, self._gone_reason
+
+    def _detach(self) -> WebSocket:
+        """Hand the leg on, after the hub's "idle": this connection lets go
+        of it without closing it."""
+        self._detached = True
+        self._ws.stop_keepalive()
+        return self._ws
+
+    async def _close_with(self, err: Optional[BaseException]) -> Optional[BaseException]:
         """close(), recording err as why the connection ended."""
         if err is not None:
             self._break(err)
-        await self.close()
+        return await self.close()
 
     async def _end(self, err: Optional[BaseException]) -> None:
+        self._final = err
         self._inbox.close()
-        self._ws.stop_keepalive()
+        if not self._detached:
+            self._ws.stop_keepalive()
         if self._owner is not None:
             await self._owner._conn_closed(self, err)
 

@@ -168,7 +168,9 @@ async def bridge(conn: Conn, reader: asyncio.StreamReader, writer: asyncio.Strea
     if err is not None and mine:
         await conn._fail(reason, err)
     else:
-        await conn._close_with(err)
+        final = await conn._close_with(err)
+        if err is None and final is not None:  # the hub's verdict said otherwise (12.5)
+            reason, err = link_reason(p, final), final
     if err is None:
         writer.close()
     else:

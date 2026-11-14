@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pfrelay::{Client, Conn, ConnInfo, Error, Events, Side};
+use pfrelay::{Client, Conn, ConnInfo, Error, Events, ProtoLimit, Side};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,7 +20,9 @@ const USAGE: &str = "usage:
   driver serve   --server URL --ca FILE --word WORD --target HOST:PORT [--serve-token T] [--client-token T] [--name NAME] [--mode listen|forward] [--no-accept]
   driver connect --server URL --ca FILE --word WORD --listen HOST:PORT [--client-token T] [--mode listen|forward]
   driver check   --server URL --ca FILE --word WORD [--client-token T]
-  driver version --server URL --ca FILE --serve-token T";
+  driver version --server URL --ca FILE --serve-token T
+  driver protocols
+Every command but protocols also takes --proto-max N (0: announce no protocol).";
 
 /// Defines a closed set of words: an enum that prints and parses as them.
 macro_rules! words {
@@ -52,7 +54,7 @@ macro_rules! words {
 
 words!(
     /// What the suite asks the driver to do.
-    Command { Serve = "serve", Connect = "connect", Check = "check", Version = "version" }
+    Command { Serve = "serve", Connect = "connect", Check = "check", Version = "version", Protocols = "protocols" }
 );
 words!(
     /// How the driver uses the SDK.
@@ -80,6 +82,7 @@ words!(
         Name = "name",
         Mode = "mode",
         NoAccept = "no-accept",
+        ProtoMax = "proto-max",
     }
 );
 words!(
@@ -228,6 +231,18 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd: Command = args.first().unwrap_or_else(|| usage("no command")).parse().unwrap_or_else(|e: String| usage(&e));
     let flags = Flags::parse(&args[1..]);
+    if cmd == Command::Protocols {
+        say(pfrelay::proto_range(pfrelay::PROTO_MIN, pfrelay::PROTO_MAX));
+        exit(0);
+    }
+    let limit = match flags.get(Flag::ProtoMax) {
+        n if n.is_empty() => ProtoLimit::Newest,
+        n => match n.parse::<u32>() {
+            Ok(0) => ProtoLimit::Unannounced,
+            Ok(n) => ProtoLimit::UpTo(n),
+            Err(_) => usage(&format!("--{} needs a number", Flag::ProtoMax)),
+        },
+    };
     let mode: Mode = match flags.get(Flag::Mode) {
         m if m.is_empty() => Mode::Listen,
         m => m.parse().unwrap_or_else(|e: String| usage(&e)),
@@ -245,7 +260,8 @@ async fn main() {
         .target(target.clone())
         .agent(format!("{} conformance", pfrelay::DEFAULT_AGENT))
         .logger(|msg| eprintln!("{msg}"))
-        .events(events(cmd));
+        .events(events(cmd))
+        .max_proto(limit);
     if let Some(ca) = flags.0.get(&Flag::Ca) {
         b = b.ca_file(ca);
     }
@@ -268,6 +284,7 @@ async fn main() {
                     Mode::Listen => serve(&client, &target, flags.on(Flag::NoAccept)).await,
                 }
             }
+            Command::Protocols => unreachable!("answered before the client is made"),
             Command::Connect => {
                 let ln = TcpListener::bind(flags.required(Flag::Listen))
                     .await

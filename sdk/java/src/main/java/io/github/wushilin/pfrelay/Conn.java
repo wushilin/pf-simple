@@ -60,7 +60,12 @@ public final class Conn implements Closeable {
     private final AtomicReference<IOException> failure = new AtomicReference<>(); // what the reader saw
     private final AtomicReference<IOException> broke = new AtomicReference<>(); // what broke it here
     private volatile String goneReason;
-    private final CountDownLatch gone = new CountDownLatch(1);
+    private final CountDownLatch gone = new CountDownLatch(1); // the reader has stopped, for whatever reason
+    // Reuse (protocol 2, docs/PROTOCOL.md §12): the registration whose idle
+    // pool this leg may join; null when the hub did not offer reuse.
+    private final Registration reuse;
+    private final long verdictMs;
+    private final AtomicBoolean idled = new AtomicBoolean(); // the reader stopped at the hub's "idle"
     private volatile boolean closed; // close has begun: errors from here on are our own doing
     private final AtomicBoolean closeOnce = new AtomicBoolean();
     private final AtomicBoolean sentClose = new AtomicBoolean();
@@ -72,9 +77,20 @@ public final class Conn implements Closeable {
 
     /** Takes over ws, and reports the connection opened. */
     Conn(WebSocket ws, Client client, ConnId id, Side side) throws IOException {
+        this(ws, client, id, side, null);
+    }
+
+    /**
+     * Takes over ws, and reports the connection opened. reuse is the
+     * registration whose idle pool the leg may join, when the hub offered
+     * reuse on it; null otherwise.
+     */
+    Conn(WebSocket ws, Client client, ConnId id, Side side, Registration reuse) throws IOException {
         this.ws = ws;
         this.client = client;
+        this.reuse = reuse;
         Timing timing = client.timing();
+        this.verdictMs = timing.verdictMs();
         this.linkSilenceMs = timing.linkSilenceMs();
         ws.setWriteTimeout(0); // data may be held back by the network for as long as it likes
         ws.setReadTimeout(linkSilenceMs);
@@ -251,7 +267,12 @@ public final class Conn implements Closeable {
 
     /** Whether the far end is gone for good: it closed the stream, or the link died. */
     boolean isGone() {
-        return gone.getCount() == 0;
+        return gone.getCount() == 0 && !idled.get();
+    }
+
+    /** Whether the hub offered to reuse this connection's leg. */
+    boolean reusable() {
+        return reuse != null;
     }
 
     /** What the far end said when it went, after its half-close; null if nothing. */
@@ -270,7 +291,6 @@ public final class Conn implements Closeable {
         if (!closeOnce.compareAndSet(false, true)) {
             return;
         }
-        ws.beginClose();
         if (!wroteEOF.get() && !failed.get()) {
             try {
                 shutdownOutput();
@@ -280,6 +300,12 @@ public final class Conn implements Closeable {
         }
         closed = true;
         pinger.cancel(false);
+        if (reuse != null && readEOF.get() && wroteEOF.get() && !failed.get() && failure.get() == null
+                && broke.get() == null && goneReason == null) {
+            finishOffered();
+            return;
+        }
+        ws.beginClose();
         if (readEOF.get() && wroteEOF.get() && !failed.get()) {
             boolean wrote = true;
             if (sentClose.compareAndSet(false, true)) {
@@ -295,6 +321,65 @@ public final class Conn implements Closeable {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
+            }
+        }
+        ws.abort();
+        IOException err = broke.get();
+        client.closed(rec, err != null ? err : error());
+    }
+
+    /**
+     * Ends a clean finish on a leg the hub offered to reuse: waits for the
+     * hub's verdict, keeps the leg if there is room, and only then reports
+     * the connection closed (docs/PROTOCOL.md §12.5).
+     */
+    private void finishOffered() {
+        try {
+            gone.await(verdictMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (idled.get()) {
+            // The reader has stopped at the hub's "idle": nobody reads the leg now.
+            if (reuse.keep()) {
+                try {
+                    ws.writeFrame(WebSocket.OP_TEXT, Registration.IDLE_TEXT);
+                    client.closed(rec, null);
+                    reuse.idleLeg(ws);
+                    return;
+                } catch (IOException e) {
+                    reuse.release();
+                }
+            }
+            // over the cap: the hub's "idle" is answered with a close, and
+            // nobody will answer ours
+            ws.beginClose();
+            if (sentClose.compareAndSet(false, true)) {
+                try {
+                    ws.writeFrame(WebSocket.OP_CLOSE, new byte[0]);
+                } catch (IOException ignored) {
+                    // going anyway
+                }
+            }
+            ws.abort();
+            client.closed(rec, null);
+            return;
+        }
+        if (gone.getCount() == 0 && goneReason != null) { // err: instead of idle: the connection failed
+            ws.abort();
+            client.closed(rec, new RemoteException(goneReason));
+            return;
+        }
+        // the hub closed, or said nothing in time: protocol 1 rules (§8.4)
+        ws.beginClose();
+        if (sentClose.compareAndSet(false, true)) {
+            try {
+                ws.writeFrame(WebSocket.OP_CLOSE, new byte[0]);
+                gone.await(WebSocket.CLOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            } catch (IOException ignored) {
+                // going anyway
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
         }
         ws.abort();
@@ -333,6 +418,20 @@ public final class Conn implements Closeable {
                         break;
                     case WebSocket.OP_TEXT: {
                         String msg = new String(ws.readPayload(f, MAX_TEXT_FRAME), StandardCharsets.UTF_8);
+                        if (reuse != null && readEOF.get() && msg.equals(Registration.IDLE)) {
+                            // The hub's verdict: a clean finish. Valid only once this
+                            // side sent its eof (§12.4); otherwise a violation.
+                            if (wroteEOF.get()) {
+                                idled.set(true);
+                                return; // stop reading: the leg may go on to its next connection
+                            }
+                            if (!closed) {
+                                failure.compareAndSet(null,
+                                        new IOException("the server sent idle before this side's half-close"));
+                            }
+                            ws.abort();
+                            return;
+                        }
                         if (msg.equals("eof")) {
                             if (readEOF.compareAndSet(false, true)) {
                                 deliver(EOF_MARK);

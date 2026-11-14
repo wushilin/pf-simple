@@ -75,3 +75,25 @@ func TestProtocolOneIsSealed(t *testing.T) {
 		t.Error("client tokens and serving without a serve token are part of protocol 1")
 	}
 }
+
+// Protocol 2's names and numbers (docs/PROTOCOL.md §12). Once released they
+// are sealed like protocol 1's.
+func TestProtocolTwo(t *testing.T) {
+	for got, want := range map[string]string{
+		HeaderSession:   "X-PF-Tunnel-Session",
+		HeaderKeepAlive: "X-PF-Tunnel-Keep-Alive",
+		MsgIdle:         "idle",
+		MsgBind:         "bind",
+		MsgBound:        "bound",
+	} {
+		if got != want {
+			t.Errorf("protocol 2 has %q, the code has %q", want, got)
+		}
+	}
+	if ProtoMax != 2 || protoRelease[2] != "0.15.0" {
+		t.Errorf("protocol 2 belongs to 0.15.0; ProtoMax = %d, release %q", ProtoMax, protoRelease[2])
+	}
+	if FeatureProto(FeatureReuse) != 2 {
+		t.Error("reusing accept legs is protocol 2")
+	}
+}

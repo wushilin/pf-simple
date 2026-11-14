@@ -96,9 +96,12 @@ pub(crate) async fn reply(s: &mut DuplexStream, status: u16, extra: &[(&str, &st
 pub(crate) async fn upgrade(s: &mut DuplexStream, req: &Req, extra: &[(&str, &str)]) {
     let key = req.get("Sec-WebSocket-Key").unwrap();
     let mut head = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\nX-Pf-Tunnel-Proto: 1\r\n",
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
         crate::ws::accept_key(key)
     );
+    if !extra.iter().any(|(n, _)| n.eq_ignore_ascii_case("X-Pf-Tunnel-Proto")) {
+        head.push_str("X-Pf-Tunnel-Proto: 1\r\n");
+    }
     for (n, v) in extra {
         head.push_str(&format!("{n}: {v}\r\n"));
     }
@@ -149,6 +152,44 @@ pub(crate) async fn recv(s: &mut DuplexStream) -> Option<(u8, Vec<u8>)> {
         }
         if h[0] & 0x0F != crate::ws::OP_PING {
             return Some((h[0] & 0x0F, body));
+        }
+    }
+}
+
+/// The hub's side of a run where the test writes every frame: each request
+/// arrives here, and the test answers it.
+pub(crate) struct Script(tokio::sync::mpsc::UnboundedReceiver<(Req, DuplexStream)>);
+
+/// A client for `WORD` whose hub is the test itself.
+pub(crate) fn scripted(configure: impl FnOnce(ClientBuilder) -> ClientBuilder) -> (Client, Script) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let c = client(
+        move |req, s| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send((req, s));
+            }
+        },
+        configure,
+    );
+    (c, Script(rx))
+}
+
+impl Script {
+    /// The next request, which must be to `endpoint`.
+    pub(crate) async fn next(&mut self, endpoint: &str) -> (Req, DuplexStream) {
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), self.0.recv())
+            .await
+            .expect("a request in time")
+            .expect("the client is gone");
+        assert_eq!(got.0.endpoint(), endpoint, "{:?}", got.0);
+        got
+    }
+
+    /// No request comes within `d`.
+    pub(crate) async fn none_within(&mut self, d: std::time::Duration) {
+        if let Ok(Some((req, _))) = tokio::time::timeout(d, self.0.recv()).await {
+            panic!("an unexpected request: {req:?}");
         }
     }
 }

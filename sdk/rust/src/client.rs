@@ -12,7 +12,7 @@ use crate::conn::{Conn, ConnInfo, Registry, Side, Stats};
 use crate::error::{Error, Result};
 use crate::events::{ConnId, Events};
 use crate::http::{self, Answer, Connector, Head, Upgraded};
-use crate::proto::{self, Endpoint};
+use crate::proto::{self, Endpoint, ProtoLimit};
 use crate::values::{self, Base};
 
 /// What a [`Client`] calls itself in the hub's log and console unless told
@@ -31,6 +31,12 @@ pub(crate) const H_CLIENT_HASH: &str = "X-PF-Client-Token-SHA256";
 pub(crate) const H_CLIENT_TOKEN: &str = "X-PF-Client-Token";
 pub(crate) const H_CONN: &str = "X-PF-Tunnel-Conn";
 pub(crate) const H_ERROR: &str = "X-PF-Tunnel-Error";
+pub(crate) const H_SESSION: &str = "X-PF-Tunnel-Session";
+pub(crate) const H_KEEP_ALIVE: &str = "X-PF-Tunnel-Keep-Alive";
+
+/// How many idle legs a serving client keeps for reuse unless told
+/// otherwise (PROTOCOL.md §12.9).
+pub const DEFAULT_MAX_IDLE_LEGS: usize = 16;
 
 /// The answer to a version probe (PROTOCOL.md §6.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +76,9 @@ pub struct Timing {
     pub settled: Duration,
     /// [`Client::watch`] checks a tunnel that is up this often.
     pub recheck: Duration,
+    /// After a clean finish on a leg offered reuse, how long to wait for
+    /// the hub's verdict (PROTOCOL.md §12.5).
+    pub verdict_wait: Duration,
 }
 
 impl Default for Timing {
@@ -79,6 +88,7 @@ impl Default for Timing {
             retry_max: Duration::from_secs(30),
             settled: Duration::from_secs(60),
             recheck: Duration::from_secs(30),
+            verdict_wait: Duration::from_secs(3),
         }
     }
 }
@@ -104,6 +114,9 @@ pub struct ClientBuilder {
     events: Events,
     timing: Timing,
     connector: Option<Connector>,
+    max_proto: ProtoLimit,
+    no_reuse: bool,
+    max_idle_legs: usize,
 }
 
 impl ClientBuilder {
@@ -182,6 +195,28 @@ impl ClientBuilder {
         self
     }
 
+    /// The newest tunnel protocol to offer: [`ProtoLimit::Newest`] (the
+    /// default) offers protocol 2; `UpTo(1)` behaves like pf-client 0.14;
+    /// `Unannounced` like a client from before 0.14.
+    pub fn max_proto(mut self, limit: ProtoLimit) -> Self {
+        self.max_proto = limit;
+        self
+    }
+
+    /// Never reuse the serving side's accept legs (protocol 2): each
+    /// connection gets a new one, as in protocol 1.
+    pub fn no_reuse(mut self) -> Self {
+        self.no_reuse = true;
+        self
+    }
+
+    /// How many idle legs to keep for reuse at most; [`DEFAULT_MAX_IDLE_LEGS`]
+    /// by default. More are closed when the hub offers them.
+    pub fn max_idle_legs(mut self, n: usize) -> Self {
+        self.max_idle_legs = n;
+        self
+    }
+
     /// Retry and recheck timing; [`Timing::default`] unless told otherwise.
     pub fn timing(mut self, timing: Timing) -> Self {
         self.timing = timing;
@@ -227,6 +262,9 @@ impl ClientBuilder {
                 target: self.target.unwrap_or_else(|| "listener".into()),
                 agent: self.agent.unwrap_or_else(|| DEFAULT_AGENT.into()),
                 registry: Arc::new(Registry::new(self.events)),
+                max_proto: self.max_proto,
+                reuse: !self.no_reuse && self.max_proto.max() >= 2 && self.max_idle_legs > 0,
+                max_idle_legs: self.max_idle_legs,
                 log: self.log,
             }),
         })
@@ -291,6 +329,10 @@ pub(crate) struct Inner {
     agent: String,
     pub(crate) registry: Arc<Registry>,
     log: Option<Logger>,
+    max_proto: ProtoLimit,
+    /// This client takes part in reusing legs (protocol 2).
+    pub(crate) reuse: bool,
+    pub(crate) max_idle_legs: usize,
 }
 
 /// Talks to one relay hub about one tunnel (one word). It can serve the
@@ -325,6 +367,9 @@ impl Client {
             events: Events::default(),
             timing: Timing::default(),
             connector: None,
+            max_proto: ProtoLimit::Newest,
+            no_reuse: false,
+            max_idle_legs: DEFAULT_MAX_IDLE_LEGS,
         }
     }
 
@@ -410,11 +455,11 @@ impl Client {
     pub(crate) async fn send(&self, endpoint: Endpoint, extra: Vec<(&'static str, String)>, upgrade: bool) -> Result<Answer> {
         let i = &self.inner;
         let needs = proto::needs(endpoint, i.client_token.is_some(), i.serve_token.is_some());
-        let mut headers = vec![
-            (H_PROTO, proto::offer(&needs)),
-            (H_VERSION, i.agent.clone()),
-            ("User-Agent", i.agent.clone()),
-        ];
+        let mut headers = vec![("User-Agent", i.agent.clone())];
+        if let Some(range) = proto::offer(&needs, i.max_proto) {
+            headers.push((H_PROTO, range));
+            headers.push((H_VERSION, i.agent.clone()));
+        }
         headers.extend(extra);
         let answer = http::request(&i.base, &i.connector, endpoint.path(), &headers, upgrade).await?;
         let head = match &answer {
@@ -481,6 +526,19 @@ impl Client {
         h
     }
 
+    /// Brings this side's leg of connection `id` to the hub. With the
+    /// registration's session, it asks for reuse; the result says whether
+    /// the hub offered it (PROTOCOL.md §12.3).
+    pub(crate) async fn accept(&self, id: &str, session: Option<&str>) -> Result<(Upgraded, bool)> {
+        let mut h = self.accept_headers(id);
+        if let Some(s) = session {
+            h.push((H_SESSION, s.to_string()));
+        }
+        let up = self.upgrade(Endpoint::Accept, h).await?;
+        let offered = session.is_some() && crate::reuse::offered(&up.head);
+        Ok((up, offered))
+    }
+
     /// Opens one connection through the tunnel.
     ///
     /// The hub answers before the serving side has: if the serving side
@@ -489,7 +547,7 @@ impl Client {
     pub async fn dial(&self) -> Result<Conn> {
         let up = self.upgrade(Endpoint::Connect, self.connect_headers()).await?;
         let id = up.head.get(H_CONN).unwrap_or_default().to_string();
-        Ok(Conn::start(up, &id, Side::Connect, self.inner.registry.clone()))
+        Ok(Conn::start(up, &id, Side::Connect, self.inner.registry.clone(), None))
     }
 
     /// Asks the hub whether someone serves this word (and whether the

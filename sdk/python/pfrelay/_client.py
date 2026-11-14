@@ -16,7 +16,9 @@ from typing import Any, Awaitable, Callable, Optional, Union
 from urllib.parse import quote_plus
 
 from . import _ws
-from ._conn import Conn, ConnInfo, Stats, _Registry, emit
+from ._conn import _EOF as _EOF_FRAME
+from ._conn import _ERR as _ERR_FRAME
+from ._conn import MSG_BIND, MSG_BOUND, MSG_IDLE, Conn, ConnInfo, Stats, _Registry, emit
 from ._forward import PARTY_CONNECT, PARTY_SERVE, bridge
 from ._proto import (
     CONTROL_OPEN,
@@ -24,9 +26,11 @@ from ._proto import (
     HEADER_CLIENT_TOKEN,
     HEADER_CONN,
     HEADER_ERROR,
+    HEADER_KEEP_ALIVE,
     HEADER_NAME,
     HEADER_PROTO,
     HEADER_SERVE,
+    HEADER_SESSION,
     HEADER_TARGET,
     HEADER_VERSION,
     HEADER_WORD,
@@ -39,9 +43,11 @@ from ._proto import (
     Feature,
     LinkError,
     ProtoError,
+    RemoteError,
     ServerInfo,
     Side,
     StatusError,
+    clean_reason,
     check_client_token,
     check_name,
     check_serve_token,
@@ -51,7 +57,7 @@ from ._proto import (
     proto_range,
     server_proto,
 )
-from ._ws import OP_CLOSE, OP_PING, OP_PONG, OP_TEXT, WebSocket
+from ._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT, FrameError, WebSocket
 
 __version__ = "0.1.0"
 DEFAULT_AGENT = f"pfrelay-py {__version__}"
@@ -69,6 +75,13 @@ LISTENER_TARGET = "listener"  # what listen() tells the console without a target
 REASON_BACKLOG = "the serving side is not accepting connections fast enough"
 REASON_UNREACHABLE = "the serving side could not reach its target"
 REASON_STOPPED = "the serving side stopped listening"
+# How an attempt ends whose leg died before the hub heard "bound": the hub
+# asks again with an open message (PROTOCOL.md 12.7).
+REASON_LEG_LOST = "the leg was lost before the server took the connection"
+
+DEFAULT_MAX_IDLE_LEGS = 16
+SESSION_LENGTH = 32  # hex digits of X-PF-Tunnel-Session
+KEEP_ALIVE_MAX = 3600  # the largest valid X-PF-Tunnel-Keep-Alive
 
 _NO_RELAY = "this server does not accept tunnels (it needs --tunnel or a [tunnel] table)"
 _NO_PROBE = (
@@ -143,6 +156,7 @@ class Client:
     retry_max = 30.0  # ...up to this
     settled = 60.0  # a control channel this old starts the pause again
     recheck = 30.0  # watch checks a tunnel that is up this often
+    verdict_wait = 3.0  # how long a clean finish waits for the hub's verdict (12.5)
 
     def __init__(
         self,
@@ -157,6 +171,9 @@ class Client:
         target: str = "",
         agent: str = DEFAULT_AGENT,
         events: Optional[Events] = None,
+        max_proto: Optional[int] = None,
+        no_reuse: bool = False,
+        max_idle_legs: int = DEFAULT_MAX_IDLE_LEGS,
     ):
         self.base, self._host, self._port, self._netloc = normalize_base(server)
         self.word = normalize_word(word)
@@ -172,6 +189,13 @@ class Client:
         self.target = target
         self.agent = _clean_header(agent or DEFAULT_AGENT, 128) or DEFAULT_AGENT
         self.events = events if events is not None else Events()
+        # The newest protocol to offer: None or 0 the newest this SDK
+        # speaks, 1 like pf-client 0.14, -1 none at all, like a client from
+        # before 0.14 (for testing against old peers).
+        self.max_proto = max_proto
+        # Protocol 2: keep the serving side's legs for reuse, at most this many.
+        self.no_reuse = no_reuse
+        self.max_idle_legs = max_idle_legs if max_idle_legs > 0 else DEFAULT_MAX_IDLE_LEGS
         if ssl_context is None:
             ssl_context = ssl.create_default_context(cafile=ca_file)
         elif ca_file:
@@ -200,12 +224,25 @@ class Client:
                 out.append(Feature.CLIENT_TOKEN)
         return out
 
-    def offer(self, endpoint: Union[Endpoint, str]) -> str:
-        """The protocol range a request to endpoint offers."""
+    def proto_max(self) -> int:
+        """The newest protocol this client offers."""
+        m = self.max_proto
+        if m is not None and m < 0:
+            return 0
+        if not m or m > PROTO_MAX:
+            return PROTO_MAX
+        return m
+
+    def offer(self, endpoint: Union[Endpoint, str]) -> Optional[str]:
+        """The protocol range a request to endpoint offers; None when this
+        client announces none (max_proto -1)."""
+        if self.max_proto is not None and self.max_proto < 0:
+            return None
+        hi = self.proto_max()
         lo = PROTO_MIN
         for f in self.needs(endpoint):
             lo = max(lo, f.proto)
-        return proto_range(lo, PROTO_MAX)
+        return proto_range(min(lo, hi), hi)
 
     def answered(self, endpoint: Union[Endpoint, str], headers) -> None:
         """Raise ProtoError when the hub's answer shows it is too old for
@@ -216,7 +253,10 @@ class Client:
                 raise ProtoError(proto, f)
 
     def _headers(self, endpoint: Endpoint, extra: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        h = [(HEADER_PROTO, self.offer(endpoint)), (HEADER_VERSION, self.agent)]
+        h: list[tuple[str, str]] = []
+        offer = self.offer(endpoint)
+        if offer is not None:  # a client from before 0.14 announced nothing
+            h += [(HEADER_PROTO, offer), (HEADER_VERSION, self.agent)]
         if endpoint is not Endpoint.VERSION:
             h.append((HEADER_WORD, self.word))
         return h + extra
@@ -404,23 +444,30 @@ class Client:
             raise ValueError("give the tunnel a name")
         host, port = split_host_port(target)
 
-        async def open_one(cid: ConnID) -> None:
+        async def open_one(cid: ConnID, sess: "_Session", leg: Optional[WebSocket]) -> None:
+            # On a reused leg the hub already has "bound": a refusal from
+            # here on is an err: on that leg (12.7).
             try:
                 reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), TARGET_DIAL_TIMEOUT)
             except (OSError, asyncio.TimeoutError) as e:
                 log.warning("connection %s refused: cannot reach the target %s: %s", cid.short, target, e)
-                await self._refuse(cid, REASON_UNREACHABLE)
+                if leg is not None:
+                    await self._refuse_leg(leg, cid, REASON_UNREACHABLE)
+                else:
+                    await self._refuse(cid, REASON_UNREACHABLE)
                 return
-            try:
-                ws = await self._dial(Endpoint.ACCEPT, [(HEADER_CONN, str(cid))])
-            except Exception as e:
-                log.warning("connection %s failed: cannot bring it to the server: %s", cid.short, explain(e))
-                writer.transport.abort()
-                return
-            except BaseException:
-                writer.transport.abort()
-                raise
-            conn = await self._new_conn(ws, cid, Side.SERVE)
+            reusable = True
+            if leg is None:
+                try:
+                    leg, reusable = await self._accept(cid, sess)
+                except Exception as e:
+                    log.warning("connection %s failed: cannot bring it to the server: %s", cid.short, explain(e))
+                    writer.transport.abort()
+                    return
+                except BaseException:
+                    writer.transport.abort()
+                    raise
+            conn = await self._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
             ended = await bridge(conn, reader, writer, PARTY_SERVE)
             log.info("connection %s closed: %s", cid.short, ended.reason)
 
@@ -452,11 +499,48 @@ class Client:
         task.add_done_callback(self._drops.discard)
         return True
 
-    async def _new_conn(self, ws: WebSocket, cid: ConnID, side: Side) -> Conn:
-        conn = Conn(ws, cid, side, self)
+    async def _new_conn(
+        self,
+        ws: WebSocket,
+        cid: ConnID,
+        side: Side,
+        *,
+        reusable: bool = False,
+        finisher: Optional[Callable[[Conn], Awaitable[Optional[BaseException]]]] = None,
+    ) -> Conn:
+        conn = Conn(ws, cid, side, self, reusable=reusable, finisher=finisher if reusable else None)
         self._reg.add(conn)
         await emit(self.events.on_open, conn.info())
         return conn
+
+    async def _accept(self, cid: ConnID, sess: "_Session") -> tuple[WebSocket, bool]:
+        """Bring this side's leg of connection cid to the hub. With the
+        registration's session it may be offered reuse (12.3); returns the
+        leg and whether it was."""
+        extra = [(HEADER_CONN, str(cid))]
+        if sess.secret:
+            extra.append((HEADER_SESSION, sess.secret))
+        ws = await self._dial(Endpoint.ACCEPT, extra)
+        return ws, bool(sess.secret) and offered(ws.headers)
+
+    def _abandon(self, cid: ConnID) -> None:
+        """The hub asks again for an id only when the leg it was bound to
+        was lost before it heard "bound" (12.7): the old attempt fails, and
+        the new one goes on under the same id."""
+        for info in self._reg.conns():
+            if info.id == cid and info.side is Side.SERVE:
+                self.drop(cid, REASON_LEG_LOST)
+
+    async def _refuse_leg(self, ws: WebSocket, cid: ConnID, reason: str) -> None:
+        """Refuse a connection that arrived on a reused leg, after "bound":
+        err:<reason> and a close on that leg (12.7)."""
+        await emit(self.events.on_refuse, cid, reason)
+        try:
+            await ws.send(OP_TEXT, b"err:" + _clean_header(reason, 128).encode("ascii"), timeout=_ws.CLOSE_TIMEOUT)
+            await ws.send(OP_CLOSE, b"", timeout=_ws.CLOSE_TIMEOUT)
+        except (ConnectionError, OSError):
+            pass
+        ws.close_transport()
 
     async def _conn_closed(self, conn: Conn, err: Optional[BaseException]) -> None:
         if self._reg.finish(conn, err is not None):
@@ -478,7 +562,7 @@ class _Registration:
         self,
         client: Client,
         target: str,
-        open_one: Callable[[ConnID], Awaitable[None]],
+        open_one: Callable[[ConnID, "_Session", Optional[WebSocket]], Awaitable[None]],
         on_up: Callable[[bool], None],
     ):
         self._c = client
@@ -529,11 +613,13 @@ class _Registration:
                     log.info("registered with %s: serving %r", c.base, c.name)
                 served, attempt = True, 0
                 started = time.monotonic()
+                sess = _Session(self, ws.headers)
                 self._on_up(True)
                 await emit(c.events.on_serving, True)
                 try:
-                    err = await self._control(ws)
+                    err = await self._control(ws, sess)
                 finally:
+                    sess.end()  # its legs go with it (12.6)
                     self._on_up(False)
                 await emit(c.events.on_serving, False)
                 if time.monotonic() - started >= c.settled:
@@ -542,7 +628,12 @@ class _Registration:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, c.retry_max)
 
-    async def _control(self, ws: WebSocket) -> BaseException:
+    def spawn(self, coro) -> None:
+        t = asyncio.ensure_future(coro)
+        self._opens.add(t)
+        t.add_done_callback(self._opens.discard)
+
+    async def _control(self, ws: WebSocket, sess: "_Session") -> BaseException:
         """Run one control channel until it fails; returns why."""
         self.control = ws
         ws.start_keepalive(CONTROL_PING, CONTROL_SILENCE)
@@ -552,9 +643,8 @@ class _Registration:
                 if op == OP_TEXT:
                     cid = _open_message(payload)
                     if cid:
-                        t = asyncio.ensure_future(self._open_one(cid))
-                        self._opens.add(t)
-                        t.add_done_callback(self._opens.discard)
+                        self._c._abandon(cid)  # an id that comes back is a new attempt (12.7)
+                        self.spawn(self._open_one(cid, sess, None))
                 elif op == OP_PING:
                     try:
                         await ws.send(OP_PONG, payload, timeout=_ws.WRITE_TIMEOUT)
@@ -578,6 +668,122 @@ class _Registration:
             ws.stop_keepalive()
             ws.abort()
             self.control = None
+
+
+def known_leg_frame(msg: bytes) -> bool:
+    """Whether msg is one of the text frames of streams and reused legs
+    (8.1, 12): such a frame where it does not belong is a violation, while
+    any other text is ignored."""
+    return (
+        msg in (_EOF_FRAME, MSG_IDLE, MSG_BIND, MSG_BOUND)
+        or msg.startswith((_ERR_FRAME, MSG_BIND + b" ", MSG_BOUND + b" "))
+    )
+
+
+def offered(headers) -> bool:
+    """Whether the hub's answer to an accept offered reuse: a protocol 2
+    answer with a keep-alive of 1 to 3600 seconds (12.3)."""
+    if server_proto(headers) < 2:
+        return False
+    v = headers.get(HEADER_KEEP_ALIVE)
+    if not v or not v.isascii() or not v.isdigit():
+        return False
+    return 1 <= int(v) <= KEEP_ALIVE_MAX
+
+
+class _Session:
+    """One control channel's life (protocol 2): its secret, and the legs
+    kept for reuse that belong to it."""
+
+    def __init__(self, reg: "_Registration", headers):
+        c = reg._c
+        self._reg = reg
+        self._c = c
+        self.secret = ""
+        if server_proto(headers) >= 2 and not c.no_reuse and c.proto_max() >= 2:
+            v = headers.get(HEADER_SESSION) or ""
+            if len(v) == SESSION_LENGTH:
+                self.secret = v
+        self.idle = 0  # legs kept, idle or offered
+        self.legs: set[WebSocket] = set()
+        self.ended = False
+
+    def keep(self) -> bool:
+        """Reserve room for one more idle leg."""
+        if self.ended or self.idle >= self._c.max_idle_legs:
+            return False
+        self.idle += 1
+        return True
+
+    def release(self) -> None:
+        self.idle -= 1
+
+    def end(self) -> None:
+        """The control channel ended: the hub has dropped every leg."""
+        self.ended = True
+        for ws in list(self.legs):
+            ws.abort()
+
+    async def finisher(self, conn: Conn) -> Optional[BaseException]:
+        """End a cleanly finished connection on a reusable leg: wait for the
+        hub's verdict, keep the leg if there is room, and return what the
+        verdict reports went wrong, if anything (12.5)."""
+        idle, reason = await conn._await_verdict(self._c.verdict_wait)
+        if idle:
+            if self.keep():
+                ws = conn._ws
+                try:
+                    await ws.send(OP_TEXT, MSG_IDLE, timeout=_ws.WRITE_TIMEOUT)
+                except (ConnectionError, OSError):
+                    self.release()
+                    await conn._close_stream()
+                    return None
+                self._reg.spawn(self._idle_leg(conn._detach()))
+                return None
+            await conn._close_stream()  # the hub's "idle" answered with a close: not kept
+            return None
+        await conn._close_stream()
+        if reason:
+            return RemoteError(reason)
+        return None  # the hub closed, or said nothing in time: protocol 1 rules
+
+    async def _idle_leg(self, ws: WebSocket) -> None:
+        """Wait on an idle leg for the hub's "bind <id>", until the leg or
+        the registration ends."""
+        self.legs.add(ws)
+        bound = False
+        try:
+            if self.ended:
+                return
+            ws.start_keepalive(Conn._PING_EVERY, Conn._SILENCE)
+            while True:
+                op, fin, payload = await ws.recv(MAX_CONTROL_FRAME, MAX_CONTROL_FRAME)
+                if op in (OP_PING, OP_PONG):
+                    continue
+                if op == OP_CLOSE or op in (OP_BINARY, OP_CONT) or not fin:
+                    return  # closed, or a violation (12.4)
+                prefix = MSG_BIND + b" "
+                if payload.startswith(prefix) and len(payload) > len(prefix):
+                    break
+                if known_leg_frame(payload):
+                    return  # a known frame in the wrong state: a violation (12.4)
+                # unknown text is ignored
+            ws.stop_keepalive()
+            if self.ended:
+                return
+            raw = payload[len(MSG_BIND) + 1:]
+            await ws.send(OP_TEXT, MSG_BOUND + b" " + raw, timeout=_ws.WRITE_TIMEOUT)
+            bound = True
+        except (ConnectionError, OSError, LinkError, FrameError):
+            return
+        finally:
+            self.legs.discard(ws)
+            self.release()
+            if not bound:
+                ws.stop_keepalive()
+                ws.abort()
+        cid = ConnID(clean_reason(raw.decode("utf-8", "replace")))
+        await self._reg._open_one(cid, self, ws)
 
 
 def _open_message(payload: bytes) -> Optional[ConnID]:
@@ -652,23 +858,28 @@ class Listener:
             self._up = False
             self._done.set()
 
-    async def _open(self, cid: ConnID) -> None:
+    async def _open(self, cid: ConnID, sess: _Session, leg: Optional[WebSocket]) -> None:
         c = self._c
         if self._slots >= LISTEN_BACKLOG:
             log.warning("connection %s refused: %d connections are waiting to be accepted", cid.short, LISTEN_BACKLOG)
-            await c._refuse(cid, REASON_BACKLOG)
+            if leg is not None:
+                await c._refuse_leg(leg, cid, REASON_BACKLOG)  # after "bound", an err: (12.7)
+            else:
+                await c._refuse(cid, REASON_BACKLOG)
             return
         self._slots += 1
-        try:
-            ws = await c._dial(Endpoint.ACCEPT, [(HEADER_CONN, str(cid))])
-        except asyncio.CancelledError:
-            self._slots -= 1
-            raise
-        except Exception as e:
-            self._slots -= 1
-            log.warning("connection %s failed: cannot bring it to the server: %s", cid.short, explain(e))
-            return
-        conn = await c._new_conn(ws, cid, Side.SERVE)
+        reusable = True
+        if leg is None:
+            try:
+                leg, reusable = await c._accept(cid, sess)
+            except asyncio.CancelledError:
+                self._slots -= 1
+                raise
+            except Exception as e:
+                self._slots -= 1
+                log.warning("connection %s failed: cannot bring it to the server: %s", cid.short, explain(e))
+                return
+        conn = await c._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
         if self._closed:
             self._slots -= 1
             await conn.fail(REASON_STOPPED)

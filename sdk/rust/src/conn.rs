@@ -18,6 +18,7 @@ use tokio_util::sync::PollSender;
 use crate::error::{Error, RemoteError, Result};
 use crate::events::{ConnId, Events};
 use crate::http::{Stream as Tls, Upgraded};
+use crate::reuse::{Leg, Registration, MSG_IDLE};
 use crate::values::clean_reason;
 use crate::ws::{self, FrameReader, CHUNK, OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_TEXT, STREAM_LIMITS};
 
@@ -307,12 +308,41 @@ struct Shared {
     failed: AtomicBool,
     /// Tells the writer to close or fail the stream.
     ctl: mpsc::UnboundedSender<Ctl>,
+    /// The registration whose leg this is, when the hub offered reuse
+    /// (protocol 2).
+    reuse: Option<Arc<Registration>>,
+    /// The reader stopped at the hub's valid `idle`, and left the leg's
+    /// reader in `leg_reader`: the far end is not gone, the leg goes on.
+    idled: watch::Sender<bool>,
+    leg_reader: Mutex<Option<Frames>>,
 }
+
+type Frames = FrameReader<ReadHalf<Tls>>;
 
 impl Shared {
     fn set_failure(&self, f: Failure) {
         self.failed.store(true, Ordering::Release);
         self.failure.lock().unwrap().get_or_insert(f);
+    }
+
+    /// Why the connection failed, as `Conn::err` says it.
+    fn err(&self) -> Option<Error> {
+        if let Some(f) = self.failure.lock().unwrap().as_ref() {
+            return Some(f.to_error());
+        }
+        self.gone_reason.lock().unwrap().as_ref().map(|r| Error::Remote(RemoteError { reason: r.clone() }))
+    }
+
+    /// The first error that broke this end: reading or writing.
+    fn local_error(&self) -> Option<Error> {
+        if let Some(f) = self.failure.lock().unwrap().as_ref() {
+            return Some(f.to_error());
+        }
+        match self.write_error.lock().unwrap().as_ref() {
+            // The far end's close after a clean finish breaks nothing.
+            None | Some(Failure::PeerClosed) => None,
+            Some(f) => Some(f.to_error()),
+        }
     }
 }
 
@@ -377,7 +407,30 @@ impl std::fmt::Debug for Conn {
 }
 
 impl Conn {
-    pub(crate) fn start(up: Upgraded, id: &str, side: Side, registry: Arc<Registry>) -> Conn {
+    /// A connection on a new WebSocket. `reuse` is its registration when
+    /// the hub offered reuse.
+    pub(crate) fn start(
+        up: Upgraded,
+        id: &str,
+        side: Side,
+        registry: Arc<Registry>,
+        reuse: Option<Arc<Registration>>,
+    ) -> Conn {
+        let (r, w) = tokio::io::split(up.stream);
+        let frames = FrameReader::new(r, up.leftover, STREAM_LIMITS, LINK_SILENCE);
+        Conn::on_leg(Leg { frames, w }, id, side, registry, reuse)
+    }
+
+    /// A connection on a leg: a new one, or a reused one that answered
+    /// `bound`. Nothing else reads or writes the leg from now on.
+    pub(crate) fn on_leg(
+        leg: Leg,
+        id: &str,
+        side: Side,
+        registry: Arc<Registry>,
+        reuse: Option<Arc<Registration>>,
+    ) -> Conn {
+        let Leg { frames, w } = leg;
         let rec = registry.add(id, side);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
@@ -390,12 +443,13 @@ impl Conn {
             peer_close: Notify::new(),
             failed: AtomicBool::new(false),
             ctl: ctl_tx,
+            reuse,
+            idled: watch::channel(false).0,
+            leg_reader: Mutex::new(None),
         });
         let _ = shared.rec.stream.set(Arc::downgrade(&shared));
-        let (r, w) = tokio::io::split(up.stream);
         let (ev_tx, ev_rx) = mpsc::channel(READ_QUEUE);
         let (cmd_tx, cmd_rx) = mpsc::channel(WRITE_QUEUE);
-        let frames = FrameReader::new(r, up.leftover, STREAM_LIMITS, LINK_SILENCE);
         let reader = tokio::spawn(read_loop(frames, ev_tx, shared.clone())).abort_handle();
         let writer = tokio::spawn(write_loop(w, cmd_rx, ctl_rx, shared.clone(), reader));
         let conn = Conn {
@@ -435,15 +489,7 @@ impl Conn {
     /// far end on as a half-close first, so a read returns 0 and the reason
     /// arrives just after it (PROTOCOL.md §8.3).
     pub fn err(&self) -> Option<Error> {
-        if let Some(f) = self.shared.failure.lock().unwrap().as_ref() {
-            return Some(f.to_error());
-        }
-        self.shared
-            .gone_reason
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|r| Error::Remote(RemoteError { reason: r.clone() }))
+        self.shared.err()
     }
 
     /// Waits until the far end, having half-closed, is gone for good, or
@@ -486,16 +532,8 @@ impl Conn {
         self.registry.finish(&self.shared.rec, Some(err));
     }
 
-    /// The first error that broke this end: reading or writing.
     fn local_error(&self) -> Option<Error> {
-        if let Some(f) = self.shared.failure.lock().unwrap().as_ref() {
-            return Some(f.to_error());
-        }
-        match self.shared.write_error.lock().unwrap().as_ref() {
-            // The far end's close after a clean finish breaks nothing.
-            None | Some(Failure::PeerClosed) => None,
-            Some(f) => Some(f.to_error()),
-        }
+        self.shared.local_error()
     }
 
     async fn end(&self, how: Ctl) {
@@ -617,11 +655,25 @@ impl Conn {
 impl Drop for Conn {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
-            // The writer sees its channels close and closes as `close` would.
+            // Closed in the background as `close` would, and reported once
+            // that is done: after the hub's verdict on a reusable leg.
             self.shared.closing.send_replace(true);
             let _ = self.shared.ctl.send(Ctl::Close);
-            let err = self.local_error().or_else(|| self.err());
-            self.registry.finish(&self.shared.rec, err);
+            let writer = self.writer.lock().unwrap().take();
+            let (sh, registry) = (self.shared.clone(), self.registry.clone());
+            let report = move || {
+                let err = sh.local_error().or_else(|| sh.err());
+                registry.finish(&sh.rec, err);
+            };
+            match (writer, tokio::runtime::Handle::try_current()) {
+                (Some(w), Ok(rt)) => {
+                    rt.spawn(async move {
+                        let _ = w.await;
+                        report();
+                    });
+                }
+                _ => report(),
+            }
         }
     }
 }
@@ -669,16 +721,19 @@ fn clean_local(reason: &str) -> String {
 
 // ---------- the reader ----------
 
-async fn read_loop(mut frames: FrameReader<ReadHalf<Tls>>, tx: mpsc::Sender<Event>, sh: Arc<Shared>) {
-    if read_data(&mut frames, &tx, &sh).await {
-        watch_after_eof(&mut frames, &sh).await;
+async fn read_loop(mut frames: Frames, tx: mpsc::Sender<Event>, sh: Arc<Shared>) {
+    if read_data(&mut frames, &tx, &sh).await && watch_after_eof(&mut frames, &sh).await {
+        // The hub's valid "idle": the leg goes on, and its reader with it.
+        *sh.leg_reader.lock().unwrap() = Some(frames);
+        sh.idled.send_replace(true);
+        return;
     }
     sh.gone.send_replace(true);
 }
 
 /// Reads the stream up to the far end's half-close (true) or its failure
 /// (false).
-async fn read_data(frames: &mut FrameReader<ReadHalf<Tls>>, tx: &mpsc::Sender<Event>, sh: &Shared) -> bool {
+async fn read_data(frames: &mut Frames, tx: &mpsc::Sender<Event>, sh: &Shared) -> bool {
     let failed = |f: Failure| {
         sh.set_failure(f.clone());
         Event::Failed(f)
@@ -726,16 +781,23 @@ async fn read_data(frames: &mut FrameReader<ReadHalf<Tls>>, tx: &mpsc::Sender<Ev
 
 /// Keeps reading after the far end's half-close: an `err:` may still come
 /// (PROTOCOL.md §8.3), and the far end's close or a dead link must be seen.
-async fn watch_after_eof(frames: &mut FrameReader<ReadHalf<Tls>>, sh: &Shared) {
+/// On a leg offered reuse, it stops at the hub's `idle` after both
+/// half-closes, and returns true (§12.5).
+async fn watch_after_eof(frames: &mut Frames, sh: &Shared) -> bool {
     loop {
-        let Ok(frame) = frames.next().await else { return };
+        let Ok(frame) = frames.next().await else { return false };
         match frame.op {
             OP_BINARY | OP_CONT => {
                 // Nothing may follow a half-close: a broken peer.
                 sh.set_failure(Failure::Protocol("data after the far end's half-close".into()));
-                return;
+                return false;
             }
             OP_TEXT => {
+                if frame.payload == MSG_IDLE && sh.reuse.is_some() {
+                    // Valid only once this end has half-closed too; in any
+                    // other state it is a violation, which ends the leg.
+                    return frame.fin && sh.rec.wrote_eof.load(Ordering::Acquire);
+                }
                 if let Some(reason) = frame.payload.strip_prefix(b"err:") {
                     let reason = clean_reason(&String::from_utf8_lossy(reason));
                     *sh.gone_reason.lock().unwrap() = Some(reason);
@@ -743,7 +805,7 @@ async fn watch_after_eof(frames: &mut FrameReader<ReadHalf<Tls>>, sh: &Shared) {
             }
             OP_CLOSE => {
                 sh.peer_close.notify_one();
-                return;
+                return false;
             }
             _ => {}
         }
@@ -751,6 +813,17 @@ async fn watch_after_eof(frames: &mut FrameReader<ReadHalf<Tls>>, sh: &Shared) {
 }
 
 // ---------- the writer ----------
+
+/// Waits up to `wait`, after both half-closes, for the hub's `idle`: true
+/// when it came. A close, a dead link, or nothing in time is false.
+async fn await_idle(sh: &Shared, wait: Duration) -> bool {
+    let (mut idled, mut gone) = (sh.idled.subscribe(), sh.gone.subscribe());
+    tokio::select! {
+        r = idled.wait_for(|i| *i) => r.is_ok(),
+        _ = gone.wait_for(|g| *g) => false,
+        _ = tokio::time::sleep(wait) => false,
+    }
+}
 
 /// Writes one frame. Once closing has begun, the write may take at most
 /// CLOSE_TIMEOUT, also when it was already under way.
@@ -876,14 +949,47 @@ async fn write_loop(
                 }
             }
             let clean = eof_written && sh.rec.read_eof.load(Ordering::Acquire);
+            if clean && !broken && !close_sent && !sh.failed.load(Ordering::Acquire) {
+                if let Some(reg) = &sh.reuse {
+                    // A leg offered reuse: the hub's verdict decides
+                    // (PROTOCOL.md §12.5).
+                    if await_idle(&sh, reg.verdict_wait()).await {
+                        let frames = sh.leg_reader.lock().unwrap().take();
+                        if let Some(frames) = frames {
+                            if reg.keep() {
+                                if put(&mut w, &mut closing, OP_TEXT, MSG_IDLE).await.is_ok() {
+                                    reg.adopt(Leg { frames, w });
+                                    return;
+                                }
+                                reg.release();
+                            }
+                        }
+                        // Not kept: the hub's "idle" is answered with a
+                        // close. Nobody reads the leg any more, so nothing
+                        // waits for the reply.
+                        let _ = put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await;
+                        let _ = tokio::time::timeout(Duration::from_secs(1), w.shutdown()).await;
+                        return;
+                    }
+                    // An err:, a close, or nothing in time: protocol 1 rules.
+                }
+            }
             if clean && !sh.failed.load(Ordering::Acquire) {
                 // A clean finish: the closing handshake, then wait briefly
                 // for the far end's close so the last bytes are not reset.
                 if (close_sent || put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await.is_ok())
                     && !broken
                 {
-                    let mut gone = sh.gone.subscribe();
-                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, gone.wait_for(|g| *g)).await;
+                    // The far end's close, or nobody reading any more: a
+                    // reader that stopped at the hub's "idle" sees no close.
+                    let (mut gone, mut idled) = (sh.gone.subscribe(), sh.idled.subscribe());
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+                        tokio::select! {
+                            _ = gone.wait_for(|g| *g) => {}
+                            _ = idled.wait_for(|i| *i) => {}
+                        }
+                    })
+                    .await;
                     let _ = tokio::time::timeout(Duration::from_secs(1), w.shutdown()).await;
                 } else if close_sent {
                     let _ = tokio::time::timeout(Duration::from_secs(1), w.shutdown()).await;
@@ -963,7 +1069,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(1 << 20);
         let reg = Arc::new(Registry::default());
         let up = Upgraded { stream: Box::new(a), leftover: Vec::new(), head: Head::default() };
-        (Conn::start(up, "8f14e45fceea167a", Side::Connect, reg.clone()), Hub(b), reg)
+        (Conn::start(up, "8f14e45fceea167a", Side::Connect, reg.clone(), None), Hub(b), reg)
     }
 
     #[tokio::test]

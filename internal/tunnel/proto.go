@@ -50,6 +50,24 @@ import (
 // decided from it. The server does not send its own: it is not for
 // whoever happens to reach the port, and is asked for with a serve token.
 //
+// Protocol 2 (pf-simple 0.15.0) adds one optional thing to protocol 1:
+// reusing the serving side's accept legs. It is specified in full in
+// docs/PROTOCOL.md §12. In short:
+//
+//   - serve: when protocol 2 was negotiated, the 101 carries a random
+//     per-registration secret in HeaderSession.
+//   - accept: a serving side that sends that secret back, on a request that
+//     also negotiated protocol 2, may be offered reuse: the 101 carries
+//     HeaderKeepAlive, the seconds an idle leg is kept.
+//   - on an offered leg, after a clean finish the hub sends the text frame
+//     "idle"; the client answers "idle" to keep the leg, or closes. A kept
+//     leg is idle; the hub hands it the next connection with "bind <id>",
+//     which the client answers at once with "bound <id>".
+//
+// Nothing else changes, and nothing is ever sent to a peer that did not
+// negotiate protocol 2 and prove its registration. Nothing depends on
+// reuse either: a side that does not get it carries on as in protocol 1.
+//
 // To add protocol N+1: raise ProtoMax; describe it here as protocol 1 is
 // described; add it to protoRelease; give each new feature an entry in
 // featureProto and have Client.needs (pfrelay/client.go) and the other
@@ -59,13 +77,16 @@ import (
 const (
 	HeaderProto   = "X-PF-Tunnel-Proto"
 	HeaderVersion = "X-PF-Version"
+	// Protocol 2: the registration's secret, and the offer of reuse.
+	HeaderSession   = "X-PF-Tunnel-Session"
+	HeaderKeepAlive = "X-PF-Tunnel-Keep-Alive"
 
 	ProtoMin = 0
-	ProtoMax = 1
+	ProtoMax = 2
 )
 
 // protoRelease is the first pf-simple release that speaks each protocol.
-var protoRelease = map[int]string{0: "0.11.0", 1: "0.14.0"}
+var protoRelease = map[int]string{0: "0.11.0", 1: "0.14.0", 2: "0.15.0"}
 
 // Feature is something a run may depend on that not every protocol has.
 type Feature int
@@ -73,6 +94,9 @@ type Feature int
 const (
 	FeatureClientToken Feature = iota
 	FeatureAnonymousServe
+	// FeatureReuse is reusing accept legs. Nothing ever depends on it, so
+	// no request names it; it is listed for the record.
+	FeatureReuse
 )
 
 var featureProto = map[Feature]struct {
@@ -81,6 +105,7 @@ var featureProto = map[Feature]struct {
 }{
 	FeatureClientToken:    {1, "a client token"},
 	FeatureAnonymousServe: {1, "serving without a serve token"},
+	FeatureReuse:          {2, "reusing accept legs"},
 }
 
 // ServerInfo is the answer to a version probe.

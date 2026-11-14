@@ -48,6 +48,18 @@ password = "change-me"
 #                             serve token: anyone who can reach the server
 #                             can then relay through it
 # [tunnel]
+#
+# Reusing the serving side's connections (tunnel protocol 2): when a
+# connection ends cleanly, its connection to the serving side stays open,
+# idle, for the tunnel's next connection. The Relay hub tab changes these
+# and writes them here; left out, these defaults apply:
+# [tunnel.reuse]
+# enabled = true
+# idle_seconds = 60   # an idle connection unused this long is closed...
+# min_idle = 3        # ...unless it is one of the 3 used last; none is ever opened to make them up
+# max_idle = 10       # idle connections one tunnel keeps at most
+# tenant_cap = 256    # ...all the tunnels of one token
+# hub_cap = 4096      # ...the whole hub
 
 # One [[forward]] table per listener. listen and target are required. A file
 # may also have no forwards and only a [console].

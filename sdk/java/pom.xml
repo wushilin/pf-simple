@@ -45,6 +45,16 @@
   </properties>
 
   <build>
+    <!-- Ship the license inside the jar (and so the sources jar), as META-INF/LICENSE. -->
+    <resources>
+      <resource>
+        <directory>${project.basedir}</directory>
+        <includes>
+          <include>LICENSE</include>
+        </includes>
+        <targetPath>META-INF</targetPath>
+      </resource>
+    </resources>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

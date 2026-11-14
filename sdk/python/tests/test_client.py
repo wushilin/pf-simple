@@ -54,7 +54,7 @@ class Requests(unittest.IsolatedAsyncioTestCase):
         path, h = fake.requests[0]
         self.assertEqual(path, "/pf/api/tunnel/connect")
         self.assertEqual(h["X-PF-Tunnel-Word"], "k3f9-x2mq-7hpa")
-        self.assertEqual(h["X-PF-Tunnel-Proto"], "1-1")
+        self.assertEqual(h["X-PF-Tunnel-Proto"], "1-2")
         self.assertEqual(h["X-PF-Client-Token"], "open-sesame")
         self.assertTrue(h["X-PF-Version"].startswith("pfrelay-py"))
 
@@ -114,7 +114,7 @@ class Listening(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(_ws, "ws_dial", fake):
             with self.assertRaises(pfrelay.ProtoError):
                 await client().listen()
-        self.assertEqual(fake.requests[0][1]["X-PF-Tunnel-Proto"], "1-1")
+        self.assertEqual(fake.requests[0][1]["X-PF-Tunnel-Proto"], "1-2")
         self.assertNotIn("X-PF-Serve-Token", fake.requests[0][1])
 
     async def test_transient_failures_are_retried(self):
@@ -133,7 +133,7 @@ class Listening(unittest.IsolatedAsyncioTestCase):
         _, h = fake.requests[0]
         self.assertEqual(h["X-PF-Tunnel-Name"], "Test")
         self.assertEqual(h["X-PF-Tunnel-Target"], "listener")
-        self.assertEqual(h["X-PF-Tunnel-Proto"], "0-1")
+        self.assertEqual(h["X-PF-Tunnel-Proto"], "0-2")
 
     async def test_client_token_hash(self):
         fake = Fake([(resp(409, x_pf_tunnel_proto="1"), None)])

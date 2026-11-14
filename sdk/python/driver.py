@@ -32,6 +32,7 @@ DEFAULT_NAME = "conformance"
 DROP_REASON = "dropped by the conformance suite"
 LISTENING = "listening"  # "listening HOST:PORT"
 COPY_CHUNK = 64 * 1024
+NO_PROTOCOL = -1  # Client(max_proto=...) for a client that announces none
 TARGET_DIAL_TIMEOUT = 5.0
 
 
@@ -40,6 +41,7 @@ class Command(str, enum.Enum):
     CONNECT = "connect"
     CHECK = "check"
     VERSION = "version"
+    PROTOCOLS = "protocols"  # print the protocol range the driver speaks
 
 
 class Mode(str, enum.Enum):
@@ -329,6 +331,9 @@ async def main() -> None:
     except ValueError:
         eprint(f"unknown command {sys.argv[1]}")
         sys.exit(Exit.USAGE)
+    if cmd is Command.PROTOCOLS:
+        say(pfrelay.proto_range(pfrelay.PROTO_MIN, pfrelay.PROTO_MAX))
+        return
     ap = Usage(prog=f"driver.py {cmd.value}")
     ap.add_argument("--server", required=True)
     ap.add_argument("--ca", default=None)
@@ -340,7 +345,13 @@ async def main() -> None:
     ap.add_argument("--listen", default="")
     ap.add_argument("--mode", default=Mode.LISTEN.value, choices=[m.value for m in Mode])
     ap.add_argument("--no-accept", action="store_true")
+    # Offer no protocol newer than N; 0 announces none, like a client from
+    # before 0.14.
+    ap.add_argument("--proto-max", type=int, default=None)
     args = ap.parse_args(sys.argv[2:])
+    max_proto = args.proto_max
+    if max_proto is not None and max_proto <= 0:
+        max_proto = NO_PROTOCOL
     mode = Mode(args.mode)
 
     try:
@@ -353,6 +364,7 @@ async def main() -> None:
             name=args.name,
             target=args.target,
             agent=AGENT,
+            max_proto=max_proto,
         )
     except (ValueError, OSError, ssl.SSLError) as e:
         eprint(e)

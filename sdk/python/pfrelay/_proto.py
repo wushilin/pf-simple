@@ -41,13 +41,13 @@ __all__ = [
     "clean_reason",
 ]
 
-# The protocol versions this SDK speaks. Protocol 1 is sealed; anything new
-# on the wire is protocol 2 or later.
+# The protocol versions this SDK speaks. Protocol 1 is sealed; protocol 2
+# adds reusing the serving side's accept legs (PROTOCOL.md 12).
 PROTO_MIN = 0
-PROTO_MAX = 1
+PROTO_MAX = 2
 
 # The first pf-simple release that speaks each protocol.
-_PROTO_RELEASE = {0: "0.11.0", 1: "0.14.0"}
+_PROTO_RELEASE = {0: "0.11.0", 1: "0.14.0", 2: "0.15.0"}
 
 API_PATH = "/pf/api/tunnel"
 
@@ -61,6 +61,9 @@ HEADER_CLIENT_HASH = "X-PF-Client-Token-SHA256"
 HEADER_CLIENT_TOKEN = "X-PF-Client-Token"
 HEADER_CONN = "X-PF-Tunnel-Conn"
 HEADER_ERROR = "X-PF-Tunnel-Error"
+# Protocol 2: the registration's secret, and the offer to reuse a leg.
+HEADER_SESSION = "X-PF-Tunnel-Session"
+HEADER_KEEP_ALIVE = "X-PF-Tunnel-Keep-Alive"
 
 
 class Feature(enum.Enum):
@@ -68,6 +71,8 @@ class Feature(enum.Enum):
 
     CLIENT_TOKEN = (1, "a client token")
     ANONYMOUS_SERVE = (1, "serving without a serve token")
+    # Nothing ever depends on reuse, so no request names it; for the record.
+    REUSE = (2, "reusing accept legs")
 
     @property
     def proto(self) -> int:

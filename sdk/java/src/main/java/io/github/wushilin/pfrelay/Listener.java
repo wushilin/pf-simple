@@ -203,7 +203,9 @@ public final class Listener implements Closeable {
                     ws.abort();
                 }
                 client.serving(true);
-                IOException lost = control(ws, timing);
+                Registration reg = new Registration(client, ws.header, this::open);
+                IOException lost = control(ws, timing, reg);
+                reg.end(); // its idle legs go with it
                 up = false;
                 control = null;
                 client.serving(false);
@@ -230,7 +232,7 @@ public final class Listener implements Closeable {
     }
 
     /** Runs one control channel until it fails (docs/PROTOCOL.md §7). */
-    private IOException control(WebSocket ws, Timing timing) {
+    private IOException control(WebSocket ws, Timing timing, Registration reg) {
         ScheduledFuture<?> pinger = null;
         try {
             ws.setReadTimeout(timing.controlSilenceMs());
@@ -261,7 +263,10 @@ public final class Listener implements Closeable {
                     case WebSocket.OP_TEXT: {
                         String id = openId(new String(p, StandardCharsets.UTF_8));
                         if (id != null) {
-                            Sched.go(() -> open(id));
+                            Sched.go(() -> {
+                                client.abandon(id); // an id that comes back is a new attempt (§12.7)
+                                open(reg, id, null);
+                            });
                         }
                         break;
                     }
@@ -294,22 +299,26 @@ public final class Listener implements Closeable {
         return null;
     }
 
-    /** Answers the hub's request for connection id. */
-    private void open(String id) {
+    /**
+     * Answers the hub's request for connection id. leg is the connection's
+     * WebSocket when it arrived on a reused leg (the hub already has
+     * "bound"); null when it came with an open message, and this side brings
+     * a leg to accept.
+     */
+    private void open(Registration reg, String id, WebSocket leg) {
         if (target != null) {
-            forward(id);
+            forward(reg, id, leg);
             return;
         }
         if (!slots.tryAcquire()) {
             client.log("connection " + Client.shortId(id) + " refused: " + BACKLOG
                     + " connections are waiting to be accepted");
-            client.refuse(id, REASON_BACKLOG);
+            refuse(id, leg, REASON_BACKLOG);
             return;
         }
         Conn c;
         try {
-            WebSocket ws = client.openWs(Endpoint.ACCEPT, client.header(id));
-            c = new Conn(ws, client, new ConnId(id), Side.SERVE);
+            c = leg != null ? new Conn(leg, client, new ConnId(id), Side.SERVE, reg) : client.accept(reg, id);
         } catch (IOException e) {
             slots.release();
             client.log("connection " + Client.shortId(id) + " failed: cannot bring it to the server: "
@@ -327,12 +336,23 @@ public final class Listener implements Closeable {
         c.fail(REASON_STOPPED);
     }
 
+    /** Refuses connection id: through accept, or after "bound" on its leg with err: (§12.7). */
+    private void refuse(String id, WebSocket leg, String reason) {
+        if (leg == null) {
+            client.refuse(id, reason);
+            return;
+        }
+        client.refused(new ConnId(id), reason);
+        Registration.failLeg(leg, reason);
+    }
+
     /**
      * Carries connection id to the target. The target is reached first, so
      * that one that cannot be reached is refused with a reason the
-     * connecting side hears at once (docs/PROTOCOL.md §9).
+     * connecting side hears at once (docs/PROTOCOL.md §9). On a reused leg,
+     * "bound" has gone out already, and a refusal is err: (§12.7).
      */
-    private void forward(String id) {
+    private void forward(Registration reg, String id, WebSocket leg) {
         String shortId = Client.shortId(id);
         java.net.Socket local;
         try {
@@ -340,12 +360,12 @@ public final class Listener implements Closeable {
         } catch (IOException | IllegalArgumentException e) {
             client.log("connection " + shortId + " failed: cannot reach the target " + target + ": "
                     + e.getMessage());
-            client.refuse(id, REASON_UNREACHABLE);
+            refuse(id, leg, REASON_UNREACHABLE);
             return;
         }
         Conn c;
         try {
-            c = new Conn(client.openWs(Endpoint.ACCEPT, client.header(id)), client, new ConnId(id), Side.SERVE);
+            c = leg != null ? new Conn(leg, client, new ConnId(id), Side.SERVE, reg) : client.accept(reg, id);
         } catch (IOException e) {
             client.log("connection " + shortId + " failed: cannot bring it to the server: " + e.getMessage());
             Bridge.closeQuietly(local);

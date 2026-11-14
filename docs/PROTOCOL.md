@@ -3,8 +3,10 @@
 This document defines how a client (`pf-client`, or a program using one of
 the SDKs) talks to the relay hub of `pf-simple`. It is the reference for
 anyone writing a client in another language. It describes what pf-simple
-0.14.0 speaks, and is checked against the implementation by the conformance
-suite in [`conformance/`](../conformance/README.md).
+0.15.0 speaks: protocols 0 and 1 (§1 to §11), and protocol 2, which adds
+reusing the serving side's legs (§12). The conformance suite in
+[`conformance/`](../conformance/README.md) checks it against the
+implementation.
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in
 RFC 2119.
@@ -112,6 +114,8 @@ characters are enough to tell connections apart.
 
 | Header | Sent by | On | Meaning |
 |---|---|---|---|
+| `X-PF-Tunnel-Session` | hub, then client | serve (101), then accept | protocol 2: the registration's secret (§12.3) |
+| `X-PF-Tunnel-Keep-Alive` | hub | accept (101) | protocol 2: the offer to reuse the leg (§12.3) |
 | `X-PF-Tunnel-Proto` | client | every request | the protocol range this request can use, `min-max` (§5) |
 | `X-PF-Tunnel-Proto` | hub | every answer past the TLS check | the protocol it chose, a single number |
 | `X-PF-Version` | client | every request | the client program and version, such as `pf-client 0.14.0`; for logs only (§5.4) |
@@ -139,9 +143,12 @@ version both have.
   serve token, a name and a target. It may or may not do the rest of
   protocol 1 without saying so, so a client MUST NOT rely on anything else
   with it.
-- **Protocol 1** (pf-simple 0.14.0) is everything in this document. It is
-  **sealed**: nothing in it will ever change. Anything new will be
-  protocol 2 or later.
+- **Protocol 1** (pf-simple 0.14.0) is everything in §1 to §11. It is
+  **sealed**: nothing in it will ever change. Anything new is protocol 2
+  or later.
+- **Protocol 2** (pf-simple 0.15.0) adds one optional thing: reusing the
+  serving side's accept legs (§12). Nothing depends on it, so a client
+  offering `0-2` works with hubs of every age.
 
 ### 5.1 What the client offers
 
@@ -155,6 +162,7 @@ with `0 <= min <= max`. A single number `n` means `n-n`.
   |---|---|---|
   | client token | 1 | serve, connect and check, when a client token is set |
   | anonymous serve | 1 | serve, when no serve token is given |
+  | reusing accept legs | 2 | none: it is optional, so nothing ever raises `min` for it (§12) |
 
   With none of them, `min` is `0`.
 
@@ -291,7 +299,7 @@ is required even on hubs that allow anonymous serving.
 
 | Status | Meaning |
 |---|---|
-| 200 | JSON: `{"version": "0.14.0", "protoMin": 0, "protoMax": 1, "token": "<tenant name>"}` |
+| 200 | JSON: `{"version": "0.15.0", "protoMin": 0, "protoMax": 2, "token": "<tenant name>"}` |
 | 403 | no serve token, or a wrong one |
 | 404 | the relay is off, or the hub is older than 0.14.0 |
 
@@ -301,8 +309,14 @@ Clients MUST ignore JSON fields they do not know.
 
 The serving side sends this request after an open message (§7). The
 request headers are the word and the connection id. No serve token and no
-client token are needed: the connection id is random and travels only over
-the control channel.
+client token are needed.
+
+The connection id is random, and it reaches two parties: the serving side,
+over the control channel, and the connecting side, in the 101 of its
+`connect` (§6.3). So whoever connects could also answer `accept` for its
+own connection. That gains it nothing, since it would only be talking to
+itself, but `accept` is not proof of being the serving side. Nothing may be
+granted on the strength of an `accept` alone.
 
 There are two forms:
 
@@ -373,7 +387,8 @@ Rules for frames:
   frame. Empty data frames are allowed and carry nothing.
 - **Text frames** MUST NOT be fragmented (FIN set, no continuation), and
   are at most 1024 bytes. A receiver ignores any text frame other than
-  `eof` and `err:…`.
+  `eof` and `err:…`. On a leg offered reuse (protocol 2), `idle`, `bind`
+  and `bound` are frames too (§12).
 - **Order.** Data, `eof` and `err:` frames are read in the order they are
   sent, so `eof` follows the last byte of data.
 - **Masking.** As RFC 6455 requires, a client masks every frame it sends
@@ -526,3 +541,347 @@ client through every case in this document, including:
 
 An SDK conforms when it passes the suite. See that README for how to plug
 in a new implementation.
+
+## 12. Protocol 2: reusing accept legs
+
+Protocol 2 (pf-simple 0.15.0) is protocol 1 plus one optional feature. A
+side that does not speak it, or does not want it, sees exactly protocol 1.
+
+### 12.1 What it adds
+
+Protocol 2 adds one optional thing to protocol 1: the serving side's
+`accept` legs can be **reused**.
+
+- Today, every connection costs the serving side a new WebSocket to
+  `/accept`: a TCP connect, a TLS handshake, the upgrade, and the round
+  trip of the open message.
+- Under protocol 2, a leg whose connection ended cleanly may stay open,
+  idle. The hub hands the tunnel's next connection to that leg with one
+  frame, instead of asking for a new one.
+
+The scope is deliberately small:
+
+- **No leg is ever opened in advance.** Only a leg that has just carried a
+  connection can be reused.
+- **Only the registered serving side can offer legs for reuse.** It proves
+  this with a secret it got when it registered (§12.3). An `accept` alone
+  proves nothing: the connecting side also knows the connection id (§6.6).
+- **Both sides must take part.** If either side does not, the leg closes as
+  in protocol 1.
+- **It is an optimization, never a requirement.** Not getting it is never
+  an error (§5.3).
+- **Only serving-side legs.** Connecting-side legs (`/connect`) are
+  unchanged.
+
+### 12.2 Compatibility
+
+The hub chooses a protocol for every request (§5). Everything in this
+section needs **both** of these:
+
+- the tunnel's registration (`serve`) negotiated protocol 2; and
+- the `accept` negotiated protocol 2.
+
+Every other request is answered exactly as in protocol 1, byte for byte.
+
+| Serving side | Hub | Chosen | Result |
+|---|---|---|---|
+| protocol 0 (before 0.14) | protocol 2 | 0 | protocol 1 behavior |
+| offers `0-1` (0.14, today's SDKs) | protocol 2 | 1 | protocol 1 behavior |
+| offers `0-2` | protocol 1 | 1 | protocol 1 behavior |
+| offers `0-2` | protocol 2 | 2 | legs may be reused |
+
+Further rules:
+
+- **Connecting sides** of any protocol are unaffected, in every
+  combination.
+- **The client's minimum stays at the protocol of the features its request
+  depends on** (§5.1).
+- **`ProtoMin` stays 0.**
+
+### 12.3 The registration secret, and the offer
+
+**On the `serve` 101,** when protocol 2 was negotiated, the hub adds:
+
+```
+X-PF-Tunnel-Session: 3f9a0c7e5b2d4e8f1a6c9b0d7e2f4a1c
+```
+
+- **The value** is 32 lower-case hex digits: 128 random bits, new for every
+  registration. Only the serving side that registered sees it.
+- **It is a secret,** like the tokens. It is never logged and never put
+  in an error body. The client sends it only on `accept`, never on
+  `connect`, `check` or `version`.
+- **It is valid** for as long as that control channel lives.
+
+**On `accept`,** a serving side that wants its leg to be reusable sends the
+session as `X-PF-Tunnel-Session`, along with the word and the connection
+id.
+
+**On the `accept` 101,** the hub MAY add:
+
+```
+X-PF-Tunnel-Keep-Alive: 60
+```
+
+- **When.** Only if all of these hold:
+  - both requests negotiated protocol 2 (§12.2);
+  - the session matches the tunnel's current registration (compared in
+    constant time);
+  - reuse is switched on;
+  - the limits of §12.6 leave room.
+
+  Otherwise the hub sends no offer, and the leg is a protocol 1 leg.
+- **A missing or wrong session** is not an error, and is not counted as a
+  guess. The accept itself still works as in protocol 1, because the
+  connection id alone authorizes carrying one connection (§6.6).
+- **The value** is the most seconds the hub keeps this leg idle each time
+  it becomes idle (§12.6).
+  - It is decimal digits only, no sign and no white space, from 1 to 3600.
+  - The header appears at most once.
+  - A client that cannot parse it treats it as no offer.
+  - The client needs the value only to know that the offer was made; it
+    MAY use it to close idle legs a little earlier on its own.
+- **The offer is for the life of the leg.** The hub may withdraw it at any
+  time: by closing an idle leg, or by ending a connection with a close
+  instead of `idle` (§12.5).
+
+### 12.4 Leg states
+
+```
+          (accept 101 with the offer)
+                    |
+                    v
+   +----------> CARRYING <-------------------------------------+
+   |                | clean finish: hub sends "idle"            |
+   |                v                                           |
+   |            OFFERED --- client closes, or 3 s pass ---> closed
+   |                | client sends "idle"                       |
+   |                v                                           |
+   |              IDLE ---- either closes; the idle limit ---> closed
+   |                | hub sends "bind <id>"                     |
+   |                v                                           |
+   |            BINDING --- no "bound" in 2 s, or the leg dies ---> closed
+   |                |                                           (the hub falls back, §12.7)
+   +-- client sends "bound <id>" -------------------------------+
+```
+
+A leg without the offer only has CARRYING, then closed, as in protocol 1.
+
+**What each side may send in each state.** Pings and pongs are allowed in
+every state, in both directions, and keepalive (§8.5) runs throughout.
+Unknown text frames are ignored, as in §8.1.
+
+| State | Hub may send | Client may send | Anything else is |
+|---|---|---|---|
+| CARRYING | as in §8, then `idle` (§12.5) | as in §8 | as in §8 |
+| OFFERED | nothing | `idle`, or a close | a violation |
+| IDLE | `bind <id>`, or a close | a close | a violation |
+| BINDING | a close | `bound <id>`, or a close | a violation |
+
+A **violation** closes the leg at once. If a connection was on it
+(BINDING), the hub falls back as in §12.7.
+
+- **Known frames in the wrong state are violations,** not unknown text.
+  For example, an `idle` or `bound` from the client while CARRYING, or a
+  `bound` whose id is not the one bound.
+- **Legs without the offer** are protocol 1 legs. There, these words are
+  unknown text, ignored as §8.1 says, though a conforming peer never sends
+  them.
+
+### 12.5 A clean finish: the hub's `idle`
+
+The hub decides whether a connection finished cleanly, because only it sees
+both legs. That avoids a failure on the connecting leg being passed on as a
+plain `eof` (§8.3) and taken for a clean finish.
+
+1. **The hub decides,** at the moment both copy directions of the pipe
+   have finished. A failure on the connecting leg after that moment, for
+   example during its own close handshake, does not count. The connection
+   finished cleanly when *both* of these hold:
+   - this leg has exchanged both `eof`s: the hub sent its `eof` and
+     received the client's;
+   - neither copy direction ended with an error. That includes write
+     errors toward the connecting leg, and that leg failing (§8.3).
+
+   The hub MUST then answer promptly: `idle`, or `err:` and a close, or a
+   close. It must not leave the leg waiting.
+2. **On an offered leg, the hub then sends the text frame `idle`,**
+   instead of starting the close handshake. The leg is OFFERED. The hub
+   sends nothing more for that connection: no `err:` follows an `idle`.
+3. **The client answers within 3 seconds:**
+   - **`idle`:** it keeps the leg, which joins the tunnel's idle pool
+     (§12.6);
+   - **a close:** it does not want the leg. The hub answers the close, and
+     the leg is gone.
+   - **If neither comes in time,** the hub closes the leg.
+4. **If the connection did not finish cleanly,** the hub ends it as in
+   protocol 1 (`err:` and a close), and the leg is never reused.
+5. **The client reports the connection as finished cleanly when it
+   receives the hub's `idle`,** with its close event and final figures.
+   - Until then, the outcome is open.
+   - An `err:` or a close without `idle` means protocol 1 rules apply
+     (§8.3, §8.4).
+   - The client waits at most 3 seconds after both `eof`s. If no verdict
+     has come by then, it closes as in §8.4 and reports by protocol 1
+     rules, so a silent hub never delays a connection's end by the
+     30-second silence limit.
+   - A client that has already sent its close ignores an `idle` that
+     crosses it.
+6. **After the client's `idle`,** both ends forget the connection: its id,
+   its half-close state, its byte counts and its reason.
+
+A client that never answers `idle`, because it does not want reuse or does
+not know protocol 2, simply closes. That costs nothing but the reuse.
+
+### 12.6 The idle pool
+
+The hub keeps the idle legs of each tunnel in a pool. A leg belongs to the
+registration it was offered under, and never passes to another one.
+
+- **Only legs without a connection.** The idle limit and the pool concern
+  legs that carry no connection. A connection, busy or quiet, is never
+  closed by them.
+- **Idle limit, max idle and min idle.** These are configurable per tunnel
+  in the hub's config file and console (defaults 60 s, 10 and 3):
+  - **max idle:** the most idle legs the pool holds. A leg beyond it is
+    closed instead of pooled.
+  - **idle limit:** a leg idle for longer than this is closed, unless min
+    idle keeps it. The clock restarts each time the leg becomes idle. It
+    is the value of the offer (§12.3).
+  - **min idle:** the most recently idle legs, up to this number, are kept
+    past the idle limit. Above it, expired legs are closed one at a time,
+    oldest first, until only min idle remain.
+  - **Min idle never opens a leg.** If traffic leaves fewer idle legs than
+    min idle, the pool stays smaller until real connections bring legs
+    back. Legs kept by min idle stay open indefinitely, pinged every 10
+    seconds by each side (§8.5).
+  - **The client may still close any idle leg** (§12.9). Min idle is the
+    least the hub keeps, never a demand on the client.
+- **Limits.** These are defaults; the console can change them:
+  - at most 256 idle legs per tenant, the anonymous tenant included;
+  - at most 4096 for the whole hub.
+
+  They win over a tunnel's max idle and min idle. A leg that would exceed
+  any limit gets no offer at `accept`, or is closed instead of being
+  pooled.
+- **A switch.** The console can turn reuse off. The hub then makes no new
+  offers, and closes the idle legs it has.
+- **Which leg next.** For a new connection, the hub takes the leg that
+  became idle most recently. The hub SHOULD skip a leg it has heard nothing
+  from for longer than 15 seconds, and close it: it may be dead, and
+  binding it would only delay the connection.
+- **The registration ends.** When the control channel ends, or another
+  registration takes the word over (§6.2), the hub closes every leg of the
+  old registration. That includes legs that are OFFERED, IDLE or BINDING,
+  and connections in BINDING fail with the hub's usual reason ("the tunnel
+  closed"). The hub MUST check, under the same lock as the takeover, that
+  the registration is still current before it puts a leg in the pool.
+- **The client may close an idle leg at any time.** The hub forgets it.
+- **No failed connection.** A closed idle leg carries none, so the hub
+  never logs it as a failed connection.
+
+### 12.7 Reuse: `bind` and `bound`
+
+When a connection arrives for a tunnel whose pool has a leg, the hub takes
+it (§12.6) and sends:
+
+```
+bind 8f14e45fceea167a
+```
+
+That is the text frame `bind`, one space, and the connection id (§3.5). The
+id is everything after the first space, and `bound` must repeat it byte for
+byte. The leg is now BINDING.
+
+- **The client answers at once** with `bound 8f14e45fceea167a`, the same
+  id, before doing anything else, such as dialing a target.
+  - `bound` only says "this leg is alive, and takes the connection".
+  - The leg is then CARRYING the new connection, under the rules of §8, as
+    a new stream.
+- **If the connection then cannot be carried,** for example because the
+  forwarder cannot reach its target, or the listener's backlog is full, the
+  client ends it the protocol 1 way: `err:<reason>` and a close. The
+  connecting side hears the reason as `err:` on its first read, exactly as
+  in §6.3. The leg is not reused.
+- **Reasons at once.** On a leg that was offered reuse, the hub passes an
+  `err:` from the serving side on to the connecting side at once, instead
+  of a half-close first and the reason later (§8.3). The serving side
+  answers `bound` before it dials its target, so this is how the
+  connecting side hears an unreachable target on its first read.
+- **No data before `bound`.** The hub MUST NOT send data, `eof` or `err:`
+  for the new connection before it has received a `bound` with that id.
+  The client may be closing the idle leg at that very moment, and data sent
+  on it would be lost.
+- **Falling back.** If no `bound` arrives within 2 seconds, or a `bound`
+  with another id arrives, or the leg closes or dies first, the hub closes
+  the leg and never uses it again: a late `bound` on it is ignored. The connection has
+  not been touched, so the hub asks for a new leg as in protocol 1
+  (`{"open": id}`, §7), with the same id, within the same 10-second limit
+  (§6.3).
+- **The same id may come twice: a new attempt.** A client may receive
+  `{"open": id}` for an id it had answered `bound` for, when its `bound`
+  was lost with a dying leg. It treats the open as a **new attempt** at
+  that connection:
+  - it ends the old attempt: it closes the old leg, and with it the target
+    socket or the connection it gave the application;
+  - it reports the old attempt as failed, with the reason "the leg was
+    lost before the server took the connection";
+  - it then carries the connection on the new leg, as in protocol 1: a
+    fresh dial, or a new connection for the application.
+
+  This is safe because the hub sent nothing for that id on the old leg. So
+  the target and the application got nothing from the connecting side
+  through it. Bytes the application or target wrote on the old leg are
+  lost, but they never reached anyone.
+
+  A client's events may therefore name the same id twice, the first time
+  as failed. An SDK MAY wait for the first frame from the hub before it
+  hands a listener's application the connection, but it is not required
+  to: that cannot work for protocols where the server speaks first.
+- **The connecting side leaves during BINDING.** The hub waits for
+  `bound`, and then ends the new stream with `err:` and the usual reason. A
+  leg that misses `bound` is closed, as above.
+- **Each connection is new.** Each `bind` gives a new id, its own
+  half-close state, its own byte counts, and its own open and close events
+  on both sides. The hub's console, flow log and per-word counters list it
+  like any other connection.
+- **The flow log.** A `bind` that is refused with `err:` appears in the
+  hub's flow log as a failed connection with that reason, as an
+  `X-PF-Tunnel-Error` refusal does today. Reasons are cut to 128 printable
+  ASCII characters, as for `X-PF-Tunnel-Error` (§6.6).
+
+### 12.8 What does not change
+
+- **Connecting legs, the control channel, and every endpoint other than
+  `serve` and `accept`** are as in protocol 1.
+- **The stream framing of §8** is unchanged, apart from the new frames:
+  - `idle`, `bind` and `bound` are text frames, at most 1024 bytes and
+    never fragmented, like every text frame on a stream;
+  - they are only ever sent on legs with the offer.
+- **The 10-second limit for answering a connection** (§6.3, §6.6) still
+  holds, counted from the connection's arrival, including any fallback.
+
+### 12.9 Recommended client behavior
+
+This part is not on the wire.
+
+- **Accepting the offer.** Reuse SHOULD be on by default when the hub
+  offers it. An SDK SHOULD let the application turn it off, and set how
+  many idle legs it keeps at most (default 16). It closes the rest by
+  answering the hub's `idle` with a close.
+- **Its own idle limit.** An SDK MAY close idle legs before the hub's
+  limit.
+- **The application never sees legs.** Each connection, whether `bind` or
+  `open`, arrives as a new connection through the listener's accept or the
+  forwarder, with the events of a new connection.
+- **The registration ends.** When the control channel is lost, the SDK
+  closes all its legs that are OFFERED, IDLE or BINDING: the hub has
+  dropped them. After registering again, it uses the new session.
+
+### 12.10 Testing
+
+The conformance suite (§11) runs every case at each combination of the
+hub's and the client's protocols: 2 with 2, 1 and 0, and 1 and 0 with 2.
+Where both speak 2, it checks that legs are reused, and that a failed
+connection's leg never is. Everywhere else, it checks that legs are never
+reused.

@@ -34,6 +34,8 @@ public final class Client {
     public static final String DEFAULT_AGENT = "pfrelay-java " + VERSION;
     /** The target a serving side names when it offers stdin/stdout. */
     public static final String STDIO_TARGET = "stdio";
+    /** How many idle legs a serving side keeps for reuse unless told otherwise. */
+    public static final int DEFAULT_MAX_IDLE_LEGS = 16;
 
     static final String PATH = "/pf/api/tunnel/";
     static final String H_WORD = "X-PF-Tunnel-Word";
@@ -61,6 +63,9 @@ public final class Client {
     private final Consumer<String> logger;
     private final ClientEvents events;
     private final Timing timing;
+    private final int maxProto; // -1: announce none; otherwise 0 to Proto.MAX
+    private final boolean noReuse;
+    private final int maxIdleLegs;
     final Registry registry = new Registry();
 
     private Client(Builder b) {
@@ -85,6 +90,15 @@ public final class Client {
         this.logger = b.logger;
         this.events = b.events == null ? new ClientEvents() {} : b.events;
         this.timing = b.timing == null ? Timing.DEFAULT : b.timing;
+        if (b.maxProto < -1 || b.maxProto > Proto.MAX) {
+            throw new IllegalArgumentException("maxProto must be from -1 to " + Proto.MAX + " (0: the newest)");
+        }
+        this.maxProto = b.maxProto < 0 ? -1 : b.maxProto == 0 ? Proto.MAX : b.maxProto;
+        this.noReuse = b.noReuse;
+        if (b.maxIdleLegs < 1) {
+            throw new IllegalArgumentException("maxIdleLegs must be at least 1; use noReuse() to keep none");
+        }
+        this.maxIdleLegs = b.maxIdleLegs;
         if (b.sslContext != null) {
             this.ssl = b.sslContext;
         } else if (b.caFile != null) {
@@ -121,8 +135,38 @@ public final class Client {
         private Consumer<String> logger;
         private ClientEvents events;
         private Timing timing;
+        private int maxProto;
+        private boolean noReuse;
+        private int maxIdleLegs = DEFAULT_MAX_IDLE_LEGS;
 
         private Builder() {}
+
+        /**
+         * The newest tunnel protocol to offer, to behave like an older
+         * client: 0 (the default) means the newest this SDK speaks; 1 behaves
+         * like pf-client 0.14; -1 announces no protocol at all, like a client
+         * from before 0.14 (no X-PF-Tunnel-Proto, no X-PF-Version). For
+         * testing.
+         */
+        public Builder maxProto(int maxProto) {
+            this.maxProto = maxProto;
+            return this;
+        }
+
+        /** Turns off reusing the serving side's legs (protocol 2): each connection gets a leg of its own. */
+        public Builder noReuse() {
+            this.noReuse = true;
+            return this;
+        }
+
+        /**
+         * How many idle legs the serving side keeps for reuse at most
+         * (default 16). Past that, the hub's offer is declined with a close.
+         */
+        public Builder maxIdleLegs(int n) {
+            this.maxIdleLegs = n;
+            return this;
+        }
 
         /**
          * The handlers to call as connections open and close, and as the
@@ -333,13 +377,33 @@ public final class Client {
         return out;
     }
 
-    /** The protocol range a request to endpoint offers: from its newest feature to the highest spoken. */
+    /**
+     * The protocol range a request to endpoint offers: from its newest
+     * feature to the highest offered. Null when this client announces none.
+     */
     String offer(Endpoint endpoint) {
+        if (maxProto < 0) {
+            return null; // like a client from before protocols were announced
+        }
         int min = Proto.MIN;
         for (Feature f : needs(endpoint)) {
             min = Math.max(min, f.proto());
         }
-        return Proto.range(min, Proto.MAX);
+        return Proto.range(Math.min(min, maxProto), maxProto);
+    }
+
+    /** The newest protocol this client offers; 0 when it announces none. */
+    int maxProto() {
+        return Math.max(maxProto, 0);
+    }
+
+    /** Whether this client takes up the hub's offer of reusing legs. */
+    boolean reuseWanted() {
+        return !noReuse && maxProto >= 2;
+    }
+
+    int maxIdleLegs() {
+        return maxIdleLegs;
     }
 
     /**
@@ -358,8 +422,11 @@ public final class Client {
 
     /** Makes one request, and checks every answer except 404 for the protocol (§5.3). */
     private Http.Response exchange(Endpoint endpoint, Map<String, String> h, boolean upgrade) throws IOException {
-        h.put(Proto.HEADER, offer(endpoint));
-        h.put(H_VERSION, agent);
+        String range = offer(endpoint);
+        if (range != null) {
+            h.put(Proto.HEADER, range);
+            h.put(H_VERSION, agent);
+        }
         Http.Response r = Http.request(target, endpoint.path(), h, ssl, upgrade);
         if (r.status != 404) {
             try {
@@ -650,6 +717,39 @@ public final class Client {
         }
         h.put(H_NAME, URLEncoder.encode(name, StandardCharsets.UTF_8));
         return h;
+    }
+
+    /**
+     * Brings this side's leg of connection id to the hub, asking for reuse
+     * when the registration has a session, and makes it a connection.
+     */
+    Conn accept(Registration reg, String id) throws IOException {
+        Map<String, String> h = header(id);
+        boolean ask = reg != null && reg.session != null;
+        if (ask) {
+            h.put(Registration.H_SESSION, reg.session);
+        }
+        WebSocket ws = openWs(Endpoint.ACCEPT, h);
+        try {
+            return new Conn(ws, this, new ConnId(id), Side.SERVE, ask && Registration.offered(ws.header) ? reg : null);
+        } catch (IOException e) {
+            ws.abort();
+            throw e;
+        }
+    }
+
+    /**
+     * Ends an attempt at connection id that is still open here: the hub asks
+     * again for an id only when the leg it was bound to was lost before the
+     * hub heard "bound" (§12.7). The old attempt is reported as failed, and
+     * the new one goes on under the same id.
+     */
+    void abandon(String id) {
+        ConnId cid = new ConnId(id);
+        if (registry.find(cid) != null) {
+            log("connection " + shortId(id) + " is asked for again: " + Registration.REASON_LEG_LOST);
+            drop(cid, Registration.REASON_LEG_LOST);
+        }
     }
 
     /** Refuses connection id, with a reason the connecting side hears. */

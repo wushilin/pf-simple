@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,7 +45,21 @@ import (
 // Without PF_CONFORMANCE_DRIVER it runs the Go SDK's own driver.
 // PF_CONFORMANCE_SLOW=1 adds the cases that take a minute.
 
-type driver []string
+// driver is an SDK's driver, and the configuration a run puts it in.
+type driver struct {
+	argv   []string
+	speaks int // the newest protocol it speaks, from "protocols"; 1 without that command
+	// protoMax is the newest protocol it is told to offer (--proto-max);
+	// 0 announces none. hub is the hub's newest: 2, 1 (like 0.14) or 0
+	// (like a hub from before 0.14).
+	protoMax, hub int
+}
+
+// common is the protocol the two sides end up with.
+func (d driver) common() int { return min(d.hub, d.protoMax) }
+
+// reuse says whether legs are reused in this configuration.
+func (d driver) reuse() bool { return d.common() >= 2 }
 
 // The driver's commands, modes and queries (conformance/README.md).
 type (
@@ -54,10 +69,11 @@ type (
 )
 
 const (
-	cmdServe   driverCommand = "serve"
-	cmdConnect driverCommand = "connect"
-	cmdCheck   driverCommand = "check"
-	cmdVersion driverCommand = "version"
+	cmdServe     driverCommand = "serve"
+	cmdConnect   driverCommand = "connect"
+	cmdCheck     driverCommand = "check"
+	cmdVersion   driverCommand = "version"
+	cmdProtocols driverCommand = "protocols"
 
 	modeListen  driverMode = "listen"
 	modeForward driverMode = "forward"
@@ -79,15 +95,27 @@ const (
 
 func conformanceDriver(t *testing.T) driver {
 	t.Helper()
+	var argv []string
 	if d := os.Getenv("PF_CONFORMANCE_DRIVER"); d != "" {
-		return strings.Fields(d)
+		argv = strings.Fields(d)
+	} else {
+		bin := filepath.Join(t.TempDir(), "go-driver")
+		out, err := exec.Command("go", "build", "-o", bin, "./conformance/go-driver").CombinedOutput()
+		if err != nil {
+			t.Fatalf("building the Go driver: %v\n%s", err, out)
+		}
+		argv = []string{bin}
 	}
-	bin := filepath.Join(t.TempDir(), "go-driver")
-	out, err := exec.Command("go", "build", "-o", bin, "./conformance/go-driver").CombinedOutput()
-	if err != nil {
-		t.Fatalf("building the Go driver: %v\n%s", err, out)
+	d := driver{argv: argv, speaks: 1}
+	// A driver from before the protocols command speaks 0-1.
+	out, err := exec.Command(argv[0], append(append([]string{}, argv[1:]...), string(cmdProtocols))...).Output()
+	if err == nil {
+		if _, max, perr := tunnel.ParseProtoRange(strings.TrimSpace(string(out))); perr == nil {
+			d.speaks = max
+		}
 	}
-	return driver{bin}
+	d.protoMax, d.hub = d.speaks, tunnel.ProtoMax
+	return d
 }
 
 // proc is one run of the driver.
@@ -142,6 +170,14 @@ func newConformanceHub(t *testing.T, d driver) *conformanceHub {
 	if err := os.WriteFile(ca, caPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	f.hub.mu.Lock()
+	switch d.hub {
+	case 0:
+		f.hub.silent = true
+	case 1:
+		f.hub.maxProto = 1
+	}
+	f.hub.mu.Unlock()
 	return &conformanceHub{relayFixture: f, ca: ca, d: d, server: f.srv.URL, leaf: leaf, roots: pool}
 }
 
@@ -190,9 +226,12 @@ func conformanceCerts(t *testing.T) (caPEM []byte, leaf tls.Certificate, pool *x
 // certificate are added.
 func (h *conformanceHub) run(t *testing.T, cmd driverCommand, args ...string) *proc {
 	t.Helper()
-	argv := append(append([]string{}, h.d[1:]...), string(cmd), "--server", h.server, "--ca", h.ca)
+	argv := append(append([]string{}, h.d.argv[1:]...), string(cmd), "--server", h.server, "--ca", h.ca)
+	if h.d.protoMax < h.d.speaks {
+		argv = append(argv, "--proto-max", strconv.Itoa(h.d.protoMax))
+	}
 	argv = append(argv, args...)
-	c := exec.Command(h.d[0], argv...)
+	c := exec.Command(h.d.argv[0], argv...)
 	stdout, err := c.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -486,11 +525,42 @@ func parallel(n int, f func(i int) error) error {
 	return first
 }
 
+// TestConformance runs every case with the SDK's driver and the hub at each
+// combination of protocol versions: so that a new SDK works with old hubs,
+// and an SDK that behaves like an old client works with a new hub.
 func TestConformance(t *testing.T) {
-	d := conformanceDriver(t)
+	base := conformanceDriver(t)
+	seen := map[[2]int]bool{}
+	for _, cfg := range []struct{ hub, client int }{
+		{2, 2}, {2, 1}, {2, 0}, {1, 2}, {0, 2},
+	} {
+		d := base
+		d.hub, d.protoMax = cfg.hub, min(cfg.client, base.speaks)
+		if base.speaks < 2 && d.protoMax < base.speaks {
+			continue // a driver from before protocol 2 cannot be told to offer less
+		}
+		if seen[[2]int{d.hub, d.protoMax}] {
+			continue
+		}
+		seen[[2]int{d.hub, d.protoMax}] = true
+		t.Run(fmt.Sprintf("hub %d, client %d", d.hub, d.protoMax), func(t *testing.T) {
+			conformanceCases(t, d, cfg == struct{ hub, client int }{2, 2})
+		})
+	}
+}
+
+// conformanceCases runs every case that applies to d's configuration. main
+// is the newest configuration, where the slow cases run.
+func conformanceCases(t *testing.T, d driver, main bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	payload := randomBytes(1 << 20)
+	// only runs a case where the protocols of the run allow it.
+	only := func(ok bool, name string, f func(t *testing.T)) {
+		if ok {
+			t.Run(name, f)
+		}
+	}
 
 	t.Run("serve/echo to a Go connector", func(t *testing.T) {
 		h := newConformanceHub(t, d)
@@ -601,7 +671,7 @@ func TestConformance(t *testing.T) {
 		}
 	})
 
-	t.Run("client token", func(t *testing.T) {
+	only(d.common() >= 1, "client token", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.serve(t, echoTarget(t), "--serve-token", testServeToken, "--client-token", "open-sesame")
 		without := h.client(t, testWord, "")
@@ -651,7 +721,7 @@ func TestConformance(t *testing.T) {
 		}
 	})
 
-	t.Run("serve/anonymous", func(t *testing.T) {
+	only(d.common() >= 1, "serve/anonymous", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		p := h.run(t, cmdServe, "--word", testWord, "--target", "127.0.0.1:1")
 		if code := p.exit(15 * time.Second); code != exitDenied {
@@ -671,7 +741,7 @@ func TestConformance(t *testing.T) {
 		}
 	})
 
-	t.Run("protocol 0 hub", func(t *testing.T) {
+	only(d.hub == 2 && d.protoMax >= 1, "protocol 0 hub", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.hub.mu.Lock()
 		h.hub.silent = true
@@ -690,7 +760,7 @@ func TestConformance(t *testing.T) {
 		}
 	})
 
-	t.Run("version", func(t *testing.T) {
+	only(d.hub >= 1, "version", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		if code := h.run(t, cmdVersion, "--serve-token", "wrong-serve-token-0123456789abcdef").exit(15 * time.Second); code != exitDenied {
 			t.Errorf("version with a wrong serve token exits %d, want %d", code, exitDenied)
@@ -701,7 +771,7 @@ func TestConformance(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &info); err != nil {
 			t.Fatalf("version printed %q: %v", line, err)
 		}
-		if info.Version != version || info.ProtoMin != tunnel.ProtoMin || info.ProtoMax != tunnel.ProtoMax || info.Token != "alice" {
+		if info.Version != version || info.ProtoMin != tunnel.ProtoMin || info.ProtoMax != d.hub || info.Token != "alice" {
 			t.Errorf("version printed %+v", info)
 		}
 		if code := p.exit(15 * time.Second); code != exitOK {
@@ -907,7 +977,125 @@ func TestConformance(t *testing.T) {
 		}
 	})
 
-	t.Run("idle connections stay up", func(t *testing.T) {
+	// Reusing the serving side's legs (protocol 2, PROTOCOL.md §12).
+	for _, mode := range []driverMode{modeListen, modeForward} {
+		only(d.reuse(), "reuse/sequential connections reuse a leg ("+string(mode)+")", func(t *testing.T) {
+			h := newConformanceHub(t, d)
+			p := h.serve(t, echoTarget(t), "--serve-token", testServeToken, "--mode", string(mode))
+			c := h.client(t, testWord, "")
+			for i := 0; i < 5; i++ {
+				conn, err := c.Dial(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := echoOver(conn, payload[:10000]); err != nil {
+					t.Fatalf("connection %d: %v", i+1, err)
+				}
+				conn.Close()
+				waitFor(t, "the leg to become idle", func() bool { return len(h.wordSnap(t).Idle) == 1 })
+			}
+			if w := h.wordSnap(t); !w.Reuse || w.Reused != 4 {
+				t.Errorf("reuse %v, %d connections reused; want true, 4", w.Reuse, w.Reused)
+			}
+			// Each reused connection is a connection of its own to the SDK.
+			waitFor(t, "five closed events", func() bool { return len(p.printed(eventClosed)) == 5 })
+			for _, l := range p.printed(eventClosed) {
+				if !strings.HasSuffix(l, " ok") {
+					t.Errorf("event %q", eventClosed+l)
+				}
+			}
+		})
+	}
+	only(!d.reuse(), "reuse/never with an older side", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		h.serve(t, echoTarget(t), "--serve-token", testServeToken)
+		c := h.client(t, testWord, "")
+		for i := 0; i < 3; i++ {
+			conn, err := c.Dial(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := echoOver(conn, payload[:1000]); err != nil {
+				t.Fatal(err)
+			}
+			conn.Close()
+		}
+		time.Sleep(200 * time.Millisecond)
+		if w := h.wordSnap(t); w.Reused != 0 || len(w.Idle) != 0 {
+			t.Errorf("%d connections reused, %d idle legs, between protocol %d and %d", w.Reused, len(w.Idle), d.hub, d.protoMax)
+		}
+	})
+	only(d.reuse(), "reuse/an unreachable target on a reused leg is reported at once", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func() { _, _ = io.Copy(c, c); c.Close() }()
+			}
+		}()
+		h.serve(t, ln.Addr().String(), "--serve-token", testServeToken, "--mode", string(modeForward))
+		c := h.client(t, testWord, "")
+		conn, err := c.Dial(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := echoOver(conn, payload[:1000]); err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+		waitFor(t, "the leg to become idle", func() bool { return len(h.wordSnap(t).Idle) == 1 })
+		ln.Close() // the target goes away
+		conn, err = c.Dial(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		// The forwarder answers bound before it dials, and reports the
+		// failure after; the hub passes the reason on at once.
+		_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+		_, err = conn.Read(make([]byte, 1))
+		var remote *pfrelay.RemoteError
+		if !errors.As(err, &remote) || remote.Reason == "" {
+			t.Fatalf("the first read gave %v, not the serving side's reason", err)
+		}
+	})
+	only(d.reuse(), "reuse/a failed connection's leg is not reused", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		h.serve(t, echoTarget(t), "--serve-token", testServeToken)
+		c := h.client(t, testWord, "")
+		conn, err := c.Dial(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(conn, make([]byte, 5)); err != nil {
+			t.Fatal(err)
+		}
+		conn.Fail("the application gave up")
+		time.Sleep(300 * time.Millisecond)
+		if w := h.wordSnap(t); len(w.Idle) != 0 {
+			t.Errorf("%d idle legs after a failed connection", len(w.Idle))
+		}
+		conn, err = c.Dial(ctx) // and the tunnel still works
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := echoOver(conn, payload[:1000]); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	only(main, "idle connections stay up", func(t *testing.T) {
 		if os.Getenv("PF_CONFORMANCE_SLOW") == "" {
 			t.Skip("takes a minute; set PF_CONFORMANCE_SLOW=1")
 		}

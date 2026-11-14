@@ -36,6 +36,12 @@ together with the code.
 - The `X-PF-*` headers, the WebSocket framing, and the `eof` and `err:`
   text frames.
 
+**Protocol 2** (0.15.0) adds one optional feature on top of protocol 1:
+reusing the serving side's accept legs (`docs/PROTOCOL.md` §12). It is gated
+on the negotiated protocol on both `serve` and `accept`, so peers of
+protocol 0 and 1 see exactly protocol 1. Treat protocol 2 as sealed once it
+is released, like protocol 1.
+
 Rules:
 
 1. **Do not change protocol 1.** No header renamed, removed or given a new

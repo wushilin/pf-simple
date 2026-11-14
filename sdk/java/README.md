@@ -2,7 +2,7 @@
 
 The Java SDK for the [pf-simple](../../README.md) relay hub: serve a tunnel
 from your own program, or connect through one, with nothing but the JDK.
-It speaks tunnel protocols 0 and 1, as described in
+It speaks tunnel protocols 0, 1 and 2, as described in
 [docs/PROTOCOL.md](../../docs/PROTOCOL.md), and passes the
 [conformance suite](../../conformance/README.md).
 
@@ -138,11 +138,49 @@ and `stats`.
 | `onClose(info, error)` | exactly once per `onOpen`, with the final figures; `error` is null after a clean finish |
 | `onRefuse(id, reason)` | this side refused a connection: the backlog was full, or the target could not be reached |
 
+## Protocol 2: reusing the serving side's legs
+
+Against a pf-simple 0.15 hub, the serving side reuses its `accept` legs
+([PROTOCOL.md §12](../../docs/PROTOCOL.md)): a connection that finished
+cleanly leaves its WebSocket open and idle, and the hub hands the tunnel's
+next connection to it with one frame instead of asking for a new
+WebSocket. That saves a TCP connect, a TLS handshake and a round trip per
+connection. It is on by default, and needs nothing from the application:
+
+- Each connection still arrives as a new `Conn` from `accept()` or the
+  serve forwarder, with its own id, figures and events. The application
+  never sees legs.
+- A connection on a leg the hub offered to reuse is reported closed only
+  once the hub's verdict is in (at most 3 seconds after both half-closes):
+  `idle` is a clean finish, `err:` a failure, and silence or a close is
+  judged as in protocol 1.
+- At most `maxIdleLegs` (16 by default) idle legs are kept; past that, the
+  hub's offer is declined. When the registration is lost, its idle legs are
+  closed, and the new registration starts afresh.
+- The hub may ask again for a connection that was bound on a leg that died
+  before the hub heard about it. The first attempt is then reported as
+  failed, with a `DroppedException` whose reason is "the leg was lost
+  before the server took the connection", and the connection arrives again
+  as a new one with the same id.
+
+**Older hubs.** Nothing depends on reuse. Against a pf-simple 0.14 hub
+(protocol 1) or an older one (protocol 0), the SDK sees no offer and works
+exactly as in protocol 1: one leg per connection. Connecting sides are
+unaffected in every combination.
+
+**Options.**
+
+| Builder option | Effect |
+|---|---|
+| `noReuse()` | never offer legs for reuse: one leg per connection, as with an older hub |
+| `maxIdleLegs(n)` | keep at most `n` idle legs (default 16) |
+| `maxProto(n)` | offer no protocol newer than `n`: `0` (the default) is the newest, `1` behaves like pf-client 0.14, `-1` announces no protocol at all, like a client from before 0.14. For testing. |
+
 ## API overview
 
 | Type | What it is |
 |---|---|
-| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.1.0`), `logger`, `events`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
+| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.1.0`), `logger`, `events`, `maxProto`, `noReuse`, `maxIdleLegs`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
 | `Client.listen()`, `listen(Duration)` | Register, and return a `Listener`. |
 | `Client.serve(target)`, `serve(target, Duration)` | Register, and forward each connection to a TCP `host:port`; returns a `Forwarder`. |
 | `Client.dial()` | Open one connection; a `Conn`. |
@@ -166,11 +204,12 @@ and `stats`.
 - **TLS** is always verified, the host name included (IP addresses match
   IP SANs). Plain `http://` is refused. Pass `caFile` or `sslContext` for a
   hub whose certificate the JDK does not trust.
-- **Protocol negotiation.** Every request offers `X-PF-Tunnel-Proto: min-1`,
+- **Protocol negotiation.** Every request offers `X-PF-Tunnel-Proto: min-2`,
   where `min` is 1 when the request depends on a client token or on serving
   without a serve token, and 0 otherwise. A hub that answers with a lower
   protocol (or none at all: a hub from before 0.14.0) is refused with a
-  `ProtoException` rather than having the feature quietly ignored.
+  `ProtoException` rather than having the feature quietly ignored. Reusing
+  legs is never depended on, so it never raises `min`.
 - **Half-close and failure.** `read` returns -1 after the far end's `eof`.
   The hub may pass a failure on as `eof` first and the reason later, so
   `error()` can turn a finish into a failure after the fact.
@@ -191,10 +230,12 @@ and `stats`.
 ```sh
 sdk/java/build.sh
 PF_CONFORMANCE_DRIVER="sdk/java/driver.sh" go test -count=1 -run TestConformance .
-PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="sdk/java/driver.sh" go test -count=1 -run 'TestConformance/idle' .
+PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="sdk/java/driver.sh" go test -count=1 -run 'TestConformance/hub_2,_client_2/idle' .
 ```
 
-Run them from the repository root.
+Run them from the repository root. The suite runs every case against hubs
+of protocols 2, 1 and 0, with the driver offering 2, 1 and 0
+(`--proto-max`); `driver.sh protocols` prints `0-2`.
 
 ## License
 

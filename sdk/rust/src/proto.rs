@@ -11,8 +11,33 @@ use crate::error::ProtoError;
 /// The lowest tunnel protocol this SDK speaks. Protocol 0 is a hub that
 /// announces none (pf-simple before 0.14.0).
 pub const PROTO_MIN: u32 = 0;
-/// The highest tunnel protocol this SDK speaks.
-pub const PROTO_MAX: u32 = 1;
+/// The highest tunnel protocol this SDK speaks. Protocol 2 adds reusing
+/// the serving side's accept legs (PROTOCOL.md §12).
+pub const PROTO_MAX: u32 = 2;
+
+/// The newest protocol a client offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtoLimit {
+    /// The newest this SDK speaks, [`PROTO_MAX`].
+    #[default]
+    Newest,
+    /// At most this protocol: `UpTo(1)` behaves like pf-client 0.14.
+    UpTo(u32),
+    /// Announce no protocol at all, like a client from before 0.14: no
+    /// `X-PF-Tunnel-Proto` and no `X-PF-Version` (protocol 0).
+    Unannounced,
+}
+
+impl ProtoLimit {
+    /// The newest protocol offered.
+    pub fn max(self) -> u32 {
+        match self {
+            ProtoLimit::Newest => PROTO_MAX,
+            ProtoLimit::UpTo(n) => n.min(PROTO_MAX),
+            ProtoLimit::Unannounced => 0,
+        }
+    }
+}
 
 /// Something a request may depend on that not every protocol has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,6 +46,9 @@ pub enum Feature {
     ClientToken,
     /// Serving without a serve token (protocol 1).
     AnonymousServe,
+    /// Reusing the serving side's accept legs (protocol 2). Nothing ever
+    /// depends on it: without it, legs are simply not reused.
+    Reuse,
 }
 
 impl Feature {
@@ -28,6 +56,7 @@ impl Feature {
     pub fn proto(self) -> u32 {
         match self {
             Feature::ClientToken | Feature::AnonymousServe => 1,
+            Feature::Reuse => 2,
         }
     }
 
@@ -36,6 +65,7 @@ impl Feature {
         match self {
             Feature::ClientToken => "a client token",
             Feature::AnonymousServe => "serving without a serve token",
+            Feature::Reuse => "reusing accept legs",
         }
     }
 }
@@ -45,6 +75,7 @@ pub(crate) fn release_of(proto: u32) -> &'static str {
     match proto {
         0 => "0.11.0",
         1 => "0.14.0",
+        2 => "0.15.0",
         _ => "of a newer release",
     }
 }
@@ -93,10 +124,17 @@ pub(crate) fn needs(endpoint: Endpoint, client_token: bool, serve_token: bool) -
     out
 }
 
-/// The range to offer for a request that depends on `needs`.
-pub(crate) fn offer(needs: &[Feature]) -> String {
-    let min = needs.iter().map(|f| f.proto()).fold(PROTO_MIN, u32::max);
-    proto_range(min, PROTO_MAX)
+/// The range to offer for a request that depends on `needs`, or none at
+/// all for a client that announces none. The minimum is the newest feature
+/// the request depends on, but never above the maximum: a hub then answers
+/// with less, and the client refuses (§5.3).
+pub(crate) fn offer(needs: &[Feature], limit: ProtoLimit) -> Option<String> {
+    if limit == ProtoLimit::Unannounced {
+        return None;
+    }
+    let max = limit.max();
+    let min = needs.iter().map(|f| f.proto()).fold(PROTO_MIN, u32::max).min(max);
+    Some(proto_range(min, max))
 }
 
 /// Checks the hub's answer: `header` is its `X-PF-Tunnel-Proto`, if any.
@@ -149,14 +187,30 @@ mod tests {
 
     #[test]
     fn offers() {
-        assert_eq!(offer(&needs(Endpoint::Connect, false, false)), "0-1");
-        assert_eq!(offer(&needs(Endpoint::Connect, true, false)), "1-1");
-        assert_eq!(offer(&needs(Endpoint::Check, true, false)), "1-1");
-        assert_eq!(offer(&needs(Endpoint::Serve, false, true)), "0-1");
-        assert_eq!(offer(&needs(Endpoint::Serve, false, false)), "1-1");
-        assert_eq!(offer(&needs(Endpoint::Serve, true, true)), "1-1");
-        assert_eq!(offer(&needs(Endpoint::Accept, true, false)), "0-1");
-        assert_eq!(offer(&needs(Endpoint::Version, true, false)), "0-1");
+        let o = |e, ct, st| offer(&needs(e, ct, st), ProtoLimit::Newest).unwrap();
+        assert_eq!(o(Endpoint::Connect, false, false), "0-2");
+        assert_eq!(o(Endpoint::Connect, true, false), "1-2");
+        assert_eq!(o(Endpoint::Check, true, false), "1-2");
+        assert_eq!(o(Endpoint::Serve, false, true), "0-2");
+        assert_eq!(o(Endpoint::Serve, false, false), "1-2");
+        assert_eq!(o(Endpoint::Serve, true, true), "1-2");
+        assert_eq!(o(Endpoint::Accept, true, false), "0-2");
+        assert_eq!(o(Endpoint::Version, true, false), "0-2");
+    }
+
+    #[test]
+    fn limits() {
+        let serve = needs(Endpoint::Serve, true, true);
+        let plain = needs(Endpoint::Connect, false, false);
+        assert_eq!(offer(&plain, ProtoLimit::UpTo(1)).unwrap(), "0-1");
+        assert_eq!(offer(&serve, ProtoLimit::UpTo(1)).unwrap(), "1-1");
+        assert_eq!(offer(&serve, ProtoLimit::UpTo(0)).unwrap(), "0-0");
+        assert_eq!(offer(&plain, ProtoLimit::UpTo(9)).unwrap(), "0-2");
+        assert_eq!(offer(&serve, ProtoLimit::Unannounced), None);
+        assert_eq!(ProtoLimit::Unannounced.max(), 0);
+        // Nothing depends on reuse, so it never raises the minimum.
+        assert!(!needs(Endpoint::Accept, true, false).contains(&Feature::Reuse));
+        assert_eq!(Feature::Reuse.proto(), 2);
     }
 
     #[test]
@@ -183,8 +237,9 @@ mod tests {
         assert_eq!(parse_proto_range("2-1"), None);
         assert_eq!(parse_proto_range("x"), None);
         assert_eq!(parse_proto_range("-1"), None);
-        assert_eq!(negotiate(0, 5), (1, true));
-        assert_eq!(negotiate(2, 5), (1, false));
+        assert_eq!(negotiate(0, 5), (2, true));
+        assert_eq!(negotiate(3, 5), (2, false));
+        assert_eq!(negotiate(0, 1), (1, true));
         assert_eq!(negotiate(0, 0), (0, true));
         assert_eq!(server_proto(Some("1")), 1);
         assert_eq!(server_proto(Some("-1")), 0);

@@ -53,6 +53,18 @@ type Client struct {
 	// tunnel comes and goes. None is set by default.
 	Events Events
 
+	// NoReuse turns off reusing the serving side's legs (protocol 2): each
+	// connection then gets a new leg, as with a protocol 1 server.
+	NoReuse bool
+	// MaxIdleLegs is how many idle legs the serving side keeps for reuse
+	// at most; 0 means 16.
+	MaxIdleLegs int
+	// MaxProto limits the tunnel protocol this client offers, to behave
+	// like an older one: 0 means the newest it speaks, 1 like pf-client
+	// 0.14, and -1 like one from before 0.14 that announces none. For
+	// testing.
+	MaxProto int
+
 	reg registry // connections and totals
 }
 
@@ -112,18 +124,41 @@ func (c *Client) needs(endpoint string) []tunnel.Feature {
 // from the newest protocol it depends on, so a server that knows about
 // protocols refuses one it cannot honor.
 func (c *Client) offer(endpoint string, h http.Header) {
+	if c.MaxProto < 0 {
+		return // like a client from before protocols were announced
+	}
+	max := c.maxProto()
 	min := tunnel.ProtoMin
 	for _, f := range c.needs(endpoint) {
 		if p := tunnel.FeatureProto(f); p > min {
 			min = p
 		}
 	}
-	h.Set(tunnel.HeaderProto, tunnel.ProtoRange(min, tunnel.ProtoMax))
+	min = minInt(min, max)
+	h.Set(tunnel.HeaderProto, tunnel.ProtoRange(min, max))
 	agent := c.Agent
 	if agent == "" {
 		agent = DefaultAgent
 	}
 	h.Set(tunnel.HeaderVersion, agent)
+}
+
+// maxProto is the newest protocol this client offers.
+func (c *Client) maxProto() int {
+	switch {
+	case c.MaxProto < 0:
+		return 0
+	case c.MaxProto == 0 || c.MaxProto > tunnel.ProtoMax:
+		return tunnel.ProtoMax
+	}
+	return c.MaxProto
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // answered checks a response to endpoint: a server from before protocols
@@ -294,7 +329,9 @@ var (
 // start, is retried with a growing pause. The connections that were open
 // end with a lost relay, and the connecting side opens new ones.
 func (c *Client) Serve(ctx context.Context, target string) error {
-	return c.serve(ctx, target, func(id string) { c.serveConn(ctx, id, target) }, nil)
+	return c.serve(ctx, target, func(reg *registration, id string, leg *tunnel.Stream) {
+		c.serveConn(ctx, reg, id, target, leg)
+	}, nil)
 }
 
 // ServeOne offers local, such as stdin/stdout, as the tunnel's only
@@ -307,7 +344,7 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 	defer cancel()
 	var taken atomic.Bool
 	done := make(chan error, 1)
-	open := func(id string) {
+	open := func(_ *registration, id string, _ *tunnel.Stream) {
 		h := c.header(id)
 		if !taken.CompareAndSwap(false, true) {
 			c.logf("connection %s refused: this side carries one connection, and has one", short(id))
@@ -331,7 +368,7 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 		defer stop()
 		rec := c.reg.add(id, SideServe, stream)
 		c.opened(rec)
-		e := bridge(ctx, stream, local, partyServeStdio, rec)
+		e := bridge(ctx, stream, local, partyServeStdio, rec, nil)
 		c.closed(rec, e.err)
 		c.logEnd(short(id), started, e, true)
 		if e.err != nil {
@@ -355,7 +392,7 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 // goroutine, for each connection the relay asks for. up, if not nil, is
 // called each time a registration succeeds (true) or its control channel is
 // lost (false).
-func (c *Client) serve(ctx context.Context, target string, open func(id string), up func(bool)) error {
+func (c *Client) serve(ctx context.Context, target string, open func(reg *registration, id string, leg *tunnel.Stream), up func(bool)) error {
 	h := c.header("")
 	h.Set(tunnel.HeaderTarget, target)
 	if c.ServeToken != "" {
@@ -397,7 +434,12 @@ func (c *Client) serve(ctx context.Context, target string, open func(id string),
 				up(true)
 			}
 			c.serving(true)
-			err = c.control(ctx, ws, open)
+			reg := c.newRegistration(ctx, ws.Header, open)
+			err = c.control(ctx, ws, func(id string) {
+				c.abandon(id) // an id that comes back is a new attempt (§12.7)
+				open(reg, id, nil)
+			})
+			reg.cancel() // its idle legs go with it
 			if up != nil {
 				up(false)
 			}
@@ -498,32 +540,40 @@ func (c *Client) control(ctx context.Context, ws *tunnel.Conn, open func(id stri
 }
 
 // serveConn carries one connection the relay asked for.
-func (c *Client) serveConn(ctx context.Context, id, target string) {
-	h := c.header(id)
+// leg is the connection's stream when it arrived on a reused leg (the hub
+// already has "bound"); nil when it came with an open message, and this
+// side brings a leg to accept.
+func (c *Client) serveConn(ctx context.Context, reg *registration, id, target string, leg *tunnel.Stream) {
+	const reason = "the serving side could not reach its target"
 	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", target)
 	if err != nil {
 		c.logf("connection %s failed: cannot reach the target %s: %v", short(id), target, err)
-		const reason = "the serving side could not reach its target"
 		c.refused(id, reason)
+		if leg != nil {
+			leg.Fail(reason) // after "bound", a refusal is an err: (§12.7)
+			return
+		}
+		h := c.header(id)
 		h.Set(tunnel.HeaderError, reason)
 		if err := c.get(ctx, "accept", h); err != nil {
 			c.logf("connection %s: could not tell the server: %v", short(id), explain(err))
 		}
 		return
 	}
-	ws, err := c.dial(ctx, "accept", h)
-	if err != nil {
-		c.logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
-		_ = conn.Close()
-		return
+	stream := leg
+	if stream == nil {
+		if stream, err = c.accept(ctx, reg, id, true); err != nil {
+			c.logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
+			_ = conn.Close()
+			return
+		}
 	}
 	c.logf("connection %s open: tunnel -> %s", short(id), target)
-	stream := tunnel.NewStream(ws)
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
 	rec := c.reg.add(id, SideServe, stream)
 	c.opened(rec)
-	e := bridge(ctx, stream, conn.(*net.TCPConn), partyServe, rec)
+	e := bridge(ctx, stream, conn.(*net.TCPConn), partyServe, rec, reg.finisher())
 	c.closed(rec, e.err)
 	c.logEnd(short(id), rec.opened, e, true)
 }
@@ -661,7 +711,10 @@ func (p party) localReason(err error) string {
 // bridge copies both ways until both directions finish cleanly or either
 // fails, then closes both ends. When this end is the one that saw the
 // break, it tells the far end why, so both logs name the same cause.
-func bridge(ctx context.Context, sess *tunnel.Stream, local HalfCloser, p party, rec *connRecord) ended {
+// finish, if not nil, ends a cleanly finished stream on a reusable leg
+// instead of closing it (protocol 2), and returns what the hub's verdict
+// says went wrong, if anything.
+func bridge(ctx context.Context, sess *tunnel.Stream, local HalfCloser, p party, rec *connRecord, finish func(*tunnel.Stream) error) ended {
 	// If this program is stopped, whoever closes the stream says so.
 	sess.CloseReason = func() string {
 		if ctx.Err() != nil {
@@ -742,9 +795,14 @@ func bridge(ctx context.Context, sess *tunnel.Stream, local HalfCloser, p party,
 	if ctx.Err() != nil {
 		reason, mine, err = p.self+" is stopping", true, ctx.Err()
 	}
-	if mine && err != nil {
+	switch {
+	case mine && err != nil:
 		sess.Fail(reason)
-	} else {
+	case err == nil && finish != nil && sess.Reusable() && sess.Clean():
+		if verr := finish(sess); verr != nil {
+			reason, err = p.linkReason(verr), verr
+		}
+	default:
 		_ = sess.Close()
 	}
 	_ = local.Close()
@@ -801,7 +859,7 @@ func (c *Client) carry(ctx context.Context, local HalfCloser, from string) error
 	defer stop()
 	rec := c.reg.add(fullID, SideConnect, stream)
 	c.opened(rec)
-	e := bridge(ctx, stream, local, partyConnect, rec)
+	e := bridge(ctx, stream, local, partyConnect, rec, nil)
 	c.closed(rec, e.err)
 	c.logEnd(id, started, e, false)
 	if e.err != nil {

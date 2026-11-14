@@ -38,7 +38,17 @@ driver connect --server URL --ca FILE --word WORD --listen HOST:PORT
                [--client-token T] [--mode listen|forward]
 driver check   --server URL --ca FILE --word WORD [--client-token T]
 driver version --server URL --ca FILE --serve-token T
+driver protocols
 ```
+
+`protocols` prints the range of tunnel protocols the driver speaks, such
+as `0-2`, and exits. A driver without it is taken to speak `0-1`.
+
+A driver that speaks protocol 2 also takes `--proto-max N` on every
+command: the SDK then offers no protocol newer than N, to behave like an
+older client. `1` behaves like pf-client 0.14, and `0` like one from before
+0.14, which announces no protocol at all. Each SDK needs an option for this
+(Go: `Client.MaxProto`).
 
 `--mode` chooses which part of the SDK carries connections:
 
@@ -142,6 +152,24 @@ Probe the hub's version. Print the answer as one line of JSON with at
 least `version`, `protoMin`, `protoMax` and `token`, then exit 0. Exit 4 on
 a 403.
 
+## Protocol versions
+
+`TestConformance` runs every case at each combination of the hub's and the
+driver's protocols:
+
+| Hub | Driver | Like |
+|---|---|---|
+| 2 | 2 | today's hub and SDK |
+| 2 | 1 | a 0.14 client against today's hub |
+| 2 | 0 | a client from before 0.14 against today's hub |
+| 1 | 2 | today's SDK against a 0.14 hub |
+| 0 | 2 | today's SDK against a hub from before 0.14 |
+
+The hub plays the older ones itself. A driver that speaks only `0-1` runs
+the combinations it can: hub 2, 1 and 0 with driver 1. A case that needs a
+protocol 1 feature, such as a client token, runs only where both sides have
+protocol 1. The slow case runs only in the first combination.
+
 ## The cases
 
 | Case | What it shows |
@@ -167,6 +195,10 @@ a 403.
 | forward/serve, forward/connect | echo through the forwarders |
 | forward/serve: an unreachable target is reported at once | the forwarder refuses through `accept` with a reason, so the far end hears it on its first read |
 | connect/watch reports the tunnel coming up | `tunnel down`, then `tunnel up` once someone serves |
+| reuse/sequential connections reuse a leg (both modes) | protocol 2 on both sides: after the first, every connection runs on a reused leg (§12), each with its own events |
+| reuse/an unreachable target on a reused leg is reported at once | the forwarder answers `bound`, then fails with a reason, which reaches the connecting side on its first read |
+| reuse/a failed connection's leg is not reused | a failure is never reused, and the tunnel goes on working |
+| reuse/never with an older side | in every other combination, no leg is ever reused |
 | idle connections stay up (slow) | pings on streams and on the control channel (§7, §8.5) |
 
 ## Adding an SDK
