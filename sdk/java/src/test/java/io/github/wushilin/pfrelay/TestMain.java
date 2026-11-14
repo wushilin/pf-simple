@@ -918,6 +918,9 @@ public final class TestMain {
                 long gap = (checks.get(i + 1).atNanos - checks.get(i).atNanos) / 1_000_000;
                 check(gap >= want[i] * 8 / 10 && gap <= want[i] * 2 + 100, "gap " + i + " was " + gap + " ms");
             }
+            // A check already on its way when the watcher closed may still
+            // land; after that, nothing more is sent.
+            Thread.sleep(200);
             int before = hub.requests("check").size();
             Thread.sleep(500);
             eq(before, hub.requests("check").size(), "a closed watcher stops checking");
