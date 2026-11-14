@@ -17,15 +17,13 @@
   <description>Java SDK for the pf-simple relay hub: serve a tunnel or connect through one.</description>
   <url>https://github.com/wushilin/pf-simple</url>
 
-  <!-- Maven Central refuses an artifact without a license: fill this in
-       once the repository has one, e.g.
   <licenses>
     <license>
       <name>Apache License, Version 2.0</name>
       <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
     </license>
   </licenses>
-  -->
 
   <developers>
     <developer>

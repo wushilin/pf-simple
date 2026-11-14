@@ -1,6 +1,9 @@
 // Package pfrelay is the Go SDK for the pf-simple relay hub: serve a tunnel
 // or connect through one from your own program. The protocol is described
 // in docs/PROTOCOL.md.
+//
+// The package is licensed under the Apache License 2.0; see the LICENSE
+// file in this directory.
 package pfrelay
 
 import (

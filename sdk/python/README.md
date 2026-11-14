@@ -194,3 +194,7 @@ PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="python3 -I sdk/python/driver.py" go
 
 `driver.py` is the conformance driver described in
 [conformance/README.md](../../conformance/README.md).
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).

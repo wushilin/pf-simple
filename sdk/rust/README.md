@@ -186,5 +186,4 @@ PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="sdk/rust/target/release/driver" go 
 
 ## License
 
-TODO: the repository has no LICENSE file yet. Set `license` in
-`Cargo.toml` (and `repository`) before publishing to crates.io.
+Apache License 2.0; see [LICENSE](LICENSE).

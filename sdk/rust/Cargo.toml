@@ -8,7 +8,7 @@ keywords = ["tunnel", "relay", "websocket", "pf-simple"]
 categories = ["network-programming", "asynchronous"]
 repository = "https://github.com/wushilin/pf-simple"
 homepage = "https://github.com/wushilin/pf-simple"
-# TODO: license (the repository has no LICENSE file yet); crates.io refuses a crate without one
+license = "Apache-2.0"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "io-std", "time", "sync", "rt", "rt-multi-thread", "macros", "signal"] }

@@ -195,3 +195,7 @@ PF_CONFORMANCE_SLOW=1 PF_CONFORMANCE_DRIVER="sdk/java/driver.sh" go test -count=
 ```
 
 Run them from the repository root.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
