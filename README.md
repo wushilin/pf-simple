@@ -981,3 +981,8 @@ Sample results, 10 second runs:
 The forwarded path uses two loopback hops instead of one, so a single stream
 cannot match the direct baseline. With 4 streams the forwarder spreads work
 across more cores and keeps up with the direct path.
+
+## License
+
+pf-simple, pf-client and the SDKs are licensed under the Apache License 2.0;
+see [LICENSE](LICENSE).
