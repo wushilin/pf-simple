@@ -427,6 +427,48 @@ travel in the clear. There are two ways to give it TLS:
   must pass the WebSocket `Upgrade` headers and set
   `X-Forwarded-Proto: https`, which is how the hub knows.
 
+### Reusing the serving side's connections
+
+Every connection through a tunnel needs a connection from the serving side
+to the server: a TCP connect, a TLS handshake and a WebSocket upgrade, all
+before the first byte. With tunnel protocol 2 (pf-simple and pf-client
+0.15.0, and the SDKs), that connection is reused. When a connection ends
+cleanly, its connection to the serving side stays open, idle, and carries
+the tunnel's next connection. That saves two or three round trips for each
+connection after the first, which matters for many short connections
+through a distant server.
+
+It needs nothing from you, and it is safe:
+
+- **On by default** wherever both the server and the serving side speak
+  protocol 2. With any older side, every connection gets a new connection
+  to the serving side, as before; nothing else changes. The connecting side
+  can be of any version.
+- **Only idle connections, never pre-opened ones.** Only a connection that
+  just carried something can be kept, and only by the serving side that
+  registered the tunnel, which proves it with a secret it got when it
+  registered.
+- **A failed connection is never reused.** Its reason reaches both ends,
+  as before.
+- **Idle connections are pinged** every 10 seconds by both ends, so a dead
+  one is noticed and dropped, and NATs and proxies keep the live ones.
+
+The limits are in the console's Relay hub tab, and in `[tunnel.reuse]`:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `idle_seconds` | 60 | An idle connection unused this long is closed... |
+| `min_idle` | 3 | ...unless it is one of the 3 used last. None is ever opened to make them up. |
+| `max_idle` | 10 | The most idle connections one tunnel keeps. |
+| `tenant_cap`, `hub_cap` | 256, 4096 | The most for all the tunnels of one token, and for the whole hub. |
+| `enabled` | true | Reuse at all. |
+
+A word can have its own `idle_seconds`, `min_idle` and `max_idle`, set
+under *Reuse limits* on its card. The card also shows the tunnel's idle
+connections, marks each connection that runs on a reused one with ↻, and
+counts how many were reused. The protocol is in
+[docs/PROTOCOL.md](docs/PROTOCOL.md) §12.
+
 ### HTTPS without a proxy
 
 The console's listener can serve https itself. It is off unless you turn it
@@ -484,11 +526,12 @@ clients of several ages; the two do not have to be the same release.
 
 | Tunnel protocol | Spoken by | What it covers |
 | --- | --- | --- |
+| 2 | 0.15.0 and later | Protocol 1, plus reusing the serving side's connections (below). |
 | 1 (sealed) | 0.14.0 and later | Everything on this page: serve tokens, serving without one, client tokens, stdio. |
 | 0 | 0.11.0 to 0.13.0, which announce no version | Plain tunnels: a word, a serve token, a name and a target. |
 
-Protocol 1 is sealed: it will not change. Whatever is added later becomes
-protocol 2, and both programs keep speaking the older ones, so upgrading
+Protocol 1 is sealed: it will not change. Protocol 2 adds one optional
+feature, and both programs keep speaking the older protocols, so upgrading
 one side does not force the other.
 
 What happens when the two sides differ:
@@ -512,12 +555,12 @@ serve token of that server:
 
 ```sh
 pf-client version
-# pf-client 0.14.0 (tunnel protocol 0-1)
+# pf-client 0.15.0 (tunnel protocol 0-2)
 
 pf-client server-version --server https://relay.example.com/ --token "$PF_SERVE_TOKEN"
-# server:  pf-simple 0.14.0, tunnel protocol 0-1
-# client:  pf-client 0.14.0, tunnel protocol 0-1
-# in use:  tunnel protocol 1
+# server:  pf-simple 0.15.0, tunnel protocol 0-2
+# client:  pf-client 0.15.0, tunnel protocol 0-2
+# in use:  tunnel protocol 2
 # token:   alice-laptop
 ```
 
@@ -623,6 +666,66 @@ Words bound to the token that nobody is serving are listed after them.
 and its connections (the serving side comes back on its own), and **Clear
 binding** frees a word for whichever token registers it next. The tab shows
 the words in full, so treat console access as access to every tunnel.
+
+### SDKs: serve and connect from your own program
+
+A program can serve a tunnel, or connect through one, without running
+`pf-client`. The Go SDK is [`pfrelay`](pfrelay), and `pf-client` itself is
+built on it. Serving gives you a `net.Listener`, and connecting gives you a
+`net.Conn`:
+
+```go
+import "github.com/wushilin/pf-simple/pfrelay"
+
+// machine B: serve
+c, _ := pfrelay.NewClient("https://relay.example.com/", "k3f9-x2mq-7hpa", nil)
+c.ServeToken, c.Name = os.Getenv("PF_SERVE_TOKEN"), "My service"
+ln, _ := c.Listen(ctx)             // registered; re-registers on its own
+http.Serve(ln, handler)            // or ln.Accept() in a loop
+
+// machine A: connect
+c, _ := pfrelay.NewClient("https://relay.example.com/", "k3f9-x2mq-7hpa", nil)
+conn, _ := c.Dial(ctx)             // one connection through the tunnel
+```
+
+A `*pfrelay.Conn` also has `CloseWrite` (half-close), `Fail(reason)` (drop
+the connection, telling the far end why) and `Err()` (why the far end
+dropped it). `Client.Stats()` and `Client.Conns()` report the client's own
+connections and byte counts.
+
+`Client.Serve(ctx, "localhost:22")` and `Client.Connect(ctx, listener)`
+forward to a TCP target and from a local port, as `pf-client` does.
+`Client.Watch` keeps checking whether the tunnel is up.
+
+For lifecycle rules, set handlers in `Client.Events`. None is set by
+default. Every event names its connection by a `ConnID`, an opaque id that
+prints as the hub's connection id, and `Client.Drop(id, reason)` ends any
+open connection by that id:
+
+```go
+c.Events = pfrelay.Events{
+	OnOpen:  func(ci pfrelay.ConnInfo) { log.Printf("%s opened", ci.ID) },
+	OnClose: func(ci pfrelay.ConnInfo, err error) { log.Printf("%s closed: %v", ci.ID, err) },
+	OnRefuse: func(id pfrelay.ConnID, why string) { log.Printf("%s refused: %s", id, why) },
+	OnServing: func(up bool) { log.Printf("registered: %v", up) },
+}
+// e.g. no connection may last longer than an hour
+go func() {
+	for range time.Tick(time.Minute) {
+		for _, ci := range c.Conns() {
+			if time.Since(ci.Opened) > time.Hour {
+				c.Drop(ci.ID, "connections are limited to an hour")
+			}
+		}
+	}
+}()
+```
+
+SDKs for other languages are under [`sdk/`](sdk). All of them speak the
+same protocol, which is specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+Every SDK has to pass the conformance suite in
+[`conformance/`](conformance/README.md), which runs it against a real hub
+and against the Go SDK.
 
 ## Running under systemd
 
@@ -921,3 +1024,8 @@ Sample results, 10 second runs:
 The forwarded path uses two loopback hops instead of one, so a single stream
 cannot match the direct baseline. With 4 streams the forwarder spreads work
 across more cores and keeps up with the direct path.
+
+## License
+
+pf-simple, pf-client and the SDKs are licensed under the Apache License 2.0;
+see [LICENSE](LICENSE).

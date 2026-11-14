@@ -2,11 +2,25 @@
 
 ## The tunnel protocol is sealed
 
-`pf-client` and the relay hub in `pf-simple` speak a versioned protocol.
-Its definition is the comment at the top of
-[`internal/tunnel/proto.go`](internal/tunnel/proto.go); read it before
-touching anything under `internal/tunnel/`, `tunnel.go`, or
-`cmd/pf-client/`.
+`pf-client`, the SDKs and the relay hub in `pf-simple` speak a versioned
+protocol. Its short definition is the comment at the top of
+[`internal/tunnel/proto.go`](internal/tunnel/proto.go), and the full
+specification is [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Read both before
+touching anything under `internal/tunnel/`, `pfrelay/`, `sdk/`,
+`tunnel.go`, or `cmd/pf-client/`.
+
+Where the code lives:
+
+- `internal/tunnel/` holds the wire: the WebSocket, the stream framing,
+  the headers and protocol negotiation. The hub and the Go SDK share it.
+- `pfrelay/` is the Go SDK, which pf-client is built on. Its exported API
+  is public, and changing it is a breaking change for its users.
+- `sdk/<language>/` holds the other SDKs.
+- `conformance/` and `conformance_test.go` are the conformance suite,
+  which every SDK must pass.
+
+A change to the protocol goes into `docs/PROTOCOL.md` and into the suite
+together with the code.
 
 **Protocol 1 is sealed** (it is what 0.14.0 speaks):
 
@@ -22,6 +36,12 @@ touching anything under `internal/tunnel/`, `tunnel.go`, or
 - The `X-PF-*` headers, the WebSocket framing, and the `eof` and `err:`
   text frames.
 
+**Protocol 2** (0.15.0) adds one optional feature on top of protocol 1:
+reusing the serving side's accept legs (`docs/PROTOCOL.md` §12). It is gated
+on the negotiated protocol on both `serve` and `accept`, so peers of
+protocol 0 and 1 see exactly protocol 1. Treat protocol 2 as sealed once it
+is released, like protocol 1.
+
 Rules:
 
 1. **Do not change protocol 1.** No header renamed, removed or given a new
@@ -31,7 +51,8 @@ Rules:
 2. **Anything new on the wire is a new protocol version.** Raise
    `ProtoMax`, describe the version in `proto.go`, add it to
    `protoRelease`, give each new feature an entry in `featureProto`, make
-   `Client.needs` name it, and make the server honor it only when the
+   `Client.needs` (in `pfrelay/client.go`) and every SDK name it, describe
+   the version in `docs/PROTOCOL.md`, and make the server honor it only when the
    negotiated version allows. The steps are at the end of the comment in
    `proto.go`.
 3. **Never decide behavior from the program version** (`X-PF-Version`). It

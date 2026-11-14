@@ -75,9 +75,13 @@ func main() {
 		}
 		console.tunnels.enabled = cfg.tunnel != nil && cfg.tunnel.enabled
 		console.tunnels.anonymous = cfg.tunnel != nil && cfg.tunnel.anonymous
+		if cfg.tunnel != nil {
+			console.tunnels.reuse = cfg.tunnel.reuse
+		}
 		if cfg.configPath != "" {
 			console.tunnels.persist = mgr.saveTenants
 			console.tunnels.persistSettings = mgr.saveTunnelSettings
+			console.tunnels.persistReuse = mgr.saveTunnelReuse
 		}
 	}
 

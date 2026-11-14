@@ -153,6 +153,22 @@
             <span id="relay-anonymous-note"></span>
           </span>
         </label>
+        <div class="relay-setting" id="relay-reuse-row">
+          <input class="switch" type="checkbox" role="switch" id="relay-reuse" aria-label="Reuse serving connections">
+          <span class="relay-setting-text">
+            <b>Reuse serving connections</b>
+            <span id="relay-reuse-note">When a connection through a tunnel ends cleanly, its connection to the serving side stays open, idle, and carries the tunnel's next connection: no new TLS handshake. Needs pf-client or an SDK that speaks tunnel protocol 2 on the serving side; older ones are served as before.</span>
+            <form class="reuse-form" id="reuse-form" autocomplete="off">
+              <label title="An idle connection unused for this long is closed, unless min idle keeps it">Idle limit <input type="number" id="reuse-idle" min="1" max="3600" required> s</label>
+              <label title="The most recently used idle connections, up to this many, are kept past the idle limit. None is ever opened to make up the number">Min idle <input type="number" id="reuse-min" min="0" max="1024" required></label>
+              <label title="The most idle connections one tunnel keeps">Max idle <input type="number" id="reuse-max" min="0" max="1024" required></label>
+              <label title="The most idle connections all the tunnels of one token keep">Per token <input type="number" id="reuse-tenant" min="0" required></label>
+              <label title="The most idle connections the whole hub keeps">In all <input type="number" id="reuse-hub" min="0" required></label>
+              <button class="btn btn-primary" type="submit" id="reuse-save">Save</button>
+              <span class="tenant-error" id="reuse-error" role="alert"></span>
+            </form>
+          </span>
+        </div>
         <div class="relay-none" id="relay-settings-fixed" hidden>Set on the command line. Start pf-simple from a config file to change these here.</div>
       </div>
       <div id="relay-details">

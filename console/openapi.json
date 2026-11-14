@@ -1090,7 +1090,7 @@
      "Relay hub"
     ],
     "summary": "Words and tunnels of the relay hub",
-    "description": "The tenants, every word bound to one of them and, for the words being served by `pf-client serve`, the tunnel with its open connections. In a session, `client` is the connecting side and `upstream` the serving side. The words are secrets.",
+    "description": "The tenants, every word bound to one of them and, for the words being served by `pf-client serve`, the tunnel with its open connections. In a session, `client` is the connecting side and `upstream` the serving side. The words are secrets. Each served word also says whether its serving side's connections are reused (`reuse`), how many connections ran on a reused one (`reused`), its limits (`minIdle`, `maxIdle`, `idleSeconds`), its own limits if set (`wordReuse`) and its idle connections (`idle`: `leg`, `serveAddr`, `since`, `carried`, `kept`). Each open connection gives the reusable leg it runs on and how many connections that leg has carried (`leg`, `carried`). The hub's limits are under `reuse`, with `reuseFixed` when they are set on the command line.",
     "responses": {
      "200": {
       "description": "The hub's state",
@@ -1354,8 +1354,8 @@
     "tags": [
      "Relay hub"
     ],
-    "summary": "Change the relay hub's switches",
-    "description": "Turns the hub on or off, and allows or disallows `pf-client serve` without a serve token. A field left out keeps its value. The change is saved to the config file's `[tunnel]` table. Turning the hub off ends every tunnel; disallowing anonymous serving ends the tunnels served that way and frees their words.",
+    "summary": "Change the relay hub's settings",
+    "description": "Turns the hub on or off, and allows or disallows `pf-client serve` without a serve token. A field left out keeps its value. The change is saved to the config file's `[tunnel]` table. Turning the hub off ends every tunnel; disallowing anonymous serving ends the tunnels served that way and frees their words. `reuse` changes the limits on reusing the serving side's connections, saved as `[tunnel.reuse]`; idle connections over the new limits, or all of them when reuse is turned off, are closed.",
     "requestBody": {
      "required": true,
      "content": {
@@ -1370,6 +1370,9 @@
          "anonymous": {
           "type": "boolean",
           "description": "Serving without a serve token"
+         },
+         "reuse": {
+          "$ref": "#/components/schemas/ReuseSettings"
          }
         }
        }
@@ -1388,7 +1391,7 @@
       }
      },
      "400": {
-      "description": "Bad request body",
+      "description": "Bad request body, or limits that cannot be used",
       "content": {
        "application/json": {
         "schema": {
@@ -1642,6 +1645,145 @@
      },
      "403": {
       "description": "Missing X-PF-Console / X-API-Token header, or tenants are fixed because pf-simple was started with --tunnel",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/{id}/reuse": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "description": "Word id, from GET /relay"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Set a word's own limits on idle connections",
+    "description": "Overrides the hub's idleSeconds, minIdle and maxIdle for this word's tunnel. An empty object, or every field null, goes back to the hub's. Idle connections over the new limits are closed.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/WordReuse"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The hub's state after the change, as from GET /relay",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Bad request body, or limits that cannot be used",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such word",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/relay/{id}/legs/{leg}/close": {
+   "parameters": [
+    {
+     "name": "id",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "description": "Word id, from GET /relay"
+    },
+    {
+     "name": "leg",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "description": "The idle connection's leg number, as GET /relay lists it under idle"
+    }
+   ],
+   "post": {
+    "tags": [
+     "Relay hub"
+    ],
+    "summary": "Close an idle connection to the serving side",
+    "description": "Closes one connection the hub keeps open, idle, for this word's next connection. Connections carrying data are not affected.",
+    "responses": {
+     "204": {
+      "description": "Closed"
+     },
+     "400": {
+      "description": "Bad path",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such idle connection",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Not signed in and no valid X-API-Token",
       "content": {
        "application/json": {
         "schema": {
@@ -2030,6 +2172,74 @@
      },
      "spec": {
       "$ref": "#/components/schemas/ListenerSpec"
+     }
+    }
+   },
+   "ReuseSettings": {
+    "type": "object",
+    "description": "The hub's limits on reusing the serving side's connections (tunnel protocol 2). idleSeconds, minIdle and maxIdle apply to each tunnel; tenantCap and hubCap to each token and to the whole hub.",
+    "required": [
+     "enabled",
+     "idleSeconds",
+     "minIdle",
+     "maxIdle",
+     "tenantCap",
+     "hubCap"
+    ],
+    "properties": {
+     "enabled": {
+      "type": "boolean",
+      "description": "Reuse at all"
+     },
+     "idleSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600,
+      "description": "An idle connection unused this long is closed, unless minIdle keeps it"
+     },
+     "minIdle": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The most recently used idle connections, up to this many, are kept past the idle limit; none is ever opened to make up the number. At most maxIdle"
+     },
+     "maxIdle": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1024,
+      "description": "The most idle connections one tunnel keeps"
+     },
+     "tenantCap": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The most idle connections all the tunnels of one token keep"
+     },
+     "hubCap": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The most idle connections the whole hub keeps"
+     }
+    }
+   },
+   "WordReuse": {
+    "type": "object",
+    "description": "A word's own limits on idle connections; a field left out or null uses the hub's. Kept with the word's binding.",
+    "properties": {
+     "idleSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600,
+      "nullable": true
+     },
+     "minIdle": {
+      "type": "integer",
+      "minimum": 0,
+      "nullable": true
+     },
+     "maxIdle": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1024,
+      "nullable": true
      }
     }
    }

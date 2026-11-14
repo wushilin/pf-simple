@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -91,13 +92,21 @@ type tunnelHub struct {
 	// persistSettings writes enabled and anonymous to the config file; nil
 	// from the command line, and the switches are fixed then.
 	persistSettings func(enabled, anonymous bool) error
+	// persistReuse writes the limits on reusing legs; nil from the command
+	// line, and they are fixed then.
+	persistReuse func(reuseSettings) error
 
 	// silent makes the hub answer like a server from before 0.14.0, which
 	// announced no tunnel protocol. Tests only.
 	silent bool
+	// maxProto, when set, makes the hub speak no protocol newer than it,
+	// like an older hub: 1 answers as pf-simple 0.14 does. Tests only.
+	maxProto int
 
 	guesses  guessLimiter
 	maxWords int // maxWordsPerToken; tests lower it
+
+	slots idleSlots // idle legs per tenant and in all (relay_reuse.go)
 
 	mu sync.Mutex
 	// enabled is the hub's switch: off, its endpoints answer 404 as if it
@@ -105,7 +114,8 @@ type tunnelHub struct {
 	// serve token, as the built-in tenant anonymousOwner.
 	enabled   bool
 	anonymous bool
-	tenants   []*tenant // in the order they were added
+	reuse     reuseSettings // reusing accept legs, protocol 2
+	tenants   []*tenant     // in the order they were added
 	tunnels   map[secretHash]*relayTunnel
 	reserved  map[secretHash]*reservation
 	nextRes   int
@@ -125,6 +135,8 @@ type reservation struct {
 	Name       string `json:"name"`       // what its serving side called the tunnel, last time
 	Owner      string `json:"owner"`      // tenant name
 	LastServed int64  `json:"lastServed"` // unix seconds: when it was registered or last dropped
+	// Reuse overrides the hub's per-tunnel limits on idle legs for this word.
+	Reuse *wordReuse `json:"reuse,omitempty"`
 }
 
 // relayTunnel is one word being served.
@@ -144,20 +156,37 @@ type relayTunnel struct {
 	started   time.Time
 	ctl       *wsConn // the serving side's control channel
 	serveAddr string
+	// session is the registration's secret (protocol 2), which an accept
+	// must bring back to be offered reuse; nil before protocol 2.
+	session []byte
+	done    chan struct{} // closed by drop
+	reused  atomic.Uint64 // connections carried on a reused leg
 
 	mu      sync.Mutex
 	why     string                // why the tunnel was closed, once it is
 	pending map[string]*relayConn // asked of the serving side, not yet brought
 	connIDs map[uint64]string     // open pipe -> connection id
+	legOf   map[uint64]*relayLeg  // open pipe -> its reusable leg, if it has one
+	pool    []*idleLeg            // idle legs, oldest first
+	nextLeg int
 	closed  bool
 }
 
 // relayConn is a connection waiting for the serving side's leg.
 type relayConn struct {
 	id     string
-	leg    chan *tunnel.Stream
+	leg    chan servedLeg
 	failed chan string // why the serving side could not
 }
+
+// servedLeg is a serving side's leg of a connection, and the reusable leg
+// it runs on when it was offered reuse.
+type servedLeg struct {
+	s   *tunnel.Stream
+	leg *relayLeg
+}
+
+var errNoLeg = errors.New("no such idle leg")
 
 // wordLabel is a word as logs and the flow log show it: the first group.
 func wordLabel(word string) string { return word[:4] + "-…" }
@@ -174,6 +203,7 @@ func newTunnelHub(tenants []tenantSpec, idle time.Duration, newID func() int, st
 		guesses:   guessLimiter{limit: guessLimit, seen: make(map[string]*guessCount)},
 		maxWords:  maxWordsPerToken,
 		enabled:   true,
+		reuse:     defaultReuse,
 		tunnels:   make(map[secretHash]*relayTunnel),
 		reserved:  make(map[secretHash]*reservation),
 	}
@@ -539,7 +569,7 @@ func sourceKey(r *http.Request) string {
 func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
-		on := h.enabled
+		on, silent, maxProto := h.enabled, h.silent, h.maxProto
 		h.mu.Unlock()
 		if !on { // as on a server without a hub
 			w.WriteHeader(http.StatusNotFound)
@@ -557,7 +587,10 @@ func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		proto, ok := tunnel.Negotiate(min, max)
-		if h.silent {
+		if maxProto > 0 && proto > maxProto {
+			proto, ok = maxProto, maxProto >= min
+		}
+		if silent {
 			next(w, r)
 			return
 		}
@@ -698,7 +731,13 @@ func (h *tunnelHub) handleVersion(w http.ResponseWriter, r *http.Request) {
 		h.deny(w, r)
 		return
 	}
-	writeJSON(w, tunnel.ServerInfo{Version: version, ProtoMin: tunnel.ProtoMin, ProtoMax: tunnel.ProtoMax, Token: holder.name})
+	h.mu.Lock()
+	protoMax := tunnel.ProtoMax
+	if h.maxProto > 0 {
+		protoMax = h.maxProto
+	}
+	h.mu.Unlock()
+	writeJSON(w, tunnel.ServerInfo{Version: version, ProtoMin: tunnel.ProtoMin, ProtoMax: protoMax, Token: holder.name})
 }
 
 // handleServe registers a word and holds its control channel until the
@@ -788,6 +827,14 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	h.saveLocked()
 	h.mu.Unlock()
 
+	// Protocol 2: the registration's secret goes out with the 101 only,
+	// never with a refusal (§12.3).
+	var session []byte
+	if chosenProto(w) >= 2 && isUpgrade(r) {
+		if session = newSession(); session != nil {
+			w.Header().Set(tunnel.HeaderSession, hex.EncodeToString(session))
+		}
+	}
 	ws, err := upgradeWebSocket(w, r)
 	if err != nil {
 		return
@@ -798,8 +845,8 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	t := &relayTunnel{
 		key: key, word: word, name: name, owner: owner, clientHash: clientHash, stats: stats, started: time.Now(),
 		peer: peerVersion(r), proto: chosenProto(w),
-		ctl: ws, serveAddr: peerAddr(r),
-		pending: make(map[string]*relayConn), connIDs: make(map[uint64]string),
+		ctl: ws, serveAddr: peerAddr(r), session: session, done: make(chan struct{}),
+		pending: make(map[string]*relayConn), connIDs: make(map[uint64]string), legOf: make(map[uint64]*relayLeg),
 	}
 	h.mu.Lock()
 	old := h.tunnels[key]
@@ -866,7 +913,9 @@ func (h *tunnelHub) drop(t *relayTunnel, why string) {
 	t.closed, t.why = true, why
 	waiting := t.pending
 	t.pending = nil
+	close(t.done)
 	t.mu.Unlock()
+	h.closePool(t)
 	_ = t.ctl.WriteFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
 	_ = t.ctl.Close()
 	for _, c := range waiting {
@@ -999,38 +1048,44 @@ func newConnID() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-// open asks the serving side for its leg of connection id and waits for it.
-// It returns the leg, or why there is none.
-func (h *tunnelHub) open(t *relayTunnel, id string) (*tunnel.Stream, string) {
-	c := &relayConn{id: id, leg: make(chan *tunnel.Stream, 1), failed: make(chan string, 1)}
+// open asks the serving side for its leg of connection id and waits for it:
+// first on an idle leg of the tunnel's pool, if it has one (protocol 2),
+// and otherwise with an open message. It returns the leg, or why there is
+// none.
+func (h *tunnelHub) open(t *relayTunnel, id string) (servedLeg, string) {
+	deadline := time.Now().Add(h.openWait)
+	if s, leg := h.bind(t, id); s != nil {
+		return servedLeg{s, leg}, ""
+	}
+	c := &relayConn{id: id, leg: make(chan servedLeg, 1), failed: make(chan string, 1)}
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
-		return nil, "the tunnel closed"
+		return servedLeg{}, "the tunnel closed"
 	}
 	t.pending[c.id] = c
 	t.mu.Unlock()
 
 	// wait reports the serving side's answer: its leg or its reason. With
 	// neither in time, answered is false.
-	wait := func() (leg *tunnel.Stream, reason string, answered bool) {
-		timer := time.NewTimer(h.openWait)
+	wait := func(within time.Duration) (leg servedLeg, reason string, answered bool) {
+		timer := time.NewTimer(max(within, time.Millisecond))
 		defer timer.Stop()
 		select {
 		case leg := <-c.leg:
 			return leg, "", true
 		case reason := <-c.failed:
-			return nil, reason, true
+			return servedLeg{}, reason, true
 		case <-timer.C:
-			return nil, "the serving side did not answer", false
+			return servedLeg{}, "the serving side did not answer", false
 		}
 	}
-	leg, reason, answered := (*tunnel.Stream)(nil), "the serving side is not connected", false
+	leg, reason, answered := servedLeg{}, "the serving side is not connected", false
 	msg, _ := json.Marshal(tunnel.ControlMessage{Open: c.id})
 	if t.ctl.WriteFrame(wsOpText, msg) == nil {
-		leg, reason, answered = wait()
+		leg, reason, answered = wait(time.Until(deadline))
 	}
-	if leg != nil {
+	if leg.s != nil {
 		return leg, ""
 	}
 	// If /accept claimed the connection just as we gave up, its leg is on
@@ -1040,11 +1095,11 @@ func (h *tunnelHub) open(t *relayTunnel, id string) (*tunnel.Stream, string) {
 	delete(t.pending, c.id)
 	t.mu.Unlock()
 	if !answered && !unclaimed {
-		if late, _, _ := wait(); late != nil {
-			late.Fail(reason)
+		if late, _, _ := wait(h.openWait); late.s != nil {
+			late.s.Fail(reason)
 		}
 	}
-	return nil, reason
+	return servedLeg{}, reason
 }
 
 // handleConnect is the connecting side's leg of a new connection.
@@ -1070,7 +1125,8 @@ func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer l.release()
 	l.accepted.Add(1)
 	changes.notify()
-	upstream, reason := h.open(t, connID)
+	served, reason := h.open(t, connID)
+	upstream := served.s
 	if upstream == nil {
 		l.failed.Add(1)
 		changes.notify()
@@ -1080,6 +1136,9 @@ func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	t.mu.Lock()
 	t.connIDs[id] = connID
+	if served.leg != nil {
+		t.legOf[id] = served.leg
+	}
 	t.mu.Unlock()
 	// When the hub cuts a leg, it says what broke, so that side's log can
 	// name the hop and not just "closed".
@@ -1092,9 +1151,16 @@ func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		t.mu.Lock()
 		delete(t.connIDs, id)
+		delete(t.legOf, id)
 		t.mu.Unlock()
 	}()
-	servePipe(id, start, client, upstream, l, h.idle)
+	var up net.Conn = upstream
+	if served.leg != nil {
+		// Closing it offers the leg back for the next connection, after a
+		// clean finish (protocol 2, §12.5).
+		up = &reusableUpstream{Stream: upstream, h: h, t: t, leg: served.leg, client: client, pipeID: id}
+	}
+	servePipe(id, start, client, up, l, h.idle)
 }
 
 // relayCloseReason is what the hub tells the pf-client on leg self when it
@@ -1166,6 +1232,7 @@ func (h *tunnelHub) handleAccept(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	offered := h.offerReuse(w, r, t) // protocol 2: the offer goes out with the 101
 	ws, err := upgradeWebSocket(w, r)
 	if err != nil {
 		c.fail("the serving side did not answer")
@@ -1173,7 +1240,12 @@ func (h *tunnelHub) handleAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	leg := tunnel.NewStream(ws)
 	leg.SetRemote(peerAddr(r))
-	c.leg <- leg
+	served := servedLeg{s: leg}
+	if offered {
+		leg.SetReusable(true)
+		served.leg = t.newLeg(peerAddr(r))
+	}
+	c.leg <- served
 }
 
 // ---------- console view ----------
@@ -1184,10 +1256,14 @@ type relayState struct {
 	Manage bool `json:"manage"`
 	// Enabled and Anonymous are the hub's switches. With Enabled false the
 	// rest is empty.
-	Enabled   bool                  `json:"enabled"`
-	Anonymous bool                  `json:"anonymous"`
-	Tenants   []relayTenantSnapshot `json:"tenants"`
-	Words     []relayWordSnapshot   `json:"words"`
+	Enabled   bool `json:"enabled"`
+	Anonymous bool `json:"anonymous"`
+	// Reuse is the hub's limits on reusing the serving side's legs
+	// (protocol 2); ReuseFixed says they cannot be changed here.
+	Reuse      reuseSettings         `json:"reuse"`
+	ReuseFixed bool                  `json:"reuseFixed"`
+	Tenants    []relayTenantSnapshot `json:"tenants"`
+	Words      []relayWordSnapshot   `json:"words"`
 }
 
 type relayTenantSnapshot struct {
@@ -1227,6 +1303,18 @@ type relayWordSnapshot struct {
 	// maxSnapshotPipes.
 	Conns    int            `json:"conns"`
 	Sessions []relaySession `json:"sessions"`
+
+	// Reusing accept legs (protocol 2): Reuse says the serving side's legs
+	// are reused; Reused counts the connections that ran on a reused leg;
+	// Idle lists the idle legs, with the tunnel's limits on them.
+	Reuse   bool           `json:"reuse,omitempty"`
+	Reused  uint64         `json:"reused,omitempty"`
+	MinIdle int            `json:"minIdle"`
+	MaxIdle int            `json:"maxIdle"`
+	IdleSec int            `json:"idleSeconds"`
+	Idle    []idleSnapshot `json:"idle,omitempty"`
+	// WordReuse is this word's own limits, where the console set them.
+	WordReuse *wordReuse `json:"wordReuse,omitempty"`
 }
 
 // relaySession is one open connection. In the embedded pipe, "client" is the
@@ -1234,6 +1322,10 @@ type relayWordSnapshot struct {
 type relaySession struct {
 	pipeSnapshot
 	ConnID string `json:"connId"`
+	// Leg and Carried: the reusable leg it runs on, and how many
+	// connections that leg has carried, this one included (protocol 2).
+	Leg     int `json:"leg,omitempty"`
+	Carried int `json:"carried,omitempty"`
 }
 
 func (h *tunnelHub) snapshot() relayState {
@@ -1257,7 +1349,7 @@ func (h *tunnelHub) snapshot() relayState {
 	for i := range tenants {
 		index[tenants[i].Name] = &tenants[i]
 	}
-	enabled, anonymous := h.enabled, h.anonymous
+	enabled, anonymous, reuse, reuseFixed := h.enabled, h.anonymous, h.reuse, h.persistReuse == nil
 	for _, e := range entries {
 		if ts := index[e.res.Owner]; ts != nil {
 			ts.Words++
@@ -1276,12 +1368,12 @@ func (h *tunnelHub) snapshot() relayState {
 		}
 	}
 	live := pipes.snapshot(stats)
-	out := relayState{Manage: h.persist != nil, Enabled: enabled, Anonymous: anonymous, Tenants: tenants, Words: make([]relayWordSnapshot, len(entries))}
+	out := relayState{Manage: h.persist != nil, Enabled: enabled, Anonymous: anonymous, Reuse: reuse, ReuseFixed: reuseFixed, Tenants: tenants, Words: make([]relayWordSnapshot, len(entries))}
 	next := 0
 	for i, e := range entries {
 		ws := relayWordSnapshot{
 			ID: e.res.id, Name: e.res.Name, Word: e.res.Word, Owner: e.res.Owner, Orphan: index[e.res.Owner] == nil,
-			LastServed: e.res.LastServed * 1000, Sessions: []relaySession{},
+			LastServed: e.res.LastServed * 1000, Sessions: []relaySession{}, WordReuse: e.res.Reuse,
 		}
 		if t := e.t; t != nil {
 			ls := live[next]
@@ -1290,9 +1382,23 @@ func (h *tunnelHub) snapshot() relayState {
 			ws.Client, ws.Proto = t.peer, t.proto
 			ws.ServeAddr, ws.Target, ws.Since = t.serveAddr, ls.Target, t.started.UnixMilli()
 			ws.Accepted, ws.Failed, ws.BytesUp, ws.BytesDown, ws.Conns = ls.Accepted, ls.Failed, ls.BytesUp, ls.BytesDown, ls.PipeCount
+			rs := h.reuseFor(t)
+			ws.Reuse = t.session != nil && rs.Enabled && rs.MaxIdle > 0
+			ws.Reused, ws.MinIdle, ws.MaxIdle, ws.IdleSec = t.reused.Load(), rs.MinIdle, rs.MaxIdle, rs.IdleSec
 			t.mu.Lock()
 			for _, p := range ls.Pipes {
-				ws.Sessions = append(ws.Sessions, relaySession{p, t.connIDs[p.ID]})
+				rsn := relaySession{pipeSnapshot: p, ConnID: t.connIDs[p.ID]}
+				if leg := t.legOf[p.ID]; leg != nil {
+					rsn.Leg, rsn.Carried = leg.id, leg.carried
+				}
+				ws.Sessions = append(ws.Sessions, rsn)
+			}
+			limit := time.Duration(rs.IdleSec) * time.Second
+			for i, il := range t.pool {
+				ws.Idle = append(ws.Idle, idleSnapshot{
+					Leg: il.leg.id, ServeAddr: il.leg.addr, Since: il.since.UnixMilli(), Carried: il.leg.carried,
+					Kept: time.Since(il.since) > limit && len(t.pool)-1-i < rs.MinIdle,
+				})
 			}
 			t.mu.Unlock()
 		}
@@ -1326,18 +1432,50 @@ func (s *consoleServer) handleRelayAction(w http.ResponseWriter, r *http.Request
 // handleRelaySettings changes the hub's switches; a field left out stays.
 func (s *consoleServer) handleRelaySettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Enabled   *bool `json:"enabled"`
-		Anonymous *bool `json:"anonymous"`
+		Enabled   *bool           `json:"enabled"`
+		Anonymous *bool           `json:"anonymous"`
+		Reuse     json.RawMessage `json:"reuse"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "bad request body")
 		return
 	}
+	// reuse, if given, must be whole and usable before anything changes: a
+	// field left out would otherwise read as 0.
+	var reuse *reuseSettings
+	if len(body.Reuse) > 0 && string(body.Reuse) != "null" {
+		var fields map[string]json.RawMessage
+		var rs reuseSettings
+		if json.Unmarshal(body.Reuse, &fields) != nil || json.Unmarshal(body.Reuse, &rs) != nil {
+			writeError(w, http.StatusBadRequest, "reuse: bad value")
+			return
+		}
+		for _, k := range []string{"enabled", "idleSeconds", "minIdle", "maxIdle", "tenantCap", "hubCap"} {
+			if _, ok := fields[k]; !ok {
+				writeError(w, http.StatusBadRequest, "reuse: "+k+" is missing; send all six fields")
+				return
+			}
+		}
+		if msg := rs.check(); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+		reuse = &rs
+	}
 	if s.tunnels == nil {
 		writeError(w, http.StatusNotFound, "this server has no relay hub")
 		return
 	}
-	switch err := s.tunnels.setSettings(body.Enabled, body.Anonymous); {
+	err := s.tunnels.setSettings(body.Enabled, body.Anonymous)
+	if err == nil && reuse != nil {
+		err = s.tunnels.setReuse(*reuse)
+	}
+	var bad *badSetting
+	if errors.As(err, &bad) {
+		writeError(w, http.StatusBadRequest, bad.msg)
+		return
+	}
+	switch {
 	case err == nil:
 		writeJSON(w, s.tunnels.snapshot())
 	case errors.Is(err, errSettingsFixed):

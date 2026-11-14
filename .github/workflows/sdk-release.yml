@@ -1,0 +1,212 @@
+name: Release SDKs
+
+# One tag per SDK, carrying that SDK's own version:
+#
+#   python-v0.1.0   ->  PyPI           (pfrelay)
+#   rust-v0.1.0     ->  crates.io      (pfrelay)
+#   java-v0.1.0     ->  Maven Central  (io.github.wushilin:pfrelay)
+#
+# The Go SDK needs none of this: it is the package
+# github.com/wushilin/pf-simple/pfrelay, released with pf-simple's own v* tags
+# (see release.yml).
+#
+# Every release first runs the SDK's unit tests and the full conformance
+# suite (slow cases included), checks that the tag matches the package's
+# version, builds the artifacts and attaches them to a GitHub release. Only
+# then does it publish, from a job in the "release" environment, which can
+# be set to wait for a reviewer's approval (Settings > Environments).
+#
+# Run it by hand (Actions > Release SDKs > Run workflow) for a dry run: it
+# builds and tests, and publishes nothing.
+
+on:
+  push:
+    tags:
+      - "python-v*"
+      - "rust-v*"
+      - "java-v*"
+  workflow_dispatch:
+    inputs:
+      sdk:
+        description: "SDK to build (dry run: tests and artifacts, nothing published)"
+        type: choice
+        options: [python, rust, java]
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      sdk: ${{ steps.plan.outputs.sdk }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - id: plan
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "sdk=${{ inputs.sdk }}" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            tag="$GITHUB_REF_NAME"              # e.g. python-v0.1.0
+            echo "sdk=${tag%%-v*}" >> "$GITHUB_OUTPUT"
+            echo "version=${tag#*-v}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    env:
+      SDK: ${{ needs.plan.outputs.sdk }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - if: env.SDK == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: env.SDK == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: The tag matches the package's version
+        if: env.VERSION != ''
+        run: |
+          case "$SDK" in
+            python) have=$(python3 -c 'import tomllib;print(tomllib.load(open("sdk/python/pyproject.toml","rb"))["project"]["version"])') ;;
+            rust)   have=$(cargo metadata --no-deps --format-version 1 --manifest-path sdk/rust/Cargo.toml | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])') ;;
+            java)   have=$(mvn -q -f sdk/java/pom.xml help:evaluate -Dexpression=project.version -DforceStdout) ;;
+          esac
+          if [ "$have" != "$VERSION" ]; then
+            echo "::error::the tag says $VERSION, but the $SDK package is version $have"
+            exit 1
+          fi
+
+      - name: Unit tests, and the driver for the conformance suite
+        run: |
+          case "$SDK" in
+            python) python3 -I -m unittest discover -s sdk/python/tests ;;
+            rust)   cargo test --manifest-path sdk/rust/Cargo.toml
+                    cargo build --release --manifest-path sdk/rust/Cargo.toml ;;
+            java)   sdk/java/build.sh ;;
+          esac
+
+      - name: Conformance suite, slow cases included
+        env:
+          PF_CONFORMANCE_SLOW: "1"
+        run: |
+          case "$SDK" in
+            python) export PF_CONFORMANCE_DRIVER="python3 -I sdk/python/driver.py" ;;
+            rust)   export PF_CONFORMANCE_DRIVER="sdk/rust/target/release/driver" ;;
+            java)   export PF_CONFORMANCE_DRIVER="sdk/java/driver.sh" ;;
+          esac
+          go test -count=1 -run TestConformance -v .
+
+      - name: Build the artifacts
+        run: |
+          mkdir -p dist
+          case "$SDK" in
+            python)
+              python3 -m pip install --upgrade build twine
+              python3 -m build --outdir dist sdk/python
+              python3 -m twine check dist/*
+              ;;
+            rust)
+              cargo package --manifest-path sdk/rust/Cargo.toml
+              cp sdk/rust/target/package/*.crate dist/
+              ;;
+            java)
+              mvn -B -f sdk/java/pom.xml -DskipTests package
+              cp sdk/java/target/pfrelay-*.jar dist/
+              ;;
+          esac
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SDK }}-dist
+          path: dist/*
+          if-no-files-found: error
+
+  github-release:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.sdk }}-dist
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.plan.outputs.sdk }} SDK ${{ needs.plan.outputs.version }}
+          files: dist/*
+
+  publish-python:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.sdk == 'python'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # PyPI trusted publishing: no token is stored anywhere
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-rust:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.sdk == 'rust'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # crates.io trusted publishing
+    env:
+      # crates.io trusted publishing works once the crate exists. The very
+      # first release uses this secret instead; delete it after that.
+      FIRST_RELEASE_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        if: env.FIRST_RELEASE_TOKEN == ''
+        uses: rust-lang/crates-io-auth-action@v1
+      - run: cargo publish --manifest-path sdk/rust/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ env.FIRST_RELEASE_TOKEN || steps.auth.outputs.token }}
+
+  publish-java:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.sdk == 'java'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - run: mvn -B -f sdk/java/pom.xml -DskipTests -Prelease deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}

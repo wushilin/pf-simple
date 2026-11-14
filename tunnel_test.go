@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/wushilin/pf-simple/internal/tunnel"
+	"github.com/wushilin/pf-simple/pfrelay"
 )
 
 const (
@@ -46,24 +48,39 @@ type relayFixture struct {
 
 func newRelayFixture(t *testing.T, statePath string) *relayFixture {
 	t.Helper()
+	return newRelayFixtureTLS(t, statePath, tls.Certificate{}, nil)
+}
+
+// newRelayFixtureTLS is newRelayFixture with the server certificate cert,
+// trusted through roots; a zero cert means httptest's own.
+func newRelayFixtureTLS(t *testing.T, statePath string, cert tls.Certificate, roots *x509.CertPool) *relayFixture {
+	t.Helper()
 	mgr := newManager(nil, nil, halfCloseIdleTimeout)
 	cs := newConsoleServer("", "", mgr)
 	hub := newTunnelHub(testTenants(), halfCloseIdleTimeout, mgr.allocID, statePath)
 	hub.denyDelay = 5 * time.Millisecond
 	hub.guesses.limit = 1 << 30 // the tests poll from one address until the word is served
 	cs.tunnels = hub
-	srv := httptest.NewTLSServer(cs.handler())
+	srv := httptest.NewUnstartedServer(cs.handler())
+	if cert.Certificate != nil {
+		srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	}
+	srv.StartTLS()
 	t.Cleanup(func() {
 		hub.closeAll()
 		srv.CloseClientConnections()
 		srv.Close()
 	})
-	return &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig}
+	clientTLS := srv.Client().Transport.(*http.Transport).TLSClientConfig
+	if roots != nil {
+		clientTLS = &tls.Config{RootCAs: roots}
+	}
+	return &relayFixture{hub: hub, srv: srv, tls: clientTLS}
 }
 
-func (f *relayFixture) client(t *testing.T, word, serveToken string) *tunnel.Client {
+func (f *relayFixture) client(t *testing.T, word, serveToken string) *pfrelay.Client {
 	t.Helper()
-	c, err := tunnel.NewClient(f.srv.URL, word, f.tls)
+	c, err := pfrelay.NewClient(f.srv.URL, word, f.tls)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +210,7 @@ func TestRelayStdio(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	done := make(chan error, 1)
-	go func() { done <- f.client(t, testWord, "").ConnectOne(ctx, tunnel.Stdio{In: inR, Out: outW}) }()
+	go func() { done <- f.client(t, testWord, "").ConnectOne(ctx, pfrelay.Stdio{In: inR, Out: outW}) }()
 	go func() {
 		_, _ = inW.Write(payload)
 		_ = inW.Close() // end of input: a half-close, the echo still comes back
@@ -223,7 +240,7 @@ func TestRelayServeStdio(t *testing.T) {
 	outR, outW := io.Pipe()
 	served := make(chan error, 1)
 	go func() {
-		served <- f.client(t, testWord, testServeToken).ServeOne(ctx, tunnel.Stdio{In: inR, Out: outW})
+		served <- f.client(t, testWord, testServeToken).ServeOne(ctx, pfrelay.Stdio{In: inR, Out: outW})
 	}()
 	connector := f.client(t, testWord, "")
 	waitFor(t, "the word to be served", func() bool { return connector.Check(ctx) == nil })
@@ -303,7 +320,7 @@ func TestRelayServeStdioBroken(t *testing.T) {
 	go func() { _, _ = io.Copy(io.Discard, outR) }() // after the first byte, below
 	served := make(chan error, 1)
 	go func() {
-		served <- f.client(t, testWord, testServeToken).ServeOne(ctx, tunnel.Stdio{In: inR, Out: outW})
+		served <- f.client(t, testWord, testServeToken).ServeOne(ctx, pfrelay.Stdio{In: inR, Out: outW})
 	}()
 	connector := f.client(t, testWord, "")
 	waitFor(t, "the word to be served", func() bool { return connector.Check(ctx) == nil })
@@ -348,7 +365,7 @@ func TestRelayRefusals(t *testing.T) {
 		t.Fatalf("check with an unserved word = %v, want access denied", err)
 	}
 	// A connection with the wrong word is refused, not left hanging.
-	if err := f.client(t, otherWord, "").ConnectOne(ctx, tunnel.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || err.Error() != "access denied" {
+	if err := f.client(t, otherWord, "").ConnectOne(ctx, pfrelay.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || err.Error() != "access denied" {
 		t.Fatalf("connect with an unserved word = %v, want access denied", err)
 	}
 	if err := f.client(t, otherWord, "not-a-serve-token-0123456789abcdefgh").Serve(ctx, "127.0.0.1:1"); err == nil || err.Error() != "access denied" {
@@ -364,14 +381,14 @@ func TestRelayRefusals(t *testing.T) {
 	if err := nameless.Serve(ctx, "127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "--name") {
 		t.Fatalf("serve without a name = %v", err)
 	}
-	if _, err := tunnel.NewClient(f.srv.URL, "asdf123", f.tls); err == nil {
+	if _, err := pfrelay.NewClient(f.srv.URL, "asdf123", f.tls); err == nil {
 		t.Fatal("a malformed word was accepted")
 	}
 	// Case does not matter: both ends lower it before use.
 	if err := f.client(t, strings.ToUpper(testWord), "").Check(ctx); err != nil {
 		t.Fatalf("check with the word in upper case = %v", err)
 	}
-	if _, err := tunnel.NewClient(strings.Replace(f.srv.URL, "https://", "http://", 1), testWord, f.tls); err == nil {
+	if _, err := pfrelay.NewClient(strings.Replace(f.srv.URL, "https://", "http://", 1), testWord, f.tls); err == nil {
 		t.Fatal("an http:// server was accepted")
 	}
 }
@@ -698,14 +715,14 @@ func TestRelayClientToken(t *testing.T) {
 		if err := c.Check(ctx); err == nil || err.Error() != "access denied" {
 			t.Fatalf("check with %s client token = %v, want access denied", name, err)
 		}
-		if err := c.ConnectOne(ctx, tunnel.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || err.Error() != "access denied" {
+		if err := c.ConnectOne(ctx, pfrelay.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || err.Error() != "access denied" {
 			t.Fatalf("connect with %s client token = %v, want access denied", name, err)
 		}
 	}
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	done := make(chan error, 1)
-	go func() { done <- right.ConnectOne(ctx, tunnel.Stdio{In: inR, Out: outW}) }()
+	go func() { done <- right.ConnectOne(ctx, pfrelay.Stdio{In: inR, Out: outW}) }()
 	go func() {
 		_, _ = inW.Write([]byte("hello"))
 		_ = inW.Close()
@@ -728,7 +745,7 @@ func TestRelayProtocolNegotiation(t *testing.T) {
 
 	// A current pair: the tunnel records who serves it and how.
 	server := f.client(t, testWord, testServeToken)
-	server.Version, server.ClientToken = "9.9.9", "open-sesame"
+	server.Agent, server.ClientToken = "pf-client 9.9.9", "open-sesame"
 	go func() { _ = server.Serve(ctx, echoTarget(t)) }()
 	connector := f.client(t, testWord, "")
 	connector.ClientToken = "open-sesame"
@@ -809,7 +826,7 @@ func TestRelayProtocolNegotiation(t *testing.T) {
 	if err := connector.Check(ctx); err == nil || !strings.Contains(err.Error(), "too old for a client token") {
 		t.Fatalf("check with a client token against an old server = %v", err)
 	}
-	if err := connector.ConnectOne(ctx, tunnel.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || !strings.Contains(err.Error(), "too old for a client token") {
+	if err := connector.ConnectOne(ctx, pfrelay.Stdio{In: io.NopCloser(strings.NewReader("")), Out: nopWriteCloser{}}); err == nil || !strings.Contains(err.Error(), "too old for a client token") {
 		t.Fatalf("connect with a client token against an old server = %v", err)
 	}
 	// So does serving without a serve token.
@@ -901,7 +918,7 @@ func TestRelayTenants(t *testing.T) {
 	}
 	status, out := post("", `{"name":"alice"}`)
 	token := out["token"]
-	if status != http.StatusOK || len(token) != newTokenLen || tunnel.CheckSecret("serve token", token) != nil {
+	if status != http.StatusOK || len(token) != newTokenLen || pfrelay.CheckSecret("serve token", token) != nil {
 		t.Fatalf("add = %d %v", status, out)
 	}
 	if status, _ := post("", `{"name":"alice"}`); status != http.StatusConflict {
@@ -999,7 +1016,7 @@ func TestRelayGuessLimitAndWordLimit(t *testing.T) {
 			t.Fatalf("guess %d = %v, want access denied", i+1, err)
 		}
 	}
-	for _, c := range []*tunnel.Client{wrong, f.client(t, testWord, "")} {
+	for _, c := range []*pfrelay.Client{wrong, f.client(t, testWord, "")} {
 		if err := c.Check(ctx); err == nil || !strings.Contains(err.Error(), "too many refused attempts") {
 			t.Fatalf("after the limit: %v, want a lock-out, for the right word too", err)
 		}

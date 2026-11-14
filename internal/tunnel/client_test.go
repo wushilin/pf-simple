@@ -25,24 +25,6 @@ func TestCheckSecret(t *testing.T) {
 	}
 }
 
-func TestNormalizeBase(t *testing.T) {
-	for in, want := range map[string]string{
-		"https://relay.example.com":      "https://relay.example.com",
-		"https://relay.example.com/":     "https://relay.example.com",
-		"https://relay.example.com:8443": "https://relay.example.com:8443",
-		"https://relay.example.com/pf/":  "https://relay.example.com",
-	} {
-		if got, err := normalizeBase(in); err != nil || got != want {
-			t.Errorf("normalizeBase(%q) = %q, %v; want %q", in, got, err, want)
-		}
-	}
-	for _, in := range []string{"http://relay.example.com/", "relay.example.com", "https://relay.example.com/other", "wss://relay.example.com/"} {
-		if got, err := normalizeBase(in); err == nil {
-			t.Errorf("normalizeBase(%q) = %q, want an error", in, got)
-		}
-	}
-}
-
 func TestWords(t *testing.T) {
 	for in, want := range map[string]string{
 		"k3f9-x2mq-7hpa":   "k3f9-x2mq-7hpa",

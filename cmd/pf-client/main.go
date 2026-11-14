@@ -22,7 +22,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/wushilin/pf-simple/internal/tunnel"
+	"github.com/wushilin/pf-simple/pfrelay"
 )
 
 const usage = `pf-client: reach a TCP port on another machine through a pf-simple server.
@@ -189,7 +189,7 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 			fmt.Fprint(out, usage)
 			return nil, nil
 		case "--version", "-version", "version":
-			fmt.Fprintf(out, "pf-client %s (tunnel protocol %s)\n", version, tunnel.ProtoRange(tunnel.ProtoMin, tunnel.ProtoMax))
+			fmt.Fprintf(out, "pf-client %s (tunnel protocol %s)\n", version, pfrelay.ProtoRange(pfrelay.ProtoMin, pfrelay.ProtoMax))
 			return nil, nil
 		default:
 			if strings.HasPrefix(a, "-") && a != "-" {
@@ -240,16 +240,16 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 		if o.serveToken == "" {
 			return nil, errors.New("server-version needs a serve token of that server: give --token, set $PF_SERVE_TOKEN, or put serve_token in the config file. Without one a server says nothing about itself")
 		}
-		if err := tunnel.CheckSecret("serve token", o.serveToken); err != nil {
+		if err := pfrelay.CheckSecret("serve token", o.serveToken); err != nil {
 			return nil, err
 		}
 		if o.ca != "" && o.insecure {
 			return nil, errors.New("--ca and -k contradict each other: trust the CA, or skip the check")
 		}
-		if o.word, err = tunnel.NewWord(); err != nil { // not sent; a client is made with one
+		if o.word, err = pfrelay.NewWord(); err != nil { // not sent; a client is made with one
 			return nil, err
 		}
-		if _, err := tunnel.NewClient(o.server, o.word, nil); err != nil {
+		if _, err := pfrelay.NewClient(o.server, o.word, nil); err != nil {
 			return nil, err
 		}
 		return o, nil
@@ -260,12 +260,12 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 		}
 		// No serve token: an anonymous registration, if the server allows it.
 		if o.serveToken != "" {
-			if err := tunnel.CheckSecret("serve token", o.serveToken); err != nil {
+			if err := pfrelay.CheckSecret("serve token", o.serveToken); err != nil {
 				return nil, err
 			}
 		}
 		if o.word == "" { // made up here, and printed once it is being served
-			if o.word, err = tunnel.NewWord(); err != nil {
+			if o.word, err = pfrelay.NewWord(); err != nil {
 				return nil, err
 			}
 			o.generated = true
@@ -286,12 +286,12 @@ func parse(args []string, envToken, envClientToken string, out io.Writer) (*opti
 		return nil, errors.New("--ca and -k contradict each other: trust the CA, or skip the check")
 	}
 	if o.clientToken != "" {
-		if err := tunnel.CheckClientToken(o.clientToken); err != nil {
+		if err := pfrelay.CheckClientToken(o.clientToken); err != nil {
 			return nil, err
 		}
 	}
 	// NewClient checks the server URL and the word, before any network use.
-	if _, err := tunnel.NewClient(o.server, o.word, nil); err != nil {
+	if _, err := pfrelay.NewClient(o.server, o.word, nil); err != nil {
 		return nil, err
 	}
 	return o, nil
@@ -355,7 +355,7 @@ func run(args []string) error {
 		return err
 	}
 	if o.command == "word" {
-		word, err := tunnel.NewWord()
+		word, err := pfrelay.NewWord()
 		if err == nil {
 			fmt.Println(word)
 		}
@@ -370,11 +370,12 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	client, err := tunnel.NewClient(o.server, o.word, tlsConfig)
+	client, err := pfrelay.NewClient(o.server, o.word, tlsConfig)
 	if err != nil {
 		return err
 	}
-	client.Name, client.ClientToken, client.Version = o.name, o.clientToken, version
+	client.Name, client.ClientToken, client.Agent = o.name, o.clientToken, "pf-client "+version
+	client.Logf = log.Printf
 	if o.command == "serve" {
 		client.ServeToken = o.serveToken
 	}
@@ -385,10 +386,10 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		mine := tunnel.ProtoRange(tunnel.ProtoMin, tunnel.ProtoMax)
-		fmt.Printf("server:  pf-simple %s, tunnel protocol %s\n", info.Version, tunnel.ProtoRange(info.ProtoMin, info.ProtoMax))
+		mine := pfrelay.ProtoRange(pfrelay.ProtoMin, pfrelay.ProtoMax)
+		fmt.Printf("server:  pf-simple %s, tunnel protocol %s\n", info.Version, pfrelay.ProtoRange(info.ProtoMin, info.ProtoMax))
 		fmt.Printf("client:  pf-client %s, tunnel protocol %s\n", version, mine)
-		if proto, ok := tunnel.Negotiate(info.ProtoMin, info.ProtoMax); ok && proto >= info.ProtoMin {
+		if proto, ok := pfrelay.Negotiate(info.ProtoMin, info.ProtoMax); ok && proto >= info.ProtoMin {
 			fmt.Printf("in use:  tunnel protocol %d\n", proto)
 		} else {
 			fmt.Printf("in use:  none: the two share no tunnel protocol\n")
@@ -412,7 +413,7 @@ func run(args []string) error {
 		}
 		if stdio {
 			// Stdin can be read once: one connection, and its end is ours.
-			err := client.ServeOne(ctx, tunnel.Stdio{In: os.Stdin, Out: os.Stdout})
+			err := client.ServeOne(ctx, pfrelay.Stdio{In: os.Stdin, Out: os.Stdout})
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -431,7 +432,7 @@ func run(args []string) error {
 		if err := client.Check(ctx); err != nil {
 			return err
 		}
-		err := client.ConnectOne(ctx, tunnel.Stdio{In: os.Stdin, Out: os.Stdout})
+		err := client.ConnectOne(ctx, pfrelay.Stdio{In: os.Stdin, Out: os.Stdout})
 		if ctx.Err() != nil { // stopped by the caller: not a failure
 			return nil
 		}
@@ -445,7 +446,7 @@ func run(args []string) error {
 	}
 	// A server too old for what was asked is a mistake to report now, not
 	// something to wait out.
-	var tooOld *tunnel.ProtoError
+	var tooOld *pfrelay.ProtoError
 	if err := client.Check(ctx); errors.As(err, &tooOld) {
 		_ = ln.Close()
 		return err
@@ -474,7 +475,7 @@ func trust(ctx context.Context, server, ca string, insecure, mayAsk bool) (*tls.
 		}
 		return &tls.Config{RootCAs: pool}, nil
 	}
-	cert, verifyErr, err := tunnel.ProbeCert(ctx, server)
+	cert, verifyErr, err := pfrelay.ProbeCert(ctx, server)
 	if err != nil {
 		return nil, fmt.Errorf("cannot reach %s: %w", server, err)
 	}
@@ -486,11 +487,11 @@ func trust(ctx context.Context, server, ca string, insecure, mayAsk bool) (*tls.
 		return nil, fmt.Errorf("the server's certificate is not trusted (%v); give its CA with --ca, or use -k to skip the check", verifyErr)
 	}
 	fmt.Fprintf(os.Stderr, "The server's certificate is not trusted: %v\n  subject:     %s\n  issuer:      %s\n  valid until: %s\n  SHA-256:     %s\nDo you trust this certificate for this run? [y/N] ",
-		verifyErr, cert.Subject, cert.Issuer, cert.NotAfter.Format("2006-01-02"), tunnel.Fingerprint(cert))
+		verifyErr, cert.Subject, cert.Issuer, cert.NotAfter.Format("2006-01-02"), pfrelay.Fingerprint(cert))
 	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 	switch strings.ToLower(strings.TrimSpace(answer)) {
 	case "y", "yes":
-		return tunnel.PinnedTLS(cert), nil
+		return pfrelay.PinnedTLS(cert), nil
 	}
 	return nil, errors.New("certificate not trusted")
 }

@@ -25,7 +25,7 @@ import (
 // full, and a reader that stops reading stops the far end's writes.
 
 const (
-	chunkSize = 64 << 10
+	ChunkSize = 64 << 10
 
 	msgEOF       = "eof"
 	msgErrPrefix = "err:"
@@ -81,6 +81,19 @@ type Stream struct {
 	gone       chan struct{}
 	goneReason atomic.Pointer[string] // what the far end said then, if anything
 	failure    atomic.Pointer[error]  // the first error Read returned
+	wfail      atomic.Bool            // a Write failed
+
+	// Reuse (protocol 2, docs/PROTOCOL.md §12). On a stream whose leg was
+	// offered reuse, watch takes a valid "idle" after both half-closes as
+	// the end of this stream rather than of the leg: it closes idled and
+	// stops reading, and the leg can be handed on with Detach.
+	reusable atomic.Bool
+	hubSide  bool        // the hub's end: "idle" is valid only after its own
+	idleSent atomic.Bool // this end sent "idle"
+	idled    chan struct{}
+	stopPing chan struct{}
+	stopOnce sync.Once
+	detached atomic.Bool
 
 	// CloseReason, if set before the stream is used, is asked when the
 	// stream is cut rather than finished cleanly; what it returns is sent
@@ -93,13 +106,16 @@ type Stream struct {
 // directions stay independent.
 func NewStream(c *Conn) *Stream {
 	c.SetTimeouts(linkSilence, 0)
-	s := &Stream{c: c, done: make(chan struct{}), gone: make(chan struct{})}
+	s := &Stream{c: c, done: make(chan struct{}), gone: make(chan struct{}),
+		idled: make(chan struct{}), stopPing: make(chan struct{})}
 	go func() {
 		t := time.NewTicker(pingEvery)
 		defer t.Stop()
 		for {
 			select {
 			case <-s.done:
+				return
+			case <-s.stopPing:
 				return
 			case <-t.C:
 				if c.WriteFrame(OpPing, nil) != nil {
@@ -176,23 +192,99 @@ func (s *Stream) read(p []byte) (int, error) {
 	return s.c.readBody(&s.cur, p)
 }
 
+// SetReusable marks a stream whose leg was offered reuse (protocol 2).
+// hubSide is true on the hub's end. Call it before the stream is used.
+func (s *Stream) SetReusable(hubSide bool) {
+	s.hubSide = hubSide
+	s.reusable.Store(true)
+}
+
+// Reusable reports whether the stream's leg was offered reuse.
+func (s *Stream) Reusable() bool { return s.reusable.Load() }
+
+// Clean reports whether the stream finished cleanly so far: both ends
+// half-closed, and nothing failed in either direction.
+//
+// A far end that said err: after its half-close did not finish cleanly,
+// though Read saw only the half-close. One that merely went away after it
+// did, as it does under protocol 1, where that end of the stream counts as
+// finished.
+func (s *Stream) Clean() bool {
+	return s.readEOF.Load() && s.wroteEOF.Load() && s.failure.Load() == nil && !s.wfail.Load() &&
+		!s.closed.Load() && s.goneReason.Load() == nil
+}
+
+// SendIdle sends "idle": on the hub, the verdict that the connection
+// finished cleanly; on the client, that it keeps the leg.
+func (s *Stream) SendIdle() error {
+	s.idleSent.Store(true)
+	return s.c.WriteFrame(OpText, []byte(MsgIdle))
+}
+
+// AwaitIdle waits up to timeout, after both half-closes, for the far end's
+// "idle". idle is true when it came; then watch has stopped and the leg
+// can be detached. Otherwise reason is what the far end said if it failed
+// the stream instead, and empty if it closed it or said nothing in time.
+func (s *Stream) AwaitIdle(timeout time.Duration) (idle bool, reason string) {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-s.idled:
+		return true, ""
+	case <-s.gone:
+		return false, s.GoneReason()
+	case <-t.C:
+		return false, ""
+	}
+}
+
+// Detach ends the stream without closing its leg, after AwaitIdle saw
+// "idle", and returns the leg. Its pings stop; whoever takes the leg over
+// keeps it alive.
+func (s *Stream) Detach() *Conn {
+	s.detached.Store(true)
+	s.stopOnce.Do(func() { close(s.stopPing) })
+	return s.c
+}
+
+// Leg is the WebSocket under the stream.
+func (s *Stream) Leg() *Conn { return s.c }
+
 // watch keeps reading after the far end's half-close. Nothing more is due
 // except pings and the final close, but without a reader nobody would learn
 // that the far end closed the stream or that the link died, and an end that
 // is still sending into an idle stream would hold its socket open for ever.
 func (s *Stream) watch() {
-	defer close(s.gone)
+	if s.watchLoop() {
+		close(s.idled) // the leg goes on; the far end is not gone
+		return
+	}
+	close(s.gone)
+}
+
+// watchLoop is watch's reading; it reports true when it stopped at a valid
+// "idle" on a reusable stream.
+func (s *Stream) watchLoop() bool {
 	for {
 		f, err := s.c.readHeader()
 		if err != nil {
-			return
+			return false
 		}
 		if f.op == OpBinary || f.op == OpCont {
-			return // nothing may follow a half-close: a broken or hostile peer
+			return false // nothing may follow a half-close: a broken or hostile peer
 		}
 		payload, err := s.c.readPayload(f, 1024)
 		if err != nil || f.op == OpClose {
-			return
+			return false
+		}
+		if f.op == OpText && string(payload) == MsgIdle && s.reusable.Load() {
+			// Valid only after both half-closes, and on the hub only as the
+			// answer to its own "idle" (§12.4); anything else is a violation.
+			if s.wroteEOF.Load() && (!s.hubSide || s.idleSent.Load()) {
+				return true
+			}
+			_ = s.c.Close()
+			return false
 		}
 		if msg, ok := strings.CutPrefix(string(payload), msgErrPrefix); ok && f.op == OpText {
 			msg = cleanReason(msg)
@@ -216,8 +308,9 @@ func (s *Stream) GoneReason() string {
 func (s *Stream) Gone() <-chan struct{} { return s.gone }
 
 func (s *Stream) Write(p []byte) (int, error) {
-	for off := 0; off < len(p); off += chunkSize {
-		if err := s.c.WriteFrame(OpBinary, p[off:min(off+chunkSize, len(p))]); err != nil {
+	for off := 0; off < len(p); off += ChunkSize {
+		if err := s.c.WriteFrame(OpBinary, p[off:min(off+ChunkSize, len(p))]); err != nil {
+			s.wfail.Store(true)
 			return off, err
 		}
 	}
@@ -233,13 +326,21 @@ func (s *Stream) CloseWrite() error {
 	return s.c.WriteFrame(OpText, []byte(msgEOF))
 }
 
-// Fail drops the stream and tells the far end why.
+// Fail drops the stream and tells the far end why. It and Close end the
+// stream once between them, whichever comes first, so they may race: the
+// hub fails a leg from one goroutine while a reset closes it from another.
 func (s *Stream) Fail(reason string) {
-	s.CloseReason = nil // this reason, not the usual one
-	s.c.BeginClose()
-	_ = s.c.WriteFrame(OpText, []byte(msgErrPrefix+reason))
-	_ = s.c.WriteFrame(OpClose, nil)
-	_ = s.Close()
+	if s.detached.Load() {
+		return // the leg went on to its next connection
+	}
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		close(s.done)
+		s.c.BeginClose()
+		_ = s.c.WriteFrame(OpText, []byte(msgErrPrefix+reason))
+		_ = s.c.WriteFrame(OpClose, nil)
+		_ = s.c.Close()
+	})
 }
 
 // Close ends the stream. After a clean finish (both half-closes exchanged)
@@ -247,6 +348,9 @@ func (s *Stream) Fail(reason string) {
 // end's reply: closing the socket at once could reset it while the far end
 // is still reading the last bytes. Any other close cuts the stream at once.
 func (s *Stream) Close() error {
+	if s.detached.Load() {
+		return nil // the leg went on to its next connection
+	}
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		close(s.done)
@@ -256,6 +360,7 @@ func (s *Stream) Close() error {
 				t := time.NewTimer(closeTimeout)
 				select {
 				case <-s.gone: // watch saw the far end's close
+				case <-s.idled: // nobody reads any more: the leg ends here
 				case <-t.C:
 				}
 				t.Stop()
@@ -292,3 +397,17 @@ func (s *Stream) RemoteAddr() net.Addr {
 func (s *Stream) SetDeadline(t time.Time) error      { return s.c.conn.SetDeadline(t) }
 func (s *Stream) SetReadDeadline(t time.Time) error  { return s.c.conn.SetReadDeadline(t) }
 func (s *Stream) SetWriteDeadline(t time.Time) error { return s.c.conn.SetWriteDeadline(t) }
+
+// LinkSilence is how long a stream may hear nothing before its link counts
+// as dead.
+func LinkSilence() time.Duration { return linkSilence }
+
+// ExpireWrites makes every write fail at once, as a write deadline that has
+// passed does. The stream cannot be written to again.
+func (s *Stream) ExpireWrites() { s.c.ExpireWrites() }
+
+// WroteEOF reports whether this end has half-closed.
+func (s *Stream) WroteEOF() bool { return s.wroteEOF.Load() }
+
+// PingEvery is how often each end of a stream pings it.
+func PingEvery() time.Duration { return pingEvery }

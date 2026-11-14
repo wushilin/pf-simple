@@ -571,6 +571,12 @@ func (m *manager) saveTunnelSettings(enabled, anonymous bool) error {
 	return m.saveTunnel(func(t *tunnelTable) { t.Enabled, t.AnonymousServe = &enabled, anonymous })
 }
 
+// saveTunnelReuse writes the hub's limits on reusing legs into the config
+// file, as [tunnel.reuse].
+func (m *manager) saveTunnelReuse(r reuseSettings) error {
+	return m.saveTunnel(func(t *tunnelTable) { t.Reuse = reuseTableOf(r) })
+}
+
 // saveConsoleTLS writes the console's TLS settings into [console]. On
 // failure nothing has changed.
 func (m *manager) saveConsoleTLS(mode, dir string, names []string) error {

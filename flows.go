@@ -122,6 +122,8 @@ func (f *flowLog) ended(p *pipe, idle bool) {
 		if r := p.resetReason.Load(); r != nil {
 			v.Reason = *r
 		}
+	case p.failReason.Load() != nil:
+		v.Result, v.Reason = flowFailed, *p.failReason.Load()
 	case idle:
 		v.Result, v.Reason = flowIdle, "half-closed and idle for "+halfCloseIdleTimeout.String()
 	default:
