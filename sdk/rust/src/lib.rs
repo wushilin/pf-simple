@@ -72,3 +72,5 @@ mod testhub;
 mod tests;
 #[cfg(test)]
 mod reuse_tests;
+#[cfg(test)]
+mod leak_tests;

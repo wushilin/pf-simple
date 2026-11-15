@@ -34,6 +34,8 @@ pub(crate) struct Shared {
     slots: Arc<Semaphore>,
     /// Why serving stopped on its own, if it did.
     end: Mutex<Option<Error>>,
+    /// The connections waiting for `Listener::accept`, for a listener.
+    queue: tokio::sync::Mutex<Option<mpsc::Receiver<Pending>>>,
 }
 
 impl Shared {
@@ -43,7 +45,29 @@ impl Shared {
             up: AtomicBool::new(false),
             slots: Arc::new(Semaphore::new(LISTEN_BACKLOG)),
             end: Mutex::new(None),
+            queue: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Once serving has stopped, for whatever reason: refuses connections
+    /// still on their way to the queue, and fails those waiting in it. If
+    /// `accept` holds the queue, it does this itself when it sees the
+    /// cancellation.
+    pub(crate) fn drain_queue(&self) {
+        if let Ok(mut q) = self.queue.try_lock() {
+            if let Some(rx) = q.as_mut() {
+                drain(rx);
+            }
+        }
+    }
+}
+
+/// Closes the queue, so that a late send fails (and its sender fails the
+/// connection), and fails every connection still in it.
+fn drain(rx: &mut mpsc::Receiver<Pending>) {
+    rx.close();
+    while let Ok((conn, _slot)) = rx.try_recv() {
+        drop_pending(conn);
     }
 }
 
@@ -64,7 +88,6 @@ pub(crate) enum Handler {
 pub struct Listener {
     client: Client,
     shared: Arc<Shared>,
-    rx: tokio::sync::Mutex<mpsc::Receiver<Pending>>,
 }
 
 impl std::fmt::Debug for Listener {
@@ -90,13 +113,14 @@ impl Client {
         // Should this future be dropped while waiting, serving stops.
         let guard = shared.cancel.clone().drop_guard();
         let (tx, rx) = mpsc::channel(LISTEN_BACKLOG);
+        *shared.queue.try_lock().expect("a new queue") = Some(rx);
         let (reg_tx, reg_rx) = oneshot::channel();
         let target = self.inner.target.clone();
         tokio::spawn(serve_loop(self.clone(), shared.clone(), Handler::Listen(tx), target, Some(reg_tx)));
         match reg_rx.await {
             Ok(Ok(())) => {
                 guard.disarm();
-                Ok(Listener { client: self.clone(), shared, rx: tokio::sync::Mutex::new(rx) })
+                Ok(Listener { client: self.clone(), shared })
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::Closed),
@@ -110,10 +134,14 @@ impl Listener {
     /// Fails with [`Error::Closed`] once the listener is closed, or with
     /// the reason serving stopped on its own (a hub that became too old).
     pub async fn accept(&self) -> Result<Conn> {
-        let mut rx = self.rx.lock().await;
+        let mut q = self.shared.queue.lock().await;
+        let Some(rx) = q.as_mut() else { return Err(Error::Closed) };
         tokio::select! {
             biased;
             _ = self.shared.cancel.cancelled() => {
+                // Serving stopped: closed here, or on its own. What waits in
+                // the queue will never be accepted.
+                drain(rx);
                 Err(self.shared.end.lock().unwrap().take().unwrap_or(Error::Closed))
             }
             p = rx.recv() => match p {
@@ -138,11 +166,7 @@ impl Listener {
     /// link they use ends, or they are closed.
     pub fn close(&self) {
         self.shared.cancel.cancel();
-        if let Ok(mut rx) = self.rx.try_lock() {
-            while let Ok((conn, _slot)) = rx.try_recv() {
-                drop_pending(conn);
-            }
-        }
+        self.shared.drain_queue();
     }
 }
 
@@ -208,6 +232,7 @@ pub(crate) async fn serve_loop(
                     None => Err(e),
                 };
                 sh.cancel.cancel();
+                sh.drain_queue();
                 return out;
             }
             Err(e) => {

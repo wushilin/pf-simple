@@ -130,9 +130,17 @@ func (p *pipe) interrupt(reason string) {
 			_ = tcp.SetLinger(0)
 		}
 	}
+	// Both legs at once: a tunnel leg whose peer is not reading can take a
+	// few seconds to close.
+	var wg sync.WaitGroup
 	for _, conn := range legs {
-		_ = conn.Close()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = conn.Close()
+		}()
 	}
+	wg.Wait()
 }
 
 func (l *listenerStats) labelFor(addr string) string {
@@ -266,9 +274,17 @@ func (r *pipeRegistry) interruptListener(l *listenerStats) {
 		}
 	}
 	r.mu.Unlock()
+	// All at once: closing a leg whose peer is not reading can take a few
+	// seconds, which one after another would add up.
+	var wg sync.WaitGroup
 	for _, p := range victims {
-		p.interrupt("listener stopped")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.interrupt("listener stopped")
+		}()
 	}
+	wg.Wait()
 }
 
 func (r *pipeRegistry) get(id uint64) *pipe {

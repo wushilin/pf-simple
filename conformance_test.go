@@ -1095,6 +1095,77 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 		}
 	})
 
+	// Connection leaks: after many connections, failed ones included, the
+	// driver holds no more sockets than it did before them (Linux only).
+	for _, mode := range []driverMode{modeListen, modeForward} {
+		t.Run("leaks/serve side ("+string(mode)+")", func(t *testing.T) {
+			h := newConformanceHub(t, d)
+			p := h.serve(t, echoTarget(t), "--serve-token", testServeToken, "--mode", string(mode))
+			c := h.client(t, testWord, "")
+			round := func(n int) {
+				for i := 0; i < n; i++ {
+					conn, err := c.Dial(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if i%5 == 4 { // fails half way: the serving side must let go of it too
+						_, _ = conn.Write([]byte("hello"))
+						_, _ = io.ReadFull(conn, make([]byte, 5))
+						conn.Fail("the conformance suite gave up")
+						continue
+					}
+					if err := echoOver(conn, payload[:2000]); err != nil {
+						t.Fatalf("connection %d: %v", i, err)
+					}
+					conn.Close()
+				}
+			}
+			checkNoLeak(t, p, func() { round(20) }, func() { round(150) })
+		})
+		t.Run("leaks/connect side ("+string(mode)+")", func(t *testing.T) {
+			h := newConformanceHub(t, d)
+			h.goServe(t, ctx, echoTarget(t))
+			addr, p := h.connectProc(t, "--mode", string(mode))
+			round := func(n int) {
+				for i := 0; i < n; i++ {
+					tc, err := net.Dial("tcp", addr)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if i%5 == 4 { // the application resets its connection half way
+						_, _ = tc.Write([]byte("hello"))
+						_, _ = io.ReadFull(tc, make([]byte, 5))
+						_ = tc.(*net.TCPConn).SetLinger(0)
+						tc.Close()
+						continue
+					}
+					_ = tc.SetDeadline(time.Now().Add(20 * time.Second))
+					if err := echoOver(tc.(*net.TCPConn), payload[:2000]); err != nil {
+						t.Fatalf("connection %d: %v", i, err)
+					}
+					tc.Close()
+				}
+			}
+			checkNoLeak(t, p, func() { round(20) }, func() { round(150) })
+		})
+	}
+	t.Run("leaks/connect side, nobody serving", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		addr, p := h.connectProc(t)
+		round := func(n int) {
+			for i := 0; i < n; i++ {
+				tc, err := net.Dial("tcp", addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = tc.SetReadDeadline(time.Now().Add(20 * time.Second))
+				_, _ = tc.Read(make([]byte, 1)) // refused: the driver closes it
+				tc.Close()
+			}
+		}
+		checkNoLeak(t, p, func() { round(10) }, func() { round(80) })
+	})
+
 	only(main, "idle connections stay up", func(t *testing.T) {
 		if os.Getenv("PF_CONFORMANCE_SLOW") == "" {
 			t.Skip("takes a minute; set PF_CONFORMANCE_SLOW=1")
@@ -1244,5 +1315,45 @@ func (h *conformanceHub) refuseServes(t *testing.T, n int) func() []time.Time {
 		mu.Lock()
 		defer mu.Unlock()
 		return append([]time.Time(nil), times...)
+	}
+}
+
+// checkNoLeak runs warm, which may open what the driver keeps (pooled and
+// idle connections), counts the driver's open file descriptors, runs load,
+// and checks the count came back: what load opened was all closed again.
+func checkNoLeak(t *testing.T, p *proc, warm, load func()) {
+	t.Helper()
+	fds := func() int {
+		entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", p.cmd.Process.Pid))
+		if err != nil {
+			t.Skipf("cannot count the driver's file descriptors: %v", err)
+		}
+		return len(entries)
+	}
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("counting file descriptors needs /proc")
+	}
+	settle := func() int {
+		// Closing finishes in the background (close handshakes, verdicts):
+		// wait for the count to stop falling.
+		last, same := fds(), 0
+		for i := 0; i < 50 && same < 5; i++ {
+			time.Sleep(200 * time.Millisecond)
+			if n := fds(); n == last {
+				same++
+			} else {
+				last, same = n, 0
+			}
+		}
+		return last
+	}
+	warm()
+	before := settle()
+	load()
+	after := settle()
+	// A little slack for what a runtime opens on its own; a leak of one
+	// socket per connection shows as dozens.
+	if after > before+8 {
+		t.Errorf("the driver held %d file descriptors before and %d after: about %d leaked over the connections", before, after, after-before)
 	}
 }

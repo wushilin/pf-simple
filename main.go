@@ -137,14 +137,26 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 }
 
 func acceptConnections(ctx context.Context, ln net.Listener, l *listenerStats, idleTimeout time.Duration) {
+	var pause time.Duration // after a failed accept; reset by a good one
 	for {
 		client, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() == nil {
-				log.Printf("accept on %s: %v", ln.Addr(), err)
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return // the listener was stopped
 			}
-			return
+			// Anything else, such as running out of file descriptors, may
+			// pass: keep the listener, and try again after a pause that
+			// grows, as net/http does.
+			pause = min(max(2*pause, 5*time.Millisecond), time.Second)
+			log.Printf("accept on %s: %v; trying again in %s", ln.Addr(), err, pause)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pause):
+			}
+			continue
 		}
+		pause = 0
 		id, start := connIDs.Add(1), time.Now()
 		if !l.admit() {
 			l.rejected.Add(1)

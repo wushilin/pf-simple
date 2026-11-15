@@ -29,7 +29,7 @@ public final class TestMain {
         List<String> failed = new ArrayList<>();
         int ran = 0;
         List<Method> methods = new ArrayList<>();
-        for (Class<?> k : List.of(TestMain.class, ReuseTest.class)) {
+        for (Class<?> k : List.of(TestMain.class, ReuseTest.class, LeakTest.class)) {
             List<Method> ms = new ArrayList<>(Arrays.asList(k.getDeclaredMethods()));
             ms.sort(java.util.Comparator.comparing(Method::getName));
             methods.addAll(ms);

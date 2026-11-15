@@ -238,7 +238,13 @@ func (u *reusableUpstream) Read(p []byte) (int, error) {
 // right after this. The rest, which waits on the client, goes on its own.
 func (u *reusableUpstream) Close() error {
 	u.once.Do(func() {
-		clean := u.Stream.Clean() && u.client.Clean()
+		// An interrupted pipe (a reset, the tunnel ending) is never clean,
+		// whichever of its legs closes first.
+		interrupted := false
+		if pp := pipes.get(u.pipeID); pp != nil {
+			interrupted = pp.interrupted.Load()
+		}
+		clean := !interrupted && u.Stream.Clean() && u.client.Clean()
 		go u.finish(clean)
 	})
 	return nil

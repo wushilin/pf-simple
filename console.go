@@ -150,7 +150,13 @@ func (s *consoleServer) serve(ctx context.Context, ln net.Listener) {
 	srv := &http.Server{
 		Handler:           s.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
+		// A request must arrive whole, and its answer leave, in bounded
+		// time: a client that sends headers and no body, or never reads,
+		// must not hold a connection and its goroutine. WebSockets (the
+		// console's push, and tunnels) are hijacked and clear these.
+		ReadTimeout:  consoleReadTimeout,
+		WriteTimeout: consoleWriteTimeout,
+		IdleTimeout:  2 * time.Minute,
 	}
 	go func() {
 		<-ctx.Done()
@@ -252,6 +258,16 @@ func (s *consoleServer) handleSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// How long a console request may take to arrive, and its answer to leave;
+// variables so tests can shorten them.
+var (
+	consoleReadTimeout  = 30 * time.Second
+	consoleWriteTimeout = 2 * time.Minute
+)
+
+// maxSessions bounds the console's signed-in sessions.
+const maxSessions = 1024
+
 func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Password string `json:"password"`
@@ -279,6 +295,17 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		if !now.Before(session.expires) {
 			s.revokeLocked(t)
 		}
+	}
+	// Bounded, also where no password is needed and anyone can sign in:
+	// past the cap, the session closest to its end makes room.
+	if len(s.sessions) >= maxSessions {
+		var oldest string
+		for t, session := range s.sessions {
+			if oldest == "" || session.expires.Before(s.sessions[oldest].expires) {
+				oldest = t
+			}
+		}
+		s.revokeLocked(oldest)
 	}
 	s.sessions[token] = &consoleSession{expires: now.Add(sessionLifetime), revoked: make(chan struct{})}
 	s.mu.Unlock()

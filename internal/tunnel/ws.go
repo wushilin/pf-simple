@@ -73,7 +73,8 @@ type Conn struct {
 
 	dmu     sync.Mutex
 	closing bool
-	expired bool // ExpireWrites was called: every write fails at once
+	closeBy time.Time // when closing began, plus closeTimeout: one deadline for all its writes
+	expired bool      // ExpireWrites was called: every write fails at once
 }
 
 // SetTimeouts sets how long the peer may stay silent and how long one frame
@@ -88,7 +89,30 @@ func (c *Conn) SetTimeouts(read, write time.Duration) {
 
 func (c *Conn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *Conn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
-func (c *Conn) Close() error         { return c.conn.Close() }
+
+// Close closes the connection. One that is closing keeps to its deadline:
+// a TLS connection's close notice, which crypto/tls gives five seconds of
+// its own, is let go when it cannot leave in time, and the socket under it
+// closed, as on any cut.
+func (c *Conn) Close() error {
+	tc, ok := c.conn.(*tls.Conn)
+	c.dmu.Lock()
+	closing, by := c.closing, c.closeBy
+	c.dmu.Unlock()
+	if !ok || !closing {
+		return c.conn.Close()
+	}
+	done := make(chan error, 1)
+	go func() { done <- tc.Close() }()
+	t := time.NewTimer(max(time.Until(by), 0))
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		return tc.NetConn().Close() // the notice, if it goes at all, goes nowhere
+	}
+}
 
 func HeaderHasToken(h http.Header, name, token string) bool {
 	for _, v := range h.Values(name) {
@@ -257,6 +281,9 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 	req.Header.Set("Sec-WebSocket-Version", "13")
 	req.Header.Set("User-Agent", "pf-client")
 	_ = conn.SetDeadline(time.Now().Add(HandshakeLimit))
+	// A cancelled ctx ends the upgrade at once, not after HandshakeLimit.
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
 	if err := req.Write(conn); err != nil {
 		conn.Close()
 		return nil, err
@@ -276,6 +303,10 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 	if resp.Header.Get("Sec-WebSocket-Accept") != acceptKey(key) {
 		conn.Close()
 		return nil, errors.New("the server's websocket handshake is invalid")
+	}
+	if !stop() {
+		conn.Close() // cancelled just now: its deadline is already in the past
+		return nil, ctx.Err()
 	}
 	_ = conn.SetDeadline(time.Time{})
 	c := &Conn{conn: conn, rd: rd, Header: resp.Header, client: true}
@@ -319,7 +350,7 @@ func (c *Conn) WriteFrame(op byte, payload []byte) error {
 	case c.expired:
 		_ = c.conn.SetWriteDeadline(time.Unix(1, 0))
 	case c.closing:
-		_ = c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
+		_ = c.conn.SetWriteDeadline(c.closeBy)
 	case c.writeTimeout.Load() > 0:
 		_ = c.conn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout.Load())))
 	default:
@@ -333,8 +364,10 @@ func (c *Conn) WriteFrame(op byte, payload []byte) error {
 // BeginClose bounds every write from now on, including one already blocked.
 func (c *Conn) BeginClose() {
 	c.dmu.Lock()
-	c.closing = true
-	_ = c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
+	if !c.closing {
+		c.closing, c.closeBy = true, time.Now().Add(closeTimeout)
+	}
+	_ = c.conn.SetWriteDeadline(c.closeBy)
 	c.dmu.Unlock()
 }
 

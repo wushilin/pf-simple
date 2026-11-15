@@ -419,13 +419,30 @@ class Conn:
         reason = "".join(c for c in reason if c.isprintable()) or "the connection was dropped"
         payload = (_ERR + reason.encode("utf-8"))[:MAX_TEXT_FRAME]
         payload = payload.decode("utf-8", "ignore").encode("utf-8")
+        sent = False
         try:
-            await self._ws.send(OP_TEXT, payload, timeout=_ws.CLOSE_TIMEOUT)
-            await self._send_close()
-        except (ConnectionError, OSError):
-            pass
-        self._ws.close_transport()
-        await self._end(self._broke)
+            try:
+                await self._ws.send(OP_TEXT, payload, timeout=_ws.CLOSE_TIMEOUT)
+                await self._send_close()
+                sent = True
+            except (ConnectionError, OSError):
+                pass
+        finally:  # cancelled or not, the leg goes and the end is reported
+            if sent:
+                self._ws.close_transport()
+            else:
+                self._ws.abort()
+            await self._end(self._broke)
+
+    def _kill(self, err: BaseException) -> None:
+        """End the connection at once, from code that cannot wait: cut the
+        leg now, and report the end in a task of its own."""
+        if self._done or self._detached:
+            return
+        self._done = self._closing = True
+        self._break(err)
+        self._ws.abort()
+        asyncio.ensure_future(self._end(self._broke))
 
     async def close(self) -> Optional[BaseException]:
         """End the connection. If this end has not half-closed, it does so
@@ -443,7 +460,12 @@ class Conn:
             return self._final
         if not self._wrote_eof and not self._failed and not self._gone.is_set():
             try:
-                await self.close_write()
+                # Bounded: behind a write the peer is not reading, the eof
+                # would wait for ever (Go bounds every write once closing).
+                await asyncio.wait_for(self.close_write(), _ws.CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                self._break(LinkError("the server did not take this side's half-close in time"))
+                self._ws.abort()  # part of a frame may be out
             except (ConnectionError, OSError, ClosedError):
                 pass
         if self._done:
