@@ -426,7 +426,8 @@ on its own. When one leg fails, the hub ends that direction toward the
 other leg with `eof`, the same as a clean finish. The reason follows as
 `err:<reason>` only when the hub ends the whole connection. That happens
 when the other direction ends as well, or after the 30-second idle timeout
-(§8.2).
+(§8.2). On a serving leg offered reuse it does not follow: the hub ends
+that leg's generation instead (§12.5).
 
 So a receiver that has read `eof` MUST keep reading the stream: it can
 still receive `err:`, which turns the finish into a failure. pf-client and
@@ -555,9 +556,10 @@ Protocol 2 adds one optional thing to protocol 1: the serving side's
 - Today, every connection costs the serving side a new WebSocket to
   `/accept`: a TCP connect, a TLS handshake, the upgrade, and the round
   trip of the open message.
-- Under protocol 2, a leg whose connection ended cleanly may stay open,
-  idle. The hub hands the tunnel's next connection to that leg with one
-  frame, instead of asking for a new one.
+- Under protocol 2, a leg whose connection is over may stay open, idle,
+  however the connection ended, as long as the leg itself is healthy. The
+  hub hands the tunnel's next connection to that leg with one frame,
+  instead of asking for a new one.
 
 The scope is deliberately small:
 
@@ -652,7 +654,7 @@ X-PF-Tunnel-Keep-Alive: 60
                     |
                     v
    +----------> CARRYING <-------------------------------------+
-   |                | clean finish: hub sends "idle"            |
+   |                | generation over: hub sends "idle"         |
    |                v                                           |
    |            OFFERED --- client closes, or 3 s pass ---> closed
    |                | client sends "idle"                       |
@@ -688,36 +690,52 @@ A **violation** closes the leg at once. If a connection was on it
   unknown text, ignored as §8.1 says, though a conforming peer never sends
   them.
 
-### 12.5 A clean finish: the hub's `idle`
+### 12.5 The end of a generation: the hub's `idle`
 
-The hub decides whether a connection finished cleanly, because only it sees
-both legs. That avoids a failure on the connecting leg being passed on as a
-plain `eof` (§8.3) and taken for a clean finish.
+Each connection a leg carries is one **generation** of the leg. The leg's
+fate depends on the leg alone, never on how the connection ended: a
+connection that the connecting side's application, network or program
+ends badly leaves a healthy serving leg behind, and the leg is reused.
 
-1. **The hub decides,** at the moment both copy directions of the pipe
-   have finished. A failure on the connecting leg after that moment, for
-   example during its own close handshake, does not count. The connection
-   finished cleanly when *both* of these hold:
-   - this leg has exchanged both `eof`s: the hub sent its `eof` and
-     received the client's;
-   - neither copy direction ended with an error. That includes write
-     errors toward the connecting leg, and that leg failing (§8.3).
+1. **A generation ends when both `eof`s have passed on the serving leg:**
+   the hub sent its `eof`, and received the serving side's. One `eof` is
+   only a half-close (§8.3): the other direction may go on carrying data
+   for as long as it likes.
+2. **The hub completes the generation when the connection ends otherwise.**
+   The connecting side failed or went away (§8.3), or the hub ended the
+   connection itself, such as by the idle rule of a half-closed connection
+   (§8.4). Then, if the serving leg is healthy:
+   - the hub sends its `eof` on the serving leg, unless it has already;
+   - it then reads the serving leg and drops what arrives, since nobody is
+     left to receive it, up to the serving side's `eof`. The serving side
+     sends it in the usual way: its target was half-closed by the `eof`,
+     and closes in turn;
+   - if that `eof` has not come within 3 seconds, the hub closes the leg.
+     A target that keeps talking after a half-close costs the leg.
 
-   The hub MUST then answer promptly: `idle`, or `err:` and a close, or a
-   close. It must not leave the leg waiting.
-2. **On an offered leg, the hub then sends the text frame `idle`,**
-   instead of starting the close handshake. The leg is OFFERED. The hub
-   sends nothing more for that connection: no `err:` follows an `idle`.
-3. **The client answers within 3 seconds:**
+   No data from one generation reaches the next: everything the serving
+   side sends before its `eof` belongs to the generation that ended.
+3. **The leg is healthy** unless its link failed or went silent, the
+   serving side ended the connection with `err:` (it closes the leg after
+   it), the connection was reset by the hub's console, or the tunnel is
+   ending. Then the hub closes the leg as in protocol 1.
+4. **On an offered leg whose generation is over, the hub sends the text
+   frame `idle`,** instead of starting the close handshake. The leg is
+   OFFERED. The hub sends nothing more for that connection: no `err:`
+   follows an `idle`.
+5. **The client answers within 3 seconds:**
    - **`idle`:** it keeps the leg, which joins the tunnel's idle pool
      (§12.6);
    - **a close:** it does not want the leg. The hub answers the close, and
      the leg is gone.
    - **If neither comes in time,** the hub closes the leg.
-4. **If the connection did not finish cleanly,** the hub ends it as in
-   protocol 1 (`err:` and a close), and the leg is never reused.
-5. **The client reports the connection as finished cleanly when it
-   receives the hub's `idle`,** with its close event and final figures.
+6. **The connection's outcome is the hub's to record.** A connection that
+   failed on the connecting side still counts as failed, with its reason,
+   in the hub's flow log and counters, though its serving leg is reused.
+   The serving side does not learn that reason: on its leg the connection
+   ended with an `eof`, as when the application closes its end (§8.3).
+7. **The client reports the connection as finished when it receives the
+   hub's `idle`,** with its close event and final figures.
    - Until then, the outcome is open.
    - An `err:` or a close without `idle` means protocol 1 rules apply
      (§8.3, §8.4).
@@ -727,7 +745,7 @@ plain `eof` (§8.3) and taken for a clean finish.
      30-second silence limit.
    - A client that has already sent its close ignores an `idle` that
      crosses it.
-6. **After the client's `idle`,** both ends forget the connection: its id,
+8. **After the client's `idle`,** both ends forget the connection: its id,
    its half-close state, its byte counts and its reason.
 
 A client that never answers `idle`, because it does not want reuse or does
@@ -882,6 +900,6 @@ This part is not on the wire.
 
 The conformance suite (§11) runs every case at each combination of the
 hub's and the client's protocols: 2 with 2, 1 and 0, and 1 and 0 with 2.
-Where both speak 2, it checks that legs are reused, and that a failed
-connection's leg never is. Everywhere else, it checks that legs are never
-reused.
+Where both speak 2, it checks that legs are reused, including after a
+connection the connecting side failed. Everywhere else, it checks that
+legs are never reused.

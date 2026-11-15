@@ -389,16 +389,78 @@ func TestReuseBindFallsBack(t *testing.T) {
 	}
 }
 
-// A connection that fails, on either side, never gives its leg back.
-func TestReuseFailureIsNotReused(t *testing.T) {
+// legVerdict reads what the hub sends the serving side on leg after the
+// connection is over: the data and eofs that come first, then its verdict,
+// "idle" or an err:, or "closed".
+func legVerdict(t *testing.T, leg *tunnel.Conn) (verdict string, eofs int, data string) {
+	t.Helper()
+	leg.SetTimeouts(10*time.Second, time.Second)
+	for {
+		op, payload, err := leg.Next(1 << 20)
+		if err != nil {
+			return "closed", eofs, data
+		}
+		switch {
+		case op == tunnel.OpBinary:
+			data += string(payload)
+		case op == tunnel.OpText && string(payload) == "eof":
+			eofs++
+		case op == tunnel.OpText:
+			return string(payload), eofs, data
+		}
+	}
+}
+
+// keepAndBind answers the hub's idle on leg, opens the next connection and
+// checks that it comes to leg with bind.
+func (fs *fakeServe) keepAndBind(t *testing.T, c *pfrelay.Client, leg *tunnel.Conn) {
+	t.Helper()
+	if err := leg.WriteFrame(tunnel.OpText, []byte(tunnel.MsgIdle)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to be idle", func() bool { return len(fs.f.wordSnap(t).Idle) == 1 })
+	conn := dialEcho(t, c)
+	id := awaitBind(t, leg)
+	if err := leg.WriteFrame(tunnel.OpText, []byte(tunnel.MsgBound+" "+id)); err != nil {
+		t.Fatal(err)
+	}
+	if v, _, data := legVerdictEcho(t, leg); v != tunnel.MsgIdle || data != "hello" {
+		t.Errorf("the reused leg carried %q and ended with %q, want hello and idle", data, v)
+	}
+	if got := readAll(t, conn); got != "hello" {
+		t.Errorf("the reused leg's connection read %q", got)
+	}
+}
+
+// legVerdictEcho is echoLeg that also reports the data it carried.
+func legVerdictEcho(t *testing.T, leg *tunnel.Conn) (verdict string, eofs int, data string) {
+	t.Helper()
+	for {
+		op, payload, err := leg.Next(1 << 20)
+		if err != nil {
+			return "closed", eofs, data
+		}
+		switch {
+		case op == tunnel.OpBinary:
+			data += string(payload)
+			_ = leg.WriteFrame(tunnel.OpBinary, payload)
+		case op == tunnel.OpText && string(payload) == "eof":
+			eofs++
+			_ = leg.WriteFrame(tunnel.OpText, []byte("eof"))
+		case op == tunnel.OpText:
+			return string(payload), eofs, data
+		}
+	}
+}
+
+// A connection that fails on the connecting side leaves the serving leg
+// healthy: the hub ends the leg's generation with its eof and says idle
+// (§12.5). The connection itself still counts as failed.
+func TestReuseConnectingSideFailureKeepsTheLeg(t *testing.T) {
 	f := newRelayFixture(t, "")
 	fs := f.fakeServe(t)
 	c := f.client(t, testWord, "")
 
-	// The serving side speaks first and half-closes; the connecting side
-	// then fails. The hub passes that on to the serving leg as a half-close
-	// (§8.3), so both half-closes go by there, but the connection failed:
-	// the hub must end it with err:, not idle.
 	conn, err := c.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -410,34 +472,34 @@ func TestReuseFailureIsNotReused(t *testing.T) {
 		t.Fatalf("read %q", got)
 	}
 	conn.Fail("the application gave up")
-	var last string
-	for {
-		op, payload, err := leg.Next(1 << 20)
-		if err != nil {
-			break
-		}
-		if op == tunnel.OpText {
-			last = string(payload)
-		}
+	if v, eofs, _ := legVerdict(t, leg); v != tunnel.MsgIdle || eofs != 1 {
+		t.Fatalf("the hub ended the serving leg with %d eof(s) and %q, want 1 and idle", eofs, v)
 	}
-	if last == tunnel.MsgIdle || !strings.HasPrefix(last, "err:") {
-		t.Errorf("the hub ended a failed connection's leg with %q, want err:", last)
+	fs.keepAndBind(t, c, leg)
+	if w := f.wordSnap(t); w.Reused != 1 {
+		t.Errorf("%d reused, want 1", w.Reused)
 	}
+}
 
-	// The serving side fails: its reason reaches the connecting side at once.
-	conn = dialEcho(t, c)
-	leg = fs.accept(fs.nextOpen(), fs.session)
+// The serving side fails: its reason reaches the connecting side at once,
+// and the leg it closed is gone.
+func TestReuseServingSideFailureIsNotReused(t *testing.T) {
+	f := newRelayFixture(t, "")
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	conn := dialEcho(t, c)
+	leg := fs.accept(fs.nextOpen(), fs.session)
 	_ = leg.WriteFrame(tunnel.OpText, []byte("err:the target is down"))
 	_ = leg.WriteFrame(tunnel.OpClose, nil)
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err = io.ReadAll(conn)
+	_, err := io.ReadAll(conn)
 	var remote *pfrelay.RemoteError
 	if !errors.As(err, &remote) || remote.Reason != "the target is down" {
 		t.Errorf("the connecting side heard %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
 	if n := len(f.wordSnap(t).Idle); n != 0 {
-		t.Errorf("%d idle legs after failures", n)
+		t.Errorf("%d idle legs after the serving side failed", n)
 	}
 }
 
@@ -774,8 +836,10 @@ func TestReuseServeAndDialOneClient(t *testing.T) {
 	}
 }
 
-// A connecting side that fails after its half-close: the hub must not call
-// the connection clean, though the serving leg saw both half-closes.
+// The connecting side half-closes and then fails while the serving side
+// is still sending: what the serving side sends after that belongs to the
+// connection that is over. The hub drops it, up to the serving side's eof,
+// and the leg's next connection sees none of it.
 func TestReuseConnectingSideFailsAfterHalfClose(t *testing.T) {
 	f := newRelayFixture(t, "")
 	fs := f.fakeServe(t)
@@ -790,19 +854,101 @@ func TestReuseConnectingSideFailsAfterHalfClose(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	_ = leg.WriteFrame(tunnel.OpBinary, []byte("late"))
 	_ = leg.WriteFrame(tunnel.OpText, []byte("eof"))
-	var last string
-	leg.SetTimeouts(10*time.Second, time.Second)
-	for {
-		op, payload, err := leg.Next(1 << 20)
-		if err != nil {
-			break
+	if v, eofs, _ := legVerdict(t, leg); v != tunnel.MsgIdle || eofs != 1 {
+		t.Fatalf("the hub ended the serving leg with %d eof(s) and %q, want 1 and idle", eofs, v)
+	}
+	fs.keepAndBind(t, c, leg) // and "late" is not what its connection reads
+}
+
+// The connecting side's link drops without a word: the serving leg is
+// still healthy, and is reused.
+func TestReuseConnectingLinkLostKeepsTheLeg(t *testing.T) {
+	f := newRelayFixture(t, "")
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	h := http.Header{}
+	h.Set(tunnel.HeaderWord, testWord)
+	h.Set(tunnel.HeaderProto, "0-2")
+	ws, err := tunnel.Dial(context.Background(), f.srv.URL+tunnel.Path+"/connect", h, f.tls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leg := fs.accept(fs.nextOpen(), fs.session)
+	_ = ws.WriteFrame(tunnel.OpBinary, []byte("hello"))
+	if op, payload, err := leg.Next(1 << 20); err != nil || op != tunnel.OpBinary || string(payload) != "hello" {
+		t.Fatalf("the serving leg got %v %q %v", op, payload, err)
+	}
+	ws.Close() // gone, no close handshake
+	// The serving side hears the hub's eof (its target is half-closed),
+	// and finishes with its own.
+	if v, eofs, _ := legVerdictEcho(t, leg); v != tunnel.MsgIdle || eofs != 1 {
+		t.Fatalf("the hub ended the serving leg with %d eof(s) and %q, want 1 and idle", eofs, v)
+	}
+	fs.keepAndBind(t, c, leg)
+}
+
+// The target closes, the application keeps its end open, and the hub's
+// half-close idle rule ends the connection: the serving leg had finished
+// its part, and is reused.
+func TestReuseHalfCloseIdleTimeoutKeepsTheLeg(t *testing.T) {
+	f := newRelayFixture(t, "")
+	f.hub.idle = 300 * time.Millisecond
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	conn, err := c.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leg := fs.accept(fs.nextOpen(), fs.session)
+	_ = leg.WriteFrame(tunnel.OpText, []byte("eof")) // the target closed
+	start := time.Now()
+	if v, eofs, _ := legVerdict(t, leg); v != tunnel.MsgIdle || eofs != 1 {
+		t.Fatalf("the hub ended the serving leg with %d eof(s) and %q, want 1 and idle", eofs, v)
+	}
+	if d := time.Since(start); d < 250*time.Millisecond {
+		t.Errorf("idle after %v, before the half-close idle rule", d)
+	}
+	_ = conn
+	fs.keepAndBind(t, c, leg)
+}
+
+// A serving side that keeps sending after the hub's eof, past the grace,
+// costs the leg: the hub cannot wait for ever to finish its generation.
+func TestReuseServingSideThatNeverFinishesLosesTheLeg(t *testing.T) {
+	defer func(d time.Duration) { generationWait = d }(generationWait)
+	generationWait = 300 * time.Millisecond
+	f := newRelayFixture(t, "")
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	conn, err := c.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leg := fs.accept(fs.nextOpen(), fs.session)
+	conn.Fail("the application gave up")
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // a target that ignores the half-close and keeps talking
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+				if leg.WriteFrame(tunnel.OpBinary, []byte("more")) != nil {
+					return
+				}
+			}
 		}
-		if op == tunnel.OpText && string(payload) != "eof" {
-			last = string(payload)
+	}()
+	if v, _, _ := legVerdict(t, leg); v == tunnel.MsgIdle {
+		t.Error("the hub said idle on a leg whose generation never ended")
+	} else if v != "closed" {
+		if _, _, err := leg.Next(1 << 20); err == nil {
+			t.Errorf("the hub said %q and kept the leg open", v)
 		}
 	}
-	if last == tunnel.MsgIdle {
-		t.Error("the hub said idle for a connection whose connecting side failed")
+	if n := len(f.wordSnap(t).Idle); n != 0 {
+		t.Errorf("%d idle legs", n)
 	}
 }
 
