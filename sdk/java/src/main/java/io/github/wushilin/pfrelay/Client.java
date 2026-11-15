@@ -646,10 +646,27 @@ public final class Client {
     }
 
     private void carry(Forwarder f, Socket local) {
+        Conn[] held = new Conn[1];
+        boolean done = false;
+        try {
+            carry(f, local, held);
+            done = true;
+        } finally {
+            if (!done) { // a RuntimeException: let go of both ends
+                if (held[0] != null) {
+                    held[0].fail(Bridge.CONNECT.self + " failed");
+                }
+                Bridge.closeQuietly(local);
+            }
+        }
+    }
+
+    private void carry(Forwarder f, Socket local, Conn[] held) {
         Conn conn;
         try {
             local.setTcpNoDelay(true);
             conn = dial();
+            held[0] = conn;
         } catch (IOException e) {
             log("connection from " + local.getRemoteSocketAddress() + " refused: " + e.getMessage());
             Bridge.closeQuietly(local);

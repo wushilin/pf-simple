@@ -32,6 +32,7 @@ public final class Listener implements Closeable {
     private volatile boolean up;
     private volatile WebSocket control;
     private volatile boolean closed;
+    private final Canceller canceller = new Canceller(); // requests in flight, cut by close()
     /** For a serve forwarder: the target, and the forwarder; null for a listener. */
     private final String target;
     volatile Forwarder forwarder;
@@ -92,6 +93,10 @@ public final class Listener implements Closeable {
         synchronized (this) {
             while (true) {
                 if (closed) {
+                    IOException why = finalError;
+                    if (why != null) {
+                        throw why; // serving gave up, for a reason waiting cannot cure
+                    }
                     throw new SocketException("the listener is closed");
                 }
                 Conn c = queue.poll();
@@ -128,6 +133,7 @@ public final class Listener implements Closeable {
         }
         stopped.countDown();
         registered.countDown();
+        canceller.cancel();
         WebSocket ws = control;
         if (ws != null) {
             Sched.go(() -> {
@@ -168,10 +174,13 @@ public final class Listener implements Closeable {
             }
             WebSocket ws = null;
             IOException err = null;
+            Canceller.Scope scope = canceller.enter();
             try {
                 ws = client.openWs(Endpoint.SERVE, new java.util.LinkedHashMap<>(h));
             } catch (IOException e) {
                 err = e;
+            } finally {
+                scope.close();
             }
             if (closed) {
                 if (ws != null) {
@@ -226,9 +235,14 @@ public final class Listener implements Closeable {
         }
     }
 
+    /**
+     * Serving stopped for a reason waiting cannot cure. The listener closes,
+     * so that accept() throws the reason instead of waiting for ever.
+     */
     private void giveUp(IOException e) {
         finalError = e;
-        registered.countDown();
+        client.log("serving stopped: " + e.getMessage());
+        close();
     }
 
     /** Runs one control channel until it fails (docs/PROTOCOL.md §7). */
@@ -267,7 +281,12 @@ public final class Listener implements Closeable {
                                 if (reg.tookOpen(id)) {
                                     client.abandon(id); // a bound id asked for again: a new attempt (§12.7)
                                 }
-                                open(reg, id, null);
+                                Canceller.Scope scope = canceller.enter();
+                                try {
+                                    open(reg, id, null);
+                                } finally {
+                                    scope.close();
+                                }
                             });
                         }
                         break;
@@ -363,10 +382,32 @@ public final class Listener implements Closeable {
      * "bound" has gone out already, and a refusal is err: (§12.7).
      */
     private void forward(Registration reg, String id, WebSocket leg) {
+        java.net.Socket[] local = new java.net.Socket[1];
+        Conn[] conn = new Conn[1];
+        boolean done = false;
+        try {
+            forward(reg, id, leg, local, conn);
+            done = true;
+        } finally {
+            if (!done) { // a RuntimeException: let go of whatever it held
+                if (conn[0] != null) {
+                    conn[0].fail(Bridge.SERVE.self + " failed");
+                } else if (leg != null) {
+                    leg.abort();
+                }
+                if (local[0] != null) {
+                    Bridge.closeQuietly(local[0]);
+                }
+            }
+        }
+    }
+
+    private void forward(Registration reg, String id, WebSocket leg, java.net.Socket[] held, Conn[] heldConn) {
         String shortId = Client.shortId(id);
         java.net.Socket local;
         try {
             local = Bridge.dialTarget(target);
+            held[0] = local;
         } catch (IOException | IllegalArgumentException e) {
             client.log("connection " + shortId + " failed: cannot reach the target " + target + ": "
                     + e.getMessage());
@@ -388,6 +429,7 @@ public final class Listener implements Closeable {
             Bridge.closeQuietly(local);
             return;
         }
+        heldConn[0] = c;
         if (leg != null && reg.abandoned(id)) {
             client.abandon(id); // asked for again just as it opened
         }

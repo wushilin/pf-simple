@@ -28,6 +28,8 @@ import javax.net.ssl.SSLSocket;
 final class Http {
     static final int DIAL_TIMEOUT_MS = 10_000;
     static final int HANDSHAKE_TIMEOUT_MS = 15_000;
+    /** The most a whole request may take, from the TCP connect to the end of the answer's head and body. */
+    static volatile int requestDeadlineMs = HANDSHAKE_TIMEOUT_MS;
     static final int MAX_BODY = 64 << 10;
     private static final String WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -69,6 +71,19 @@ final class Http {
         Socket raw = new Socket();
         SSLSocket ssl = null;
         boolean keep = false;
+        Canceller canceller = Canceller.current();
+        if (canceller != null && !canceller.add(raw)) {
+            throw new java.io.InterruptedIOException("cancelled");
+        }
+        // an absolute deadline: per-read timeouts alone let a hub that
+        // trickles its answer hold the request for ever
+        java.util.concurrent.ScheduledFuture<?> deadline = Sched.after(requestDeadlineMs, () -> {
+            try {
+                raw.close();
+            } catch (IOException ignored) {
+                // cut
+            }
+        });
         try {
             raw.setTcpNoDelay(true);
             raw.connect(new InetSocketAddress(t.host, t.port), DIAL_TIMEOUT_MS);
@@ -79,7 +94,7 @@ final class Http {
             params.setApplicationProtocols(new String[] {"http/1.1"});
             ssl.setSSLParameters(params);
             ssl.setUseClientMode(true);
-            ssl.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+            ssl.setSoTimeout(Math.min(HANDSHAKE_TIMEOUT_MS, requestDeadlineMs));
             ssl.startHandshake();
 
             String key = null;
@@ -111,6 +126,10 @@ final class Http {
                 if (!accept(key).equals(resp.headers.get("Sec-WebSocket-Accept"))) {
                     throw new IOException("the server's websocket handshake is invalid");
                 }
+                if (!deadline.cancel(false)) { // the deadline is closing it right now
+                    throw new java.net.SocketTimeoutException("the server did not answer within "
+                            + requestDeadlineMs / 1000.0 + "s");
+                }
                 ssl.setSoTimeout(0);
                 resp.ws = new WebSocket(ssl, raw, in, out, true, resp.headers);
                 keep = true;
@@ -118,7 +137,20 @@ final class Http {
             }
             resp.body = readBody(in, resp);
             return resp;
+        } catch (IOException e) {
+            if (canceller != null && canceller.isCancelled()) {
+                throw new java.io.InterruptedIOException("cancelled");
+            }
+            if (raw.isClosed() && deadline.isDone()) {
+                throw new java.net.SocketTimeoutException("the server did not answer within "
+                        + requestDeadlineMs / 1000.0 + "s");
+            }
+            throw e;
         } finally {
+            deadline.cancel(false);
+            if (canceller != null) {
+                canceller.remove(raw);
+            }
             if (!keep) {
                 try {
                     raw.close();

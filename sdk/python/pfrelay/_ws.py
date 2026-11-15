@@ -122,6 +122,7 @@ class WebSocket:
         self._waiting = False  # a read from the socket is in progress
         self._keepalive: Optional[asyncio.Task] = None
         self.timed_out = False  # the watchdog found the link silent
+        self._abort_timer_set = False
 
     # ---------------------------------------------------------- sending
 
@@ -256,11 +257,17 @@ class WebSocket:
             pass
 
     def close_transport(self) -> None:
-        """Close the connection after what is buffered has gone out."""
+        """Close the connection after what is buffered has gone out, and cut
+        it if that takes longer than CLOSE_TIMEOUT: a peer that stopped
+        reading, or a TLS shutdown that never ends (Python 3.10 has no
+        timeout of its own for it), must not hold the socket."""
         try:
             self.writer.close()
         except Exception:  # pragma: no cover
             pass
+        if not self._abort_timer_set:
+            self._abort_timer_set = True
+            self._loop.call_later(CLOSE_TIMEOUT, self.abort)
 
 
 # ---------------------------------------------------------------- HTTP

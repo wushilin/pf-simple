@@ -68,6 +68,14 @@ type Client struct {
 	reg registry // connections and totals
 }
 
+// Close releases what the client keeps between requests: its idle HTTP
+// connections to the server. Listeners, connections and forwarders have
+// their own Close, or end with their context.
+func (c *Client) Close() error {
+	c.http.CloseIdleConnections()
+	return nil
+}
+
 // NewClient checks the relay URL and the word. tlsConfig may be nil.
 func NewClient(base, word string, tlsConfig *tls.Config) (*Client, error) {
 	base, err := normalizeBase(base)
@@ -78,7 +86,10 @@ func NewClient(base, word string, tlsConfig *tls.Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	// Check, Probe and the refusals at accept reuse a connection; one left
+	// idle closes after a while. Watch, which checks every 30 seconds,
+	// keeps reusing it.
+	transport := &http.Transport{TLSClientConfig: tlsConfig, IdleConnTimeout: 90 * time.Second, MaxIdleConnsPerHost: 1}
 	return &Client{
 		base: base, word: word, tls: tlsConfig,
 		http: &http.Client{Timeout: tunnel.HandshakeLimit, Transport: transport},
@@ -890,7 +901,11 @@ type Stdio struct {
 func (s Stdio) Read(p []byte) (int, error)  { return s.In.Read(p) }
 func (s Stdio) Write(p []byte) (int, error) { return s.Out.Write(p) }
 func (s Stdio) CloseWrite() error           { return s.Out.Close() }
-func (s Stdio) Close() error                { return s.In.Close() }
+func (s Stdio) Close() error {
+	err := s.In.Close()
+	_ = s.Out.Close() // may be closed already, by CloseWrite
+	return err
+}
 
 // ---------- certificate trust ----------
 

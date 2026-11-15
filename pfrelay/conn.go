@@ -348,8 +348,15 @@ func (c *Conn) Fail(reason string) {
 // far end sees the connection cut.
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
-		if !c.s.WroteEOF() && !c.failed.Load() {
-			_ = c.s.CloseWrite()
+		// The half-close first, as closing a TCP socket sends its FIN. Not
+		// behind a Write that is stuck on a peer that does not read: then
+		// the close below cuts the connection, and bounds that Write.
+		if !c.s.WroteEOF() && !c.failed.Load() && c.wmu.TryLock() {
+			c.s.Leg().SetTimeouts(tunnel.LinkSilence(), tunnel.WriteTimeout)
+			if c.s.CloseWrite() != nil {
+				c.failed.Store(true)
+			}
+			c.wmu.Unlock()
 		}
 		close(c.done)
 		var err error
@@ -408,6 +415,10 @@ type Listener struct {
 	done   chan struct{}
 	once   sync.Once
 	up     atomic.Bool
+	// mu orders a connection's arrival against Close: once closed, nothing
+	// is put in conns, which Close has emptied.
+	mu     sync.Mutex
+	closed bool
 }
 
 var _ net.Listener = (*Listener)(nil)
@@ -498,12 +509,15 @@ func (l *Listener) open(ctx context.Context, reg *registration, id string, leg *
 	if leg != nil && reg.abandoned(id) {
 		c.abandon(id) // asked for again just as it opened
 	}
-	select {
-	case l.conns <- conn:
-	case <-l.done:
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
 		<-l.slots
 		conn.Fail("the serving side stopped listening")
+		return
 	}
+	l.conns <- conn // never blocks: a slot was taken for it
+	l.mu.Unlock()
 }
 
 // Accept waits for the next connection; it is a *Conn.
@@ -529,6 +543,9 @@ func (l *Listener) Up() bool { return l.up.Load() }
 func (l *Listener) Close() error {
 	l.once.Do(func() {
 		l.cancel()
+		l.mu.Lock()
+		l.closed = true
+		l.mu.Unlock()
 		close(l.done)
 		for {
 			select {

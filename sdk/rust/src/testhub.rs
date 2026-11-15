@@ -3,7 +3,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -43,9 +45,23 @@ where
     F: Fn(Req, DuplexStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    counted_client(handler, configure, Arc::default())
+}
+
+/// `client`, counting in `live` the client's ends of the streams it opened
+/// that are still open.
+pub(crate) fn counted_client<F, Fut>(
+    handler: F,
+    configure: impl FnOnce(ClientBuilder) -> ClientBuilder,
+    live: Arc<AtomicIsize>,
+) -> Client
+where
+    F: Fn(Req, DuplexStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let handler: Handler = Arc::new(move |r, s| Box::pin(handler(r, s)));
     let connector: Connector = Arc::new(move || {
-        let handler = handler.clone();
+        let (handler, live) = (handler.clone(), live.clone());
         Box::pin(async move {
             let (ours, mut theirs) = tokio::io::duplex(1 << 20);
             tokio::spawn(async move {
@@ -53,7 +69,7 @@ where
                     handler(req, theirs).await;
                 }
             });
-            Ok(Box::new(ours) as Stream)
+            Ok(Box::new(Counted::new(ours, live)) as Stream)
         })
     });
     configure(Client::builder("https://127.0.0.1:1/", WORD).connector(connector))
@@ -158,12 +174,13 @@ pub(crate) async fn recv(s: &mut DuplexStream) -> Option<(u8, Vec<u8>)> {
 
 /// The hub's side of a run where the test writes every frame: each request
 /// arrives here, and the test answers it.
-pub(crate) struct Script(tokio::sync::mpsc::UnboundedReceiver<(Req, DuplexStream)>);
+pub(crate) struct Script(tokio::sync::mpsc::UnboundedReceiver<(Req, DuplexStream)>, Arc<AtomicIsize>);
 
 /// A client for `WORD` whose hub is the test itself.
 pub(crate) fn scripted(configure: impl FnOnce(ClientBuilder) -> ClientBuilder) -> (Client, Script) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let c = client(
+    let live = Arc::new(AtomicIsize::new(0));
+    let c = counted_client(
         move |req, s| {
             let tx = tx.clone();
             async move {
@@ -171,11 +188,29 @@ pub(crate) fn scripted(configure: impl FnOnce(ClientBuilder) -> ClientBuilder) -
             }
         },
         configure,
+        live.clone(),
     );
-    (c, Script(rx))
+    (c, Script(rx, live))
 }
 
 impl Script {
+    /// How many of the client's streams are open now.
+    pub(crate) fn live(&self) -> isize {
+        self.1.load(Ordering::SeqCst)
+    }
+
+    /// Waits up to 8 s for `want` open client streams; returns how many
+    /// there are.
+    pub(crate) async fn settle(&self, want: isize) -> isize {
+        for _ in 0..400 {
+            if self.live() == want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.live()
+    }
+
     /// The next request, which must be to `endpoint`.
     pub(crate) async fn next(&mut self, endpoint: &str) -> (Req, DuplexStream) {
         let got = tokio::time::timeout(std::time::Duration::from_secs(10), self.0.recv())
@@ -198,4 +233,38 @@ impl Script {
 pub(crate) async fn hold(mut s: DuplexStream) {
     let mut buf = [0u8; 4096];
     while matches!(s.read(&mut buf).await, Ok(n) if n > 0) {}
+}
+
+/// The client's end of a pipe, counted while it is open.
+struct Counted(DuplexStream, Arc<AtomicIsize>);
+
+impl Counted {
+    fn new(s: DuplexStream, live: Arc<AtomicIsize>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Counted(s, live)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.1.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl tokio::io::AsyncRead for Counted {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Counted {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
 }

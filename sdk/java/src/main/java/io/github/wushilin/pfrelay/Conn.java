@@ -181,6 +181,38 @@ public final class Conn implements Closeable {
         }
     }
 
+    /**
+     * The half-close that close() sends first. It waits at most
+     * CLOSE_TIMEOUT_MS for a writer to let go, and bounds its own write the
+     * same, without beginning to close the leg, which may yet be reused.
+     * Returns false when the link is stalled.
+     */
+    private boolean halfCloseForClose() {
+        try {
+            if (!wlock.tryLock(WebSocket.CLOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                broke(new IOException("the link to the server stalled: a write did not finish in "
+                        + WebSocket.CLOSE_TIMEOUT_MS / 1000 + "s"));
+                return false;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            broke(new java.io.InterruptedIOException("interrupted while closing"));
+            return false;
+        }
+        try {
+            if (wroteEOF.compareAndSet(false, true)) {
+                ws.setWriteTimeout(WebSocket.CLOSE_TIMEOUT_MS);
+                ws.writeFrame(WebSocket.OP_TEXT, EOF_TEXT);
+            }
+            return true;
+        } catch (IOException e) {
+            broke(e);
+            return true; // failed is set: close goes on as for a failure
+        } finally {
+            wlock.unlock();
+        }
+    }
+
     /** Records the first error that broke the connection on this side. */
     private void broke(IOException e) {
         failed.set(true);
@@ -291,12 +323,14 @@ public final class Conn implements Closeable {
         if (!closeOnce.compareAndSet(false, true)) {
             return;
         }
-        if (!wroteEOF.get() && !failed.get()) {
-            try {
-                shutdownOutput();
-            } catch (IOException ignored) {
-                // failed is set
-            }
+        if (!wroteEOF.get() && !failed.get() && !halfCloseForClose()) {
+            // a writer is stuck behind a stalled link: cut it, and every write with it
+            closed = true;
+            pinger.cancel(false);
+            ws.beginClose();
+            ws.abort();
+            client.closed(rec, broke.get());
+            return;
         }
         closed = true;
         pinger.cancel(false);

@@ -14,6 +14,7 @@ import java.util.concurrent.TimeUnit;
 public final class Watcher implements Closeable {
     private final Client client;
     private final CountDownLatch stopped = new CountDownLatch(1);
+    private final Canceller canceller = new Canceller();
     private volatile Boolean up; // null until the first result
     private volatile IOException lastError;
 
@@ -40,6 +41,7 @@ public final class Watcher implements Closeable {
     @Override
     public void close() {
         stopped.countDown();
+        canceller.cancel(); // a check in flight ends now, not when the hub answers
     }
 
     private void run() {
@@ -47,12 +49,15 @@ public final class Watcher implements Closeable {
         long backoff = timing.retryMinMs();
         while (stopped.getCount() > 0) {
             IOException err = null;
+            Canceller.Scope scope = canceller.enter();
             try {
                 client.check();
             } catch (IOException e) {
                 err = e;
             } catch (RuntimeException e) {
                 err = new IOException(e.getMessage(), e);
+            } finally {
+                scope.close();
             }
             if (stopped.getCount() == 0) {
                 return;

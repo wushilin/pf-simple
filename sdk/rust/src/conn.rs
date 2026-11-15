@@ -750,6 +750,11 @@ async fn read_loop(mut frames: Frames, tx: mpsc::Sender<Event>, sh: Arc<Shared>)
         // The hub's valid "idle": the leg goes on, and its reader with it.
         *sh.leg_reader.lock().unwrap() = Some(frames);
         sh.idled.send_replace(true);
+        if *sh.ended.borrow() {
+            // The writer finished meanwhile, and nobody will take the leg:
+            // close its read half here.
+            drop(sh.leg_reader.lock().unwrap().take());
+        }
         return;
     }
     sh.gone.send_replace(true);
@@ -899,9 +904,11 @@ async fn write_loop(
     impl Drop for Exit {
         fn drop(&mut self) {
             let sh = &self.0;
+            // "ended" first: a reader parking the leg after the take below
+            // sees it, and closes the leg itself.
+            sh.ended.send_replace(true);
             self.1.abort();
             drop(sh.leg_reader.lock().unwrap().take());
-            sh.ended.send_replace(true);
             let err = sh.local_error().or_else(|| sh.end_hint.lock().unwrap().take()).or_else(|| sh.err());
             sh.registry.finish(&sh.rec, err);
         }

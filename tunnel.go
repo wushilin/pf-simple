@@ -916,7 +916,9 @@ func (h *tunnelHub) drop(t *relayTunnel, why string) {
 	close(t.done)
 	t.mu.Unlock()
 	h.closePool(t)
-	_ = t.ctl.WriteFrame(wsOpClose, []byte{0x03, 0xE9}) // 1001 going away
+	// Bounded, also behind a write that is stuck: 1001, going away.
+	t.ctl.BeginClose()
+	_ = t.ctl.WriteFrame(wsOpClose, []byte{0x03, 0xE9})
 	_ = t.ctl.Close()
 	for _, c := range waiting {
 		c.fail("the tunnel closed")
@@ -1084,6 +1086,12 @@ func (h *tunnelHub) open(t *relayTunnel, id string) (servedLeg, string) {
 	msg, _ := json.Marshal(tunnel.ControlMessage{Open: c.id})
 	if t.ctl.WriteFrame(wsOpText, msg) == nil {
 		leg, reason, answered = wait(time.Until(deadline))
+	} else {
+		// A serving side that stopped reading its control channel: fail
+		// every write to it from now on, rather than let each connection
+		// wait its turn for the write timeout, and end the tunnel.
+		t.ctl.ExpireWrites()
+		go h.drop(t, "the serving side stopped reading its control channel")
 	}
 	if leg.s != nil {
 		return leg, ""

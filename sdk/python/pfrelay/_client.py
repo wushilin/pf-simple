@@ -39,6 +39,7 @@ from ._proto import (
     AccessDenied,
     ClosedError,
     ConnID,
+    DroppedError,
     Endpoint,
     Feature,
     LinkError,
@@ -387,30 +388,42 @@ class Client:
         through the tunnel, until cancelled. Each one opens its own
         connection through the tunnel; a refused one is closed at once."""
         handlers: set[asyncio.Task] = set()
+        stopping = False
 
         async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            task = asyncio.current_task()
-            if task is not None:
-                handlers.add(task)
             try:
                 await self.connect_one(reader, writer)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 log.info("connection from %s: %s", writer.get_extra_info("peername"), explain(e))
-            finally:
-                if task is not None:
-                    handlers.discard(task)
 
-        server = await asyncio.start_server(handle, sock=sock)
+        def accepted(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            # A plain callback: the task is known from the moment the
+            # connection is, so a stop cancels it even before it has run.
+            if stopping:
+                writer.transport.abort()
+                return
+            t = asyncio.ensure_future(handle(reader, writer))
+            handlers.add(t)
+            t.add_done_callback(handlers.discard)
+
+        server = await asyncio.start_server(accepted, sock=sock)
         try:
-            await server.serve_forever()
+            # Not serve_forever(): cancelled, it waits in wait_closed() for
+            # the open connections, which only the finally below ends.
+            await asyncio.get_running_loop().create_future()
         finally:
+            stopping = True
             server.close()
             for t in list(handlers):
                 t.cancel()
             if handlers:
                 await asyncio.gather(*handlers, return_exceptions=True)
+            try:
+                await asyncio.wait_for(server.wait_closed(), _ws.CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass
 
     # ---------------------------------------------------------- serving
 
@@ -478,7 +491,11 @@ class Client:
                 except BaseException:
                     writer.transport.abort()
                     raise
-            conn = await self._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
+            try:
+                conn = await self._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
+            except BaseException:
+                writer.transport.abort()
+                raise
             if was_bound and sess.abandoned(str(cid)):
                 self._drop(conn, REASON_LEG_LOST)  # asked for again just as it opened
             ended = await bridge(conn, reader, writer, PARTY_SERVE)
@@ -526,7 +543,11 @@ class Client:
     ) -> Conn:
         conn = Conn(ws, cid, side, self, reusable=reusable, finisher=finisher if reusable else None)
         self._reg.add(conn)
-        await emit(self.events.on_open, conn.info())
+        try:
+            await emit(self.events.on_open, conn.info())
+        except BaseException:  # cancelled in an async handler: nobody owns the leg yet
+            conn._kill(ClosedError("cancelled while the connection opened"))
+            raise
         return conn
 
     async def _accept(self, cid: ConnID, sess: "_Session") -> tuple[WebSocket, bool]:
@@ -550,8 +571,10 @@ class Client:
     async def _refuse_leg(self, ws: WebSocket, cid: ConnID, reason: str) -> None:
         """Refuse a connection that arrived on a reused leg, after "bound":
         err:<reason> and a close on that leg (12.7)."""
-        await emit(self.events.on_refuse, cid, reason)
-        await _fail_leg(ws, reason)
+        try:
+            await emit(self.events.on_refuse, cid, reason)
+        finally:
+            await _fail_leg(ws, reason)
 
     async def _conn_closed(self, conn: Conn, err: Optional[BaseException]) -> None:
         if self._reg.finish(conn, err is not None):
@@ -626,10 +649,11 @@ class _Registration:
                 started = time.monotonic()
                 sess = _Session(self, ws.headers)
                 self._on_up(True)
-                await emit(c.events.on_serving, True)
                 try:
+                    await emit(c.events.on_serving, True)
                     err = await self._control(ws, sess)
                 finally:
+                    ws.abort()  # also when cancelled in an async handler
                     sess.end()  # its legs go with it (12.6)
                     self._on_up(False)
                 await emit(c.events.on_serving, False)
@@ -684,13 +708,18 @@ class _Registration:
 
 async def _fail_leg(ws: WebSocket, reason: str) -> None:
     """End a leg the protocol 1 way: err:<reason> and a close."""
+    sent = False
     try:
         await ws.send(OP_TEXT, _ERR_FRAME + _clean_header(reason, 128).encode("ascii"), timeout=_ws.CLOSE_TIMEOUT)
         await ws.send(OP_CLOSE, b"", timeout=_ws.CLOSE_TIMEOUT)
+        sent = True
     except (ConnectionError, OSError):
         pass
     finally:
-        ws.close_transport()
+        if sent:
+            ws.close_transport()
+        else:
+            ws.abort()
 
 
 def known_leg_frame(msg: bytes) -> bool:
@@ -892,6 +921,7 @@ class Listener:
         self._closed = False
         self._registered = asyncio.Event()
         self._done = asyncio.Event()
+        self._wake = asyncio.Event()  # a connection arrived, or serving ended
         self._error: Optional[BaseException] = None
         self._task: Optional[asyncio.Task] = None
         self._reg = _Registration(client, client.target or LISTENER_TARGET, self._open, self._set_up)
@@ -934,6 +964,7 @@ class Listener:
         finally:
             self._up = False
             self._done.set()
+            self._wake.set()
 
     async def _open(self, cid: ConnID, sess: _Session, leg: Optional[WebSocket]) -> None:
         c = self._c
@@ -961,7 +992,11 @@ class Listener:
                 self._slots -= 1
                 log.warning("connection %s failed: cannot bring it to the server: %s", cid.short, explain(e))
                 return
-        conn = await c._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
+        try:
+            conn = await c._new_conn(leg, cid, Side.SERVE, reusable=reusable, finisher=sess.finisher)
+        except BaseException:
+            self._slots -= 1
+            raise
         if was_bound and sess.abandoned(str(cid)):
             c._drop(conn, REASON_LEG_LOST)  # asked for again just as it opened
         if self._closed:
@@ -969,6 +1004,7 @@ class Listener:
             await conn.fail(REASON_STOPPED)
             return
         self._queue.put_nowait(conn)
+        self._wake.set()
 
     async def accept(self) -> Conn:
         """The next connection. Raises ClosedError after close(), or the
@@ -981,19 +1017,10 @@ class Listener:
                 if self._error is not None and not self._closed:
                     raise self._error
                 raise ClosedError("the listener is closed")
-            getter = asyncio.ensure_future(self._queue.get())
-            done_waiter = asyncio.ensure_future(self._done.wait())
-            try:
-                await asyncio.wait({getter, done_waiter}, return_when=asyncio.FIRST_COMPLETED)
-            except BaseException:
-                getter.cancel()
-                done_waiter.cancel()
-                raise
-            done_waiter.cancel()
-            if getter.done() and not getter.cancelled():
-                self._slots -= 1
-                return getter.result()
-            getter.cancel()
+            # One Event, set by an arrival and by the end: a cancelled wait
+            # takes nothing from the queue, so nothing is lost.
+            self._wake.clear()
+            await self._wake.wait()
 
     async def close(self) -> None:
         """Stop serving: the registration ends, and connections not yet
@@ -1009,10 +1036,17 @@ class Listener:
             except BaseException:
                 pass
         self._done.set()
+        self._wake.set()
+        waiting = []
         while not self._queue.empty():
-            conn = self._queue.get_nowait()
+            waiting.append(self._queue.get_nowait())
             self._slots -= 1
-            await conn.fail(REASON_STOPPED)
+        try:
+            for conn in waiting:
+                await conn.fail(REASON_STOPPED)
+        finally:  # cancelled on the way: the rest are cut at once
+            for conn in waiting:
+                conn._kill(DroppedError(REASON_STOPPED))
 
     async def __aenter__(self) -> "Listener":
         return self
