@@ -60,7 +60,7 @@ from ._proto import (
 )
 from ._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT, FrameError, WebSocket
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 DEFAULT_AGENT = f"pfrelay-py {__version__}"
 
 log = logging.getLogger("pfrelay")
