@@ -319,18 +319,27 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// Retry timing; variables so tests can shorten them.
-var (
-	// A failed attempt is retried after retryMin, doubling up to retryMax.
-	retryMin = time.Second
-	retryMax = 30 * time.Second
+// retryTiming is how serving and watching retry.
+type retryTiming struct {
+	// A failed attempt is retried after min, doubling up to max.
+	min, max time.Duration
 	// settled is how long a control channel must have lasted for the next
-	// failure to start again from retryMin. A link that comes up and drops
+	// failure to start again from min. A link that comes up and drops
 	// straight away keeps backing off instead of retrying every second.
-	settled = time.Minute
+	settled time.Duration
 	// A tunnel that is up is checked again this often by Watch.
-	recheck = 30 * time.Second
-)
+	recheck time.Duration
+}
+
+// retry holds the timing in use: atomic, so tests can shorten it while
+// goroutines of earlier tests are still winding down.
+var retry atomic.Pointer[retryTiming]
+
+func init() {
+	retry.Store(&retryTiming{min: time.Second, max: 30 * time.Second, settled: time.Minute, recheck: 30 * time.Second})
+}
+
+func timing() retryTiming { return *retry.Load() }
 
 // Serve offers target to whoever connects with the same word, for ever: it
 // returns only when ctx ends, or when the relay refuses the very first
@@ -414,7 +423,8 @@ func (c *Client) serve(ctx context.Context, target string, open func(reg *regist
 		h.Set(tunnel.HeaderClientHash, hex.EncodeToString(sum[:]))
 	}
 	h.Set(tunnel.HeaderName, url.QueryEscape(c.Name))
-	backoff, served := retryMin, false
+	rt := timing()
+	backoff, served := rt.min, false
 	for attempt := 1; ; attempt++ {
 		ws, err := c.dial(ctx, "serve", h)
 		if ctx.Err() != nil {
@@ -460,15 +470,15 @@ func (c *Client) serve(ctx context.Context, target string, open func(reg *regist
 			if ctx.Err() != nil {
 				return nil
 			}
-			if time.Since(started) >= settled {
-				backoff = retryMin
+			if time.Since(started) >= rt.settled {
+				backoff = rt.min
 			}
 			c.logf("lost the server after %s (%v); its connections are closed; registering again in %s", fmtAge(time.Since(started)), err, backoff)
 		}
 		if !sleep(ctx, backoff) {
 			return nil
 		}
-		backoff = min(backoff*2, retryMax)
+		backoff = min(backoff*2, rt.max)
 	}
 }
 
@@ -480,7 +490,8 @@ func (c *Client) serve(ctx context.Context, target string, open func(reg *regist
 // is up is checked every 30 seconds; one that is down sooner, from 1
 // second doubling to 30.
 func (c *Client) Watch(ctx context.Context) {
-	backoff, up := retryMin, false
+	rt := timing()
+	backoff, up := rt.min, false
 	for first := true; ; first = false {
 		err := c.Check(ctx)
 		if ctx.Err() != nil {
@@ -489,25 +500,25 @@ func (c *Client) Watch(ctx context.Context) {
 		if c.Events.OnTunnel != nil && (first || up != (err == nil)) {
 			c.Events.OnTunnel(err == nil, err)
 		}
-		wait := recheck
+		wait := rt.recheck
 		switch {
 		case err == nil:
 			if !up {
 				c.logf("the tunnel is up")
 			}
-			up, backoff = true, retryMin
+			up, backoff = true, rt.min
 		case errors.As(err, new(*tunnel.ProtoError)):
 			if up || first {
 				c.logf("%v; connections are refused meanwhile, and this keeps checking", err)
 			}
 			up, wait = false, backoff
-			backoff = min(backoff*2, retryMax)
+			backoff = min(backoff*2, rt.max)
 		default:
 			if up || first {
 				c.logf("the tunnel is not available (%v): the word is wrong, nobody is serving it yet, or it asks for a client token that was not given; connections are refused until it is, and this keeps checking", err)
 			}
 			up, wait = false, backoff
-			backoff = min(backoff*2, retryMax)
+			backoff = min(backoff*2, rt.max)
 		}
 		if !sleep(ctx, wait) {
 			return

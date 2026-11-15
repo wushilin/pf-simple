@@ -1066,7 +1066,10 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 			t.Fatalf("the first read gave %v, not the serving side's reason", err)
 		}
 	})
-	only(d.reuse(), "reuse/a failed connection's leg is not reused", func(t *testing.T) {
+	// The leg's fate is the leg's own: a connection that fails on the
+	// connecting side ends the serving leg's generation with the hub's eof,
+	// and the leg is reused (§12.5).
+	only(d.reuse(), "reuse/a connection failed by the connecting side gives its leg back", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.serve(t, echoTarget(t), "--serve-token", testServeToken)
 		c := h.client(t, testWord, "")
@@ -1081,17 +1084,17 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 			t.Fatal(err)
 		}
 		conn.Fail("the application gave up")
-		time.Sleep(300 * time.Millisecond)
-		if w := h.wordSnap(t); len(w.Idle) != 0 {
-			t.Errorf("%d idle legs after a failed connection", len(w.Idle))
-		}
-		conn, err = c.Dial(ctx) // and the tunnel still works
+		waitFor(t, "the leg to become idle", func() bool { return len(h.wordSnap(t).Idle) == 1 })
+		conn, err = c.Dial(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer conn.Close()
 		if err := echoOver(conn, payload[:1000]); err != nil {
 			t.Fatal(err)
+		}
+		if w := h.wordSnap(t); w.Reused != 1 {
+			t.Errorf("%d connections reused, want 1", w.Reused)
 		}
 	})
 

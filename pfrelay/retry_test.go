@@ -16,8 +16,10 @@ import (
 // a control channel has lasted a minute. The test runs the same schedule 50
 // times faster: 20ms doubling to 160ms, starting over after 400ms.
 func TestServeBackoff(t *testing.T) {
-	defer func(a, b, c time.Duration) { retryMin, retryMax, settled = a, b, c }(retryMin, retryMax, settled)
-	retryMin, retryMax, settled = 20*time.Millisecond, 160*time.Millisecond, 400*time.Millisecond
+	rt := timing()
+	rt.min, rt.max, rt.settled = 20*time.Millisecond, 160*time.Millisecond, 400*time.Millisecond
+	setTiming(t, rt)
+	settled := rt.settled
 
 	// What the relay does with each registration, in order; after the
 	// script runs out it holds the channel open.
@@ -127,8 +129,9 @@ func TestServeFirstRefusalIsFinal(t *testing.T) {
 // Watch says when the tunnel comes up and when it goes away, and nothing in
 // between.
 func TestWatch(t *testing.T) {
-	defer func(a, b, c time.Duration) { retryMin, retryMax, recheck = a, b, c }(retryMin, retryMax, recheck)
-	retryMin, retryMax, recheck = 10*time.Millisecond, 40*time.Millisecond, 10*time.Millisecond
+	rt := timing()
+	rt.min, rt.max, rt.recheck = 10*time.Millisecond, 40*time.Millisecond, 10*time.Millisecond
+	setTiming(t, rt)
 
 	var mu sync.Mutex
 	up := false
@@ -184,4 +187,10 @@ func TestWatch(t *testing.T) {
 	expect("not available")
 	set(true)
 	expect("is up")
+}
+
+// setTiming puts rt in use for the rest of the test.
+func setTiming(t *testing.T, rt retryTiming) {
+	old := retry.Swap(&rt)
+	t.Cleanup(func() { retry.Store(old) })
 }

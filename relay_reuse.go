@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -23,8 +25,9 @@ import (
 //
 // A serving side that registered with protocol 2 gets a secret, its
 // session. An accept that brings the session back, also on protocol 2, is
-// offered reuse. When the connection on an offered leg ends cleanly, the
-// hub says "idle"; a client that answers "idle" keeps the leg, which waits
+// offered reuse. When the connection on an offered leg is over, however it
+// ended, and the leg is healthy, the hub finishes the leg's generation (both
+// eofs) and says "idle"; a client that answers "idle" keeps the leg, which waits
 // in its tunnel's pool. The tunnel's next connection is handed to the leg
 // that became idle last, with "bind <id>", answered by "bound <id>"; without
 // that answer in time the hub falls back to the open message of protocol 1.
@@ -199,8 +202,14 @@ func (t *relayTunnel) newLeg(addr string) *relayLeg {
 
 // reusableUpstream is the serving side's leg of a connection whose leg was
 // offered reuse. servePipe closes it when the connection is over; then,
-// instead of closing at once, it decides whether the connection finished
-// cleanly and, if so, offers the leg back (§12.5).
+// instead of closing at once, it ends the leg's generation and offers the
+// leg back (§12.5).
+//
+// The leg's fate depends on the leg alone, not on how the connection
+// ended: a connecting side that was cut or stopped, or a connection that
+// fell idle half-closed, leaves a healthy serving leg, which is finished
+// with the hub's eof and reused. Only a broken serving link, the serving
+// side's own failure, or the tunnel ending close it.
 type reusableUpstream struct {
 	*tunnel.Stream
 	h      *tunnelHub
@@ -209,6 +218,14 @@ type reusableUpstream struct {
 	client *tunnel.Stream // the connecting side's leg of the same connection
 	pipeID uint64         // the connection's pipe, for the flow log
 	once   sync.Once
+
+	// over is set when the connection is over. From then on the pipe's
+	// copies neither read the leg nor write to it: finish has it to itself.
+	// rmu and wmu are held across each Read and Write, so finish knows when
+	// a copy that was already inside one is out.
+	over atomic.Bool
+	rmu  sync.Mutex
+	wmu  sync.Mutex
 }
 
 // Read passes a failure the serving side reports on to the connecting side
@@ -217,9 +234,14 @@ type reusableUpstream struct {
 // answers "bound" before it dials its target, so it is often the only way
 // the connecting side hears why.
 func (u *reusableUpstream) Read(p []byte) (int, error) {
+	u.rmu.Lock()
+	defer u.rmu.Unlock()
+	if u.over.Load() {
+		return 0, io.EOF // the connection is over; finish reads the leg now
+	}
 	n, err := u.Stream.Read(p)
 	var remote *tunnel.RemoteError
-	if errors.As(err, &remote) {
+	if errors.As(err, &remote) && !u.over.Load() {
 		reason := cleanHeader(remote.Reason) // as for X-PF-Tunnel-Error (§12.7)
 		// Nothing came from the serving side yet: it refused the connection
 		// after taking it, which counts as a failure, like a refusal at
@@ -233,45 +255,91 @@ func (u *reusableUpstream) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// Close decides at once whether the connection finished cleanly, while
-// both legs are as the pipe left them: servePipe closes the connecting leg
-// right after this. The rest, which waits on the client, goes on its own.
+// Write is the pipe's copy toward the serving side; it stops once the
+// connection is over, so nothing of it can follow the hub's eof.
+func (u *reusableUpstream) Write(p []byte) (int, error) {
+	u.wmu.Lock()
+	defer u.wmu.Unlock()
+	if u.over.Load() {
+		return 0, net.ErrClosed
+	}
+	return u.Stream.Write(p)
+}
+
+// Close ends the connection on this leg and, unless the leg itself is
+// unusable, finishes its generation and offers it back. What it decides
+// from, it reads at once, while both legs are as the pipe left them:
+// servePipe closes the connecting leg right after this.
 func (u *reusableUpstream) Close() error {
 	u.once.Do(func() {
-		// An interrupted pipe (a reset, the tunnel ending) is never clean,
-		// whichever of its legs closes first.
+		u.over.Store(true)
+		// An interrupted pipe (a reset, the tunnel ending) closes its legs.
 		interrupted := false
 		if pp := pipes.get(u.pipeID); pp != nil {
 			interrupted = pp.interrupted.Load()
 		}
-		clean := !interrupted && u.Stream.Clean() && u.client.Clean()
-		go u.finish(clean)
+		go u.finish(!interrupted && u.legHealthy())
 	})
 	return nil
 }
 
-func (u *reusableUpstream) finish(clean bool) {
+// legHealthy reports whether the serving leg can carry another
+// connection, whatever became of this one: its link has not failed either
+// way (a failed write may have left part of a frame on it), and the
+// serving side did not fail the connection itself (it closes the leg after
+// its err:).
+func (u *reusableUpstream) legHealthy() bool {
 	s := u.Stream
-	if !clean {
-		if s.HalfClosed() && s.WroteEOF() {
-			// Both half-closes went by on this leg, but the connection
-			// failed elsewhere: say so, rather than finish it as clean.
-			reason := ""
-			if s.CloseReason != nil {
-				reason = s.CloseReason()
-			}
-			if reason == "" {
-				reason = "the connection failed on the connecting side"
-			}
-			s.Fail(reason)
-			return
-		}
+	return s.Failure() == nil && !s.WriteFailed() && s.GoneReason() == ""
+}
+
+// generationWait is how long the hub waits, after its own eof, for the
+// serving side's: its target has been half-closed and normally closes at
+// once. A variable so tests can shorten it.
+var generationWait = 3 * time.Second
+
+func (u *reusableUpstream) finish(healthy bool) {
+	s := u.Stream
+	if !healthy {
 		_ = s.Close()
 		return
 	}
 	// Bounded like any control write: a serving side that stopped reading
 	// must not hold this goroutine and its socket (§12.5).
 	s.Leg().SetTimeouts(tunnel.LinkSilence(), tunnel.WriteTimeout)
+	// Everything below happens within generationWait, or the leg closes:
+	// closing it also wakes a copy still waiting inside Read or Write.
+	watchdog := time.AfterFunc(generationWait, func() { _ = s.Close() })
+	ended := func() bool {
+		// 1. The hub's direction: its eof, unless the pipe sent it already.
+		// A copy still inside Write finishes first, so no data follows it.
+		u.wmu.Lock()
+		err := s.CloseWrite()
+		u.wmu.Unlock()
+		if err != nil {
+			return false
+		}
+		// 2. The serving side's direction: whatever it still sends belongs
+		// to the connection that is over, and is dropped, up to its eof.
+		u.rmu.Lock()
+		defer u.rmu.Unlock()
+		if !s.HalfClosed() {
+			buf := make([]byte, 32<<10)
+			for {
+				if _, err := s.Read(buf); err != nil {
+					if err != io.EOF {
+						return false
+					}
+					break
+				}
+			}
+		}
+		return s.HalfClosed() && s.WroteEOF() && u.legHealthy()
+	}()
+	if !watchdog.Stop() || !ended {
+		_ = s.Close()
+		return
+	}
 	if s.SendIdle() != nil {
 		_ = s.Close()
 		return

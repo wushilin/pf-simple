@@ -254,7 +254,10 @@ func TestRelayBrokenConnections(t *testing.T) {
 			brk:  func(e *brokenEnv) { e.stopServe() }},
 		// 7. The target.
 		{name: "the target closes the connection", why: [2]string{"the target closed its end, and the connection was idle for 30s", "the target closed its end, the application kept its own open, and the connection was idle for 30s"}, limit: idle, targetGone: true,
-			brk: func(e *brokenEnv) { e.target.Close() }},
+			// Under protocol 2 the hub reuses the serving leg: it ends the
+			// leg's generation with its eof, not the reason (§12.5).
+			why2: &[2]string{"the target closed its end, and the connection was idle for 30s", "the target closed the connection"},
+			brk:  func(e *brokenEnv) { e.target.Close() }},
 		{name: "the target resets the connection", why: [2]string{"the target reset its connection to pf-client serve", "the target reset its connection to pf-client serve"}, limit: idle, prompt: []string{serve}, targetGone: true,
 			brk: func(e *brokenEnv) { reset(e.target) }},
 	}

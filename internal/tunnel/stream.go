@@ -406,6 +406,10 @@ func LinkSilence() time.Duration { return linkSilence }
 // passed does. The stream cannot be written to again.
 func (s *Stream) ExpireWrites() { s.c.ExpireWrites() }
 
+// WriteFailed reports whether a Write failed: the link may hold part of a
+// frame, so nothing more can be sent on it.
+func (s *Stream) WriteFailed() bool { return s.wfail.Load() }
+
 // WroteEOF reports whether this end has half-closed.
 func (s *Stream) WroteEOF() bool { return s.wroteEOF.Load() }
 
