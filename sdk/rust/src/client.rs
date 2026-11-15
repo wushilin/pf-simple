@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::events::{ConnId, Events};
 use crate::http::{self, Answer, Connector, Head, Upgraded};
 use crate::proto::{self, Endpoint, ProtoLimit};
+use crate::transport::{Params, Transport};
 use crate::values::{self, Base};
 
 /// What a [`Client`] calls itself in the hub's log and console unless told
@@ -117,9 +118,19 @@ pub struct ClientBuilder {
     max_proto: ProtoLimit,
     no_reuse: bool,
     max_idle_legs: usize,
+    transport: Option<Arc<dyn Transport>>,
 }
 
 impl ClientBuilder {
+    /// Reaches the hub through `transport` instead of WebSocket: for SDKs
+    /// built on this one, such as `pfrelay-quic` (see [`crate::transport`]).
+    /// Everything else stays the same. Reuse of accept legs, which is
+    /// WebSocket only, is then off.
+    pub fn transport(mut self, transport: Arc<dyn Transport>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
     /// A serve token of the hub, for [`Client::listen`] and
     /// [`Client::probe`]. Without one, a registration is anonymous, which
     /// the hub must allow (and which needs protocol 1).
@@ -264,9 +275,10 @@ impl ClientBuilder {
                 agent: self.agent.unwrap_or_else(|| DEFAULT_AGENT.into()),
                 registry: Arc::new(Registry::new(self.events)),
                 max_proto: self.max_proto,
-                reuse: !self.no_reuse && self.max_proto.max() >= 2,
+                reuse: !self.no_reuse && self.max_proto.max() >= 2 && self.transport.is_none(),
                 max_idle_legs: if self.max_idle_legs == 0 { DEFAULT_MAX_IDLE_LEGS } else { self.max_idle_legs },
                 log: self.log,
+                transport: self.transport,
             }),
         })
     }
@@ -334,6 +346,14 @@ pub(crate) struct Inner {
     /// This client takes part in reusing legs (protocol 2).
     pub(crate) reuse: bool,
     pub(crate) max_idle_legs: usize,
+    /// Another way to the hub than WebSocket, if one is attached.
+    pub(crate) transport: Option<Arc<dyn Transport>>,
+}
+
+impl Inner {
+    pub(crate) fn connector(&self) -> &Connector {
+        &self.connector
+    }
 }
 
 /// Talks to one relay hub about one tunnel (one word). It can serve the
@@ -371,6 +391,7 @@ impl Client {
             max_proto: ProtoLimit::Newest,
             no_reuse: false,
             max_idle_legs: DEFAULT_MAX_IDLE_LEGS,
+            transport: None,
         }
     }
 
@@ -436,6 +457,16 @@ impl Client {
             };
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// What this client calls itself in `X-PF-Version`.
+    pub(crate) fn agent(&self) -> &str {
+        &self.inner.agent
+    }
+
+    /// The attached transport, and what it needs of this client.
+    pub(crate) fn alt(&self) -> Option<(&Arc<dyn Transport>, Params)> {
+        self.inner.transport.as_ref().map(|t| (t, Params::new(self)))
     }
 
     pub(crate) fn log(&self, msg: &str) {
@@ -546,6 +577,10 @@ impl Client {
     /// cannot be reached, or cannot reach its target, the first read fails
     /// with an [`Error::Remote`] saying so.
     pub async fn dial(&self) -> Result<Conn> {
+        if let Some((t, p)) = self.alt() {
+            let (stream, id) = t.connect(p).await?;
+            return Ok(Conn::start_framed(stream, &id, Side::Connect, self.inner.registry.clone()));
+        }
         let up = self.upgrade(Endpoint::Connect, self.connect_headers()).await?;
         let id = up.head.get(H_CONN).unwrap_or_default().to_string();
         Ok(Conn::start(up, &id, Side::Connect, self.inner.registry.clone(), None))
@@ -554,6 +589,9 @@ impl Client {
     /// Asks the hub whether someone serves this word (and whether the
     /// client token, if the tunnel needs one, is right).
     pub async fn check(&self) -> Result<()> {
+        if let Some((t, p)) = self.alt() {
+            return t.check(p).await;
+        }
         self.get(Endpoint::Check, self.connect_headers()).await.map(|_| ())
     }
 

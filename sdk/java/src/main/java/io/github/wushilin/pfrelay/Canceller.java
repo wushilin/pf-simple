@@ -16,6 +16,7 @@ final class Canceller {
     private static final ThreadLocal<Canceller> CURRENT = new ThreadLocal<>();
 
     private final Set<Socket> inflight = ConcurrentHashMap.newKeySet();
+    private final Set<Runnable> hooks = ConcurrentHashMap.newKeySet(); // requests of another transport (Transport)
     private volatile boolean cancelled;
 
     /** Makes this the current thread's canceller until the returned scope is closed. */
@@ -46,6 +47,15 @@ final class Canceller {
         return true;
     }
 
+    /** Runs cancel when this is cancelled, at once if it was; closing the result forgets it. */
+    AutoCloseable hook(Runnable cancel) {
+        hooks.add(cancel);
+        if (cancelled && hooks.remove(cancel)) {
+            cancel.run();
+        }
+        return () -> hooks.remove(cancel);
+    }
+
     void remove(Socket s) {
         inflight.remove(s);
     }
@@ -57,6 +67,15 @@ final class Canceller {
             close(s);
         }
         inflight.clear();
+        for (Runnable r : hooks) {
+            if (hooks.remove(r)) {
+                try {
+                    r.run();
+                } catch (RuntimeException ignored) {
+                    // cut anyway
+                }
+            }
+        }
     }
 
     boolean isCancelled() {

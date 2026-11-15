@@ -987,12 +987,14 @@ func TestRelayTenants(t *testing.T) {
 }
 
 func TestClientVersionMatches(t *testing.T) {
-	src, err := os.ReadFile("cmd/pf-client/version.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(src), `"`+version+`"`) {
-		t.Fatalf("cmd/pf-client/version.go does not carry version %s", version)
+	for _, f := range []string{"cmd/pf-client/version.go", "cmd/pf-client-quic/version.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), `"`+version+`"`) {
+			t.Errorf("%s does not carry version %s", f, version)
+		}
 	}
 }
 

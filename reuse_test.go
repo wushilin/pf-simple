@@ -563,7 +563,9 @@ func TestReuseIdleLimitAndTakeover(t *testing.T) {
 	if w.Idle[0].Leg != 3 {
 		t.Errorf("kept leg %d, want the newest, 3", w.Idle[0].Leg)
 	}
-	waitFor(t, "the kept leg to show as kept", func() bool { return f.wordSnap(t).Idle[0].Kept })
+	if il := w.Idle[0]; !il.Kept || il.ClosesAt != 0 {
+		t.Errorf("the newest leg: kept %v, closes at %d; want kept by min idle", il.Kept, il.ClosesAt)
+	}
 
 	// Another registration takes the word over: the old pool goes.
 	f.fakeServe(t)
@@ -630,6 +632,150 @@ func TestReuseCapsAndSwitch(t *testing.T) {
 			t.Error("the console shows reuse on")
 		}
 	})
+}
+
+// A leg min idle keeps shows as kept from the start. Once a newer leg pushes
+// it out of min idle past the idle limit, it closes at once; one that is
+// pushed out before the limit shows when it will close.
+func TestReuseMinIdleHandsOver(t *testing.T) {
+	f := newRelayFixture(t, "")
+	f.hub.mu.Lock()
+	f.hub.reuse.IdleSec, f.hub.reuse.MinIdle, f.hub.reuse.MaxIdle = 3, 1, 4
+	f.hub.mu.Unlock()
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	var conns []*pfrelay.Conn
+	var legs []*tunnel.Conn
+	for i := 0; i < 3; i++ {
+		conns = append(conns, dialEcho(t, c))
+		legs = append(legs, fs.accept(fs.nextOpen(), fs.session))
+	}
+	idle := func(i int) {
+		t.Helper()
+		verdict := make(chan string, 1)
+		go func() { verdict <- echoLeg(t, legs[i]) }()
+		if got := readAll(t, conns[i]); got != "hello" {
+			t.Fatalf("read %q", got)
+		}
+		conns[i].Close()
+		if v := <-verdict; v != tunnel.MsgIdle {
+			t.Fatalf("verdict %q", v)
+		}
+		_ = legs[i].WriteFrame(tunnel.OpText, []byte(tunnel.MsgIdle))
+		waitFor(t, "the leg in the pool", func() bool {
+			for _, il := range f.wordSnap(t).Idle {
+				if il.Leg == i+1 {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	legsIdle := func() []idleSnapshot { return f.wordSnap(t).Idle }
+
+	idle(0)
+	if p := legsIdle(); len(p) != 1 || !p[0].Kept || p[0].ClosesAt != 0 {
+		t.Fatalf("the only idle leg: %+v; want kept by min idle", p)
+	}
+	time.Sleep(3300 * time.Millisecond) // past the idle limit
+	if p := legsIdle(); len(p) != 1 || !p[0].Kept {
+		t.Fatalf("past the idle limit: %+v; want leg 1 kept", p)
+	}
+
+	// Leg 1 leaves the pool in the same step that leg 2 enters it.
+	idle(1)
+	if p := legsIdle(); len(p) != 1 || p[0].Leg != 2 {
+		t.Fatalf("pool %+v once leg 2 is in it; want leg 1 gone at once", p)
+	}
+
+	idle(2)
+	p := legsIdle()
+	if len(p) != 2 || p[0].Leg != 2 || p[1].Leg != 3 {
+		t.Fatalf("pool %+v, want legs 2 and 3", p)
+	}
+	if p[0].Kept || p[0].ClosesAt != p[0].Since+3000 {
+		t.Errorf("leg 2: kept %v, closes at %d; want closing at %d", p[0].Kept, p[0].ClosesAt, p[0].Since+3000)
+	}
+	if !p[1].Kept || p[1].ClosesAt != 0 {
+		t.Errorf("leg 3: kept %v, closes at %d; want kept", p[1].Kept, p[1].ClosesAt)
+	}
+	waitFor(t, "leg 2 to reach the idle limit", func() bool { p := legsIdle(); return len(p) == 1 && p[0].Leg == 3 })
+
+	// The word's own limits reach the legs already in the pool: with no min
+	// idle, leg 3, past the limit, closes as soon as they are set.
+	time.Sleep(time.Until(time.UnixMilli(legsIdle()[0].Since).Add(3300 * time.Millisecond)))
+	three, zero := 3, 0
+	if err := f.hub.setWordReuse(f.wordSnap(t).ID, &wordReuse{IdleSec: &three, MinIdle: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	if p := legsIdle(); len(p) != 0 {
+		t.Errorf("pool %+v after min idle went to 0; want leg 3 closed at once", p)
+	}
+}
+
+// A word's own idle limit reaches a leg already idle, one that has not yet
+// reached the limit it had when it went into the pool.
+func TestReuseWordIdleLimitReachesPooledLegs(t *testing.T) {
+	f := newRelayFixture(t, "")
+	f.hub.mu.Lock()
+	f.hub.reuse.IdleSec, f.hub.reuse.MinIdle, f.hub.reuse.MaxIdle = 60, 0, 4
+	f.hub.mu.Unlock()
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	conn := dialEcho(t, c)
+	leg := fs.accept(fs.nextOpen(), fs.session)
+	verdict := make(chan string, 1)
+	go func() { verdict <- echoLeg(t, leg) }()
+	if got := readAll(t, conn); got != "hello" {
+		t.Fatalf("read %q", got)
+	}
+	conn.Close()
+	if v := <-verdict; v != tunnel.MsgIdle {
+		t.Fatalf("verdict %q", v)
+	}
+	_ = leg.WriteFrame(tunnel.OpText, []byte(tunnel.MsgIdle))
+	waitFor(t, "the leg in the pool", func() bool { return len(f.wordSnap(t).Idle) == 1 })
+
+	three, zero := 3, 0
+	if err := f.hub.setWordReuse(f.wordSnap(t).ID, &wordReuse{IdleSec: &three, MinIdle: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	if p := f.wordSnap(t).Idle; len(p) != 1 || p[0].ClosesAt != p[0].Since+3000 {
+		t.Fatalf("pool %+v; want the leg closing 3s after it went idle", p)
+	}
+	waitFor(t, "the leg to reach the word's idle limit", func() bool { return len(f.wordSnap(t).Idle) == 0 })
+}
+
+// With min idle equal to max idle, a full pool of legs past the limit still
+// takes a new leg: the oldest makes way for it.
+func TestReuseFullKeptPoolTakesANewLeg(t *testing.T) {
+	f := newRelayFixture(t, "")
+	f.hub.mu.Lock()
+	f.hub.reuse.IdleSec, f.hub.reuse.MinIdle, f.hub.reuse.MaxIdle = 1, 1, 1
+	f.hub.mu.Unlock()
+	fs := f.fakeServe(t)
+	c := f.client(t, testWord, "")
+	conns := []*pfrelay.Conn{dialEcho(t, c), dialEcho(t, c)}
+	legs := []*tunnel.Conn{fs.accept(fs.nextOpen(), fs.session), fs.accept(fs.nextOpen(), fs.session)}
+	for i := range legs {
+		if i == 1 {
+			time.Sleep(1300 * time.Millisecond) // leg 1 past the idle limit, kept
+		}
+		verdict := make(chan string, 1)
+		go func() { verdict <- echoLeg(t, legs[i]) }()
+		if got := readAll(t, conns[i]); got != "hello" {
+			t.Fatalf("read %q", got)
+		}
+		conns[i].Close()
+		if v := <-verdict; v != tunnel.MsgIdle {
+			t.Fatalf("verdict %q", v)
+		}
+		_ = legs[i].WriteFrame(tunnel.OpText, []byte(tunnel.MsgIdle))
+		waitFor(t, "the leg in the pool", func() bool {
+			p := f.wordSnap(t).Idle
+			return len(p) == 1 && p[0].Leg == i+1
+		})
+	}
 }
 
 // The limits on reuse are kept in [tunnel.reuse], changed in the console,

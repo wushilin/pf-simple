@@ -99,6 +99,12 @@ type Stream struct {
 	// stream is cut rather than finished cleanly; what it returns is sent
 	// to the far end as the reason, so that end's log can say what broke.
 	CloseReason func() string
+	// Failed, if set before the stream is used, is asked when the stream
+	// is closed after both half-closes: a reason it returns turns that
+	// finish into a failure with that reason. The hub sets it to the
+	// other leg's failure, which may come after both half-closes on this
+	// leg (docs/PROTOCOL.md §8.3).
+	Failed func() string
 }
 
 // NewStream takes over c. The pings come from their own timer rather than
@@ -355,7 +361,17 @@ func (s *Stream) Close() error {
 		s.closed.Store(true)
 		close(s.done)
 		s.c.BeginClose()
-		if s.readEOF.Load() && s.wroteEOF.Load() {
+		// After both half-closes the stream would finish cleanly; Failed
+		// can still turn that into a failure. Any other close is a cut,
+		// and CloseReason says why, as before.
+		failed := ""
+		if s.Failed != nil && s.readEOF.Load() && s.wroteEOF.Load() {
+			failed = s.Failed()
+		}
+		if failed != "" {
+			_ = s.c.WriteFrame(OpText, []byte(msgErrPrefix+failed))
+			_ = s.c.WriteFrame(OpClose, nil)
+		} else if s.readEOF.Load() && s.wroteEOF.Load() {
 			if s.c.WriteFrame(OpClose, nil) == nil {
 				t := time.NewTimer(closeTimeout)
 				select {

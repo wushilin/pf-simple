@@ -355,20 +355,80 @@ func (u *reusableUpstream) finish(healthy bool) {
 // a cap is full, or the registration it belongs to has ended.
 func (h *tunnelHub) park(t *relayTunnel, conn *tunnel.Conn, leg *relayLeg) {
 	rs := h.reuseFor(t)
-	il := &idleLeg{leg: leg, conn: conn, since: time.Now(), bound: make(chan struct{}, 1), dead: make(chan struct{})}
+	il := &idleLeg{leg: leg, conn: conn, bound: make(chan struct{}, 1), dead: make(chan struct{})}
 	t.mu.Lock()
-	if t.closed || !rs.Enabled || len(t.pool) >= rs.MaxIdle || !h.slots.take(t.owner, rs) {
+	if t.closed || !rs.Enabled {
 		t.mu.Unlock()
 		_ = conn.Close()
 		return
 	}
-	t.pool = append(t.pool, il)
+	il.since = time.Now()
+	// A leg min idle kept past the limit is no longer kept once enough newer
+	// legs are idle: it closes now, not at some later timer, and makes way
+	// for the new leg before the limits are checked. Nothing changes unless
+	// the new leg goes in.
+	pool, gone := unkept(append(t.pool[:len(t.pool):len(t.pool)], il), rs)
+	// The new leg takes over the slot of a leg it pushed out, or a new one.
+	if len(pool) > rs.MaxIdle || (len(gone) == 0 && !h.slots.take(t.owner, rs)) {
+		t.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	for range gone[min(1, len(gone)):] {
+		h.slots.release(t.owner)
+	}
+	t.pool = pool
+	for _, x := range gone {
+		x.timer.Stop()
+	}
 	il.timer = time.AfterFunc(time.Duration(rs.IdleSec)*time.Second, func() { h.expire(t, il) })
 	conn.SetTimeouts(tunnel.LinkSilence(), tunnel.WriteTimeout)
 	il.stopPing = conn.KeepAlive(tunnel.PingEvery())
 	t.mu.Unlock()
 	go h.readIdle(t, il)
+	for _, x := range gone {
+		_ = x.conn.Close() // the reader ends
+	}
 	changes.notify()
+}
+
+// keptLocked says whether min idle keeps the leg at index i of t's pool:
+// fewer than MinIdle legs became idle after it. Only a new leg in the pool,
+// or a lower min idle, can end that; taking or losing a leg cannot.
+func keptLocked(t *relayTunnel, rs reuseSettings, i int) bool {
+	return kept(len(t.pool), rs, i)
+}
+
+// kept says whether min idle keeps the leg at index i of a pool of n.
+func kept(n int, rs reuseSettings, i int) bool {
+	return rs.Enabled && n-1-i < rs.MinIdle
+}
+
+// unkept splits pool into the legs that stay and those past the idle limit
+// that min idle does not keep. It changes nothing: the caller puts the
+// legs that stay in the pool, and settles their slots and timers.
+func unkept(pool []*idleLeg, rs reuseSettings) (stay, gone []*idleLeg) {
+	limit := time.Duration(rs.IdleSec) * time.Second
+	for i, il := range pool {
+		if !kept(len(pool), rs, i) && time.Since(il.since) >= limit {
+			gone = append(gone, il)
+		} else {
+			stay = append(stay, il)
+		}
+	}
+	return stay, gone
+}
+
+// unkeepLocked takes out of t's pool the legs past the idle limit that min
+// idle no longer keeps, and returns them for the caller to close.
+func (h *tunnelHub) unkeepLocked(t *relayTunnel, rs reuseSettings) []*idleLeg {
+	stay, gone := unkept(t.pool, rs)
+	for _, il := range gone {
+		il.timer.Stop()
+		h.slots.release(t.owner)
+	}
+	t.pool = stay
+	return gone
 }
 
 // readIdle reads an idle leg until it is bound, or ends.
@@ -412,8 +472,8 @@ func (h *tunnelHub) unpool(t *relayTunnel, il *idleLeg) bool {
 	return false
 }
 
-// expire closes an idle leg past the idle limit, unless it is one of the
-// MinIdle that became idle last.
+// expire closes an idle leg that reached the idle limit, unless it is one
+// of the MinIdle that became idle last.
 func (h *tunnelHub) expire(t *relayTunnel, il *idleLeg) {
 	rs := h.reuseFor(t)
 	t.mu.Lock()
@@ -421,8 +481,17 @@ func (h *tunnelHub) expire(t *relayTunnel, il *idleLeg) {
 		if x != il {
 			continue
 		}
-		if newer := len(t.pool) - 1 - i; rs.Enabled && newer < rs.MinIdle {
-			il.timer.Reset(time.Duration(rs.IdleSec) * time.Second)
+		limit := time.Duration(rs.IdleSec) * time.Second
+		if left := limit - time.Since(il.since); left > 0 {
+			il.timer.Reset(left) // the limit was raised before retime came
+			t.mu.Unlock()
+			return
+		}
+		if keptLocked(t, rs, i) {
+			// Park and the settings close a kept leg once it is no longer
+			// kept. This timer is only for a change of settings that raced
+			// with them.
+			il.timer.Reset(limit)
 			t.mu.Unlock()
 			return
 		}
@@ -511,9 +580,10 @@ func (h *tunnelHub) closePool(t *relayTunnel) {
 type idleSnapshot struct {
 	Leg       int    `json:"leg"`
 	ServeAddr string `json:"serveAddr"`
-	Since     int64  `json:"since"`   // idle since, unix milliseconds
-	Carried   int    `json:"carried"` // connections it carried
-	Kept      bool   `json:"kept"`    // past the idle limit, kept by min idle
+	Since     int64  `json:"since"`    // idle since, unix milliseconds
+	Carried   int    `json:"carried"`  // connections it carried
+	Kept      bool   `json:"kept"`     // min idle keeps it: the idle limit does not close it
+	ClosesAt  int64  `json:"closesAt"` // when the idle limit closes it, unix milliseconds; 0 when kept
 }
 
 // legNumber is the leg a console request names.
@@ -634,13 +704,15 @@ func (h *tunnelHub) setWordReuse(id int, wr *wordReuse) error {
 	}
 	if t != nil {
 		h.trimPool(t)
+		h.retime(t)
 	}
 	changes.notify()
 	return nil
 }
 
 // trimPool closes the idle legs a tunnel holds beyond its limits now:
-// all of them when reuse is off, the oldest beyond max idle otherwise.
+// all of them when reuse is off, otherwise the oldest beyond max idle and
+// those past the idle limit that min idle no longer keeps.
 func (h *tunnelHub) trimPool(t *relayTunnel) {
 	rs := h.reuseFor(t)
 	keep := rs.MaxIdle
@@ -656,6 +728,7 @@ func (h *tunnelHub) trimPool(t *relayTunnel) {
 		h.slots.release(t.owner)
 		extra = append(extra, il)
 	}
+	extra = append(extra, h.unkeepLocked(t, rs)...)
 	t.mu.Unlock()
 	for _, il := range extra {
 		_ = il.conn.Close()

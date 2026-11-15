@@ -33,6 +33,7 @@ type tunnelSettings struct {
 	anonymous bool         // "pf-client serve" needs no serve token
 	tenants   []tenantSpec // who may run "pf-client serve" here
 	reuse     reuseSettings
+	quic      quicSettings
 }
 
 // tunnelTable is the [tunnel] table; its presence turns the relay hub on,
@@ -48,6 +49,43 @@ type tunnelTable struct {
 	// Reuse is [tunnel.reuse]: reusing the serving side's accept legs
 	// (tunnel protocol 2). Left out, the defaults apply.
 	Reuse *reuseTable `toml:"reuse,omitempty"`
+	// QUIC is [tunnel.quic]: the QUIC listener of tunnel protocol 3. Left
+	// out, it is off.
+	QUIC *quicTable `toml:"quic,omitempty"`
+}
+
+// quicTable is [tunnel.quic]; a key left out keeps its default.
+type quicTable struct {
+	Enabled        bool   `toml:"enabled"`
+	Listen         string `toml:"listen,omitempty"`
+	AdvertiseHost  string `toml:"advertise_host,omitempty"`
+	AdvertisePort  int    `toml:"advertise_port,omitzero"`
+	MaxConnections int    `toml:"max_connections,omitzero"`
+	MaxBufferedMiB int    `toml:"max_buffered_mib,omitzero"`
+}
+
+func (t *quicTable) settings() quicSettings {
+	s := defaultQUIC
+	if t == nil {
+		return s
+	}
+	s.Enabled, s.AdvertiseHost, s.AdvertisePort = t.Enabled, t.AdvertiseHost, t.AdvertisePort
+	if t.Listen != "" {
+		s.Listen = t.Listen
+	}
+	if t.MaxConnections != 0 {
+		s.MaxConnections = t.MaxConnections
+	}
+	if t.MaxBufferedMiB != 0 {
+		s.MaxBufferedMiB = t.MaxBufferedMiB
+	}
+	return s
+}
+
+// quicTableOf is the table that writes s back.
+func quicTableOf(s quicSettings) *quicTable {
+	return &quicTable{Enabled: s.Enabled, Listen: s.Listen, AdvertiseHost: s.AdvertiseHost, AdvertisePort: s.AdvertisePort,
+		MaxConnections: s.MaxConnections, MaxBufferedMiB: s.MaxBufferedMiB}
 }
 
 // reuseTable is [tunnel.reuse]; a key left out keeps its default.
@@ -301,7 +339,11 @@ func loadConfig(path, envPassword string) (settings, error) {
 		if msg := reuse.check(); msg != "" {
 			return settings{}, fmt.Errorf("config %s: [tunnel.reuse]: %s", path, msg)
 		}
-		s.tunnel = &tunnelSettings{enabled: *t.Enabled, anonymous: t.AnonymousServe, tenants: t.Tenants, reuse: reuse}
+		q := t.QUIC.settings()
+		if msg := q.check(); msg != "" {
+			return settings{}, fmt.Errorf("config %s: [tunnel.quic]: %s", path, msg)
+		}
+		s.tunnel = &tunnelSettings{enabled: *t.Enabled, anonymous: t.AnonymousServe, tenants: t.Tenants, reuse: reuse, quic: q}
 		s.tunnelRaw = t
 	}
 	if len(s.forwards) == 0 && s.console == nil {

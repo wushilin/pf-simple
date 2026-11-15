@@ -158,16 +158,18 @@ function relayCard(w) {
   locked.title = "The serving side asks for a client token: connecting needs it as well as the word";
   const reuseChip = el("span", "relay-chip reuse", "Reuse");
   reuseChip.title = "The serving side's connections are reused: when a connection ends cleanly, its connection to the serving side stays open and carries the next one (tunnel protocol 2)";
+  const quicChip = el("span", "relay-chip reuse", "QUIC");
+  quicChip.title = "The serving side reaches the hub over QUIC (tunnel protocol 3): each connection is a new stream on its one QUIC connection, so there are no idle connections to reuse";
   const actions = el("div", "relay-actions");
   const limits = relayButton("Reuse limits", "This word's own limits on idle connections to its serving side");
   const reset = relayButton("Reset", "End this tunnel and its connections; the serving side registers again on its own");
   const clear = relayButton("Clear binding", "Remove the binding of this word to its token, and end its tunnel", true);
   actions.append(limits, reset, clear);
-  head.append(chip, route, locked, reuseChip, title, actions);
+  head.append(chip, route, locked, reuseChip, quicChip, title, actions);
 
   const meta = el("div", "relay-meta");
   const refs = {
-    card, chip, locked, reuseChip, title, arrow, target, reset, clear, sessions: new Map(), idleRows: new Map(),
+    card, chip, locked, reuseChip, quicChip, limits, title, arrow, target, reset, clear, sessions: new Map(), idleRows: new Map(),
     owner: relayFact(meta, "Token"),
     from: relayFact(meta, "Served from"),
     client: relayFact(meta, "By"),
@@ -313,6 +315,10 @@ function paintRelayWord(c, w, now) {
   setText(c.title, w.name || "(unnamed)");
   c.locked.hidden = !(w.live && w.clientToken);
   c.reuseChip.hidden = !(w.live && w.reuse);
+  c.quicChip.hidden = !(w.live && w.transport === "quic");
+  // Over QUIC nothing is pooled, so the word's reuse limits do not apply.
+  c.limits.hidden = w.live && w.transport === "quic";
+  if (c.limits.hidden) c.limitsForm.wrap.hidden = true;
   const idle = w.idle || [];
   c.idle.wrap.hidden = !(w.live && w.reuse);
   setText(c.idle.value, `${idle.length} (min ${w.minIdle} · max ${w.maxIdle} · idle limit ${w.idleSeconds} s)`);
@@ -403,14 +409,18 @@ function paintRelayWord(c, w, now) {
     const next = anchor ? anchor.nextSibling : c.body.firstChild;
     if (next !== r.row) c.body.insertBefore(r.row, next);
     anchor = r.row;
-    setText(r.state, il.kept ? "Idle \u00b7 kept" : "Idle");
-    r.state.title = il.kept ? "Idle past the idle limit, kept by min idle" : "Open and unused, waiting for this tunnel's next connection";
+    const past = now - il.since >= w.idleSeconds * 1000;
+    setText(r.state, il.kept && past ? "Idle \u00b7 kept" : "Idle");
+    r.state.title = il.kept
+      ? (w.minIdle === 1 ? "The most recently idle" : `One of the ${w.minIdle} most recently idle`) +
+        (past ? ", kept open by min idle past the idle limit" : ": min idle keeps it open past the idle limit")
+      : "Open and unused, waiting for this tunnel's next connection";
     setText(r.serve, il.serveAddr);
     setText(r.opened, fmtClock(il.since));
     r.opened.title = "Idle since " + new Date(il.since).toLocaleString();
     setText(r.age, fmtAge(now - il.since));
     setText(r.carried, `${il.carried} carried`);
-    const left = il.since + w.idleSeconds * 1000 - now;
+    const left = il.closesAt - now;
     setText(r.closes, il.kept ? "kept by min idle" : left > 0 ? `closes in ${fmtAge(left)}` : "closing");
   }
   for (const [leg, r] of c.idleRows) {
@@ -613,6 +623,69 @@ function relayPaintSettings(relay) {
   }
   $("relay-reuse-row").hidden = !relay.enabled;
   $("reuse-form").hidden = !reuse.enabled;
+  relayPaintQUIC(relay);
+}
+
+// ---------- settings: the QUIC listener ----------
+
+function quicFromForm(enabled) {
+  return {
+    enabled,
+    listen: $("quic-listen").value.trim(), advertiseHost: $("quic-host").value.trim(),
+    advertisePort: Number($("quic-port").value) || 0,
+    maxConnections: Number($("quic-conns").value), maxBufferedMiB: Number($("quic-buffered").value),
+  };
+}
+
+function saveQUIC(quic, done) {
+  $("quic-save").disabled = $("relay-quic").disabled = true;
+  setText($("quic-error"), "");
+  api("api/relay/settings", { quic }).then(() => { ui.quicDirty = false; toast(done); })
+    .catch((e) => { setText($("quic-error"), e.message); $("relay-quic").checked = !quic.enabled; })
+    .finally(() => { $("quic-save").disabled = $("relay-quic").disabled = false; if (ui.state) relayPaint(ui.state.relay); });
+}
+
+$("relay-quic").addEventListener("change", () => {
+  const on = $("relay-quic").checked;
+  saveQUIC(quicFromForm(on), on ? "The QUIC listener is on" : "The QUIC listener is off; its connections were closed");
+});
+$("quic-form").addEventListener("input", () => { ui.quicDirty = true; });
+$("quic-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  saveQUIC(quicFromForm($("relay-quic").checked), "Saved the QUIC listener's settings");
+});
+$("quic-cert").addEventListener("click", () => {
+  $("quic-cert").disabled = true;
+  api("api/relay/quic/certificate", {}).then(() => toast("Made a new QUIC certificate; clients pick it up at their next connection"))
+    .catch((e) => setText($("quic-error"), e.message))
+    .finally(() => { $("quic-cert").disabled = false; });
+});
+
+function relayPaintQUIC(relay) {
+  const q = relay.quic;
+  $("relay-quic-row").hidden = !relay.enabled || !q;
+  if (!q) return;
+  const box = $("relay-quic");
+  if (!box.disabled || q.fixed) box.checked = !!q.enabled;
+  const ids = ["quic-listen", "quic-host", "quic-port", "quic-conns", "quic-buffered"];
+  for (const id of ids) $(id).disabled = q.fixed;
+  if (q.fixed) box.disabled = true;
+  $("quic-save").hidden = $("quic-cert").hidden = q.fixed;
+  if (!ui.quicDirty && !$("quic-form").contains(document.activeElement)) {
+    [q.listen, q.advertiseHost, q.advertisePort || "", q.maxConnections, q.maxBufferedMiB].forEach((v, i) => { $(ids[i]).value = v ?? ""; });
+  }
+  let state = "";
+  if (q.enabled && q.listening) {
+    state = `Listening on udp ${q.listening}, ${q.connections} connection${q.connections === 1 ? "" : "s"}.`;
+    if (!q.advertiseHost) state += " No advertised host yet: clients cannot find it until one is set.";
+    if (q.fingerprints && q.fingerprints.length) {
+      state += ` Certificate ${q.fingerprints[0].slice(0, 16)}…, valid until ${new Date(q.validUntil).toLocaleDateString()}; renewed when 15 days are left.`;
+    }
+  } else if (q.enabled && q.error) {
+    state = "Not listening: " + q.error;
+  }
+  setText($("relay-quic-state"), state);
+  $("relay-quic-state").hidden = !state;
 }
 
 // ---------- paint ----------

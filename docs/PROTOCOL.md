@@ -3,8 +3,9 @@
 This document defines how a client (`pf-client`, or a program using one of
 the SDKs) talks to the relay hub of `pf-simple`. It is the reference for
 anyone writing a client in another language. It describes what pf-simple
-0.15.0 speaks: protocols 0 and 1 (§1 to §11), and protocol 2, which adds
-reusing the serving side's legs (§12). The conformance suite in
+0.16.0 speaks: over WebSocket, protocols 0 and 1 (§1 to §11) and protocol
+2, which adds reusing the serving side's legs (§12); and over QUIC,
+protocol 3 (§13). The conformance suite in
 [`conformance/`](../conformance/README.md) checks it against the
 implementation.
 
@@ -64,7 +65,8 @@ connections.
   https://host[:port]/pf/api/tunnel/<endpoint>
   ```
 
-  where `<endpoint>` is `serve`, `connect`, `accept`, `check` or `version`.
+  where `<endpoint>` is `serve`, `connect`, `accept`, `check` or `version`,
+  and `quic` for discovering the QUIC listener (§13.2).
   All of them use the `GET` method.
 - Every secret travels in a header, never in the URL, because reverse
   proxies log URLs.
@@ -128,6 +130,7 @@ characters are enough to tell connections apart.
 | `X-PF-Tunnel-Conn` | client | accept | the connection id being answered |
 | `X-PF-Tunnel-Conn` | hub | connect (101) | the id the hub gave this connection |
 | `X-PF-Tunnel-Error` | client | accept | why the serving side cannot carry this connection |
+| `X-PF-Tunnel-Op` | client | quic (discovery) | protocol 3: what the QUIC run is for, `serve` or `connect` (§13.2) |
 
 Header names are case-insensitive, as in HTTP. A request MUST NOT repeat
 any of these headers.
@@ -149,13 +152,16 @@ version both have.
 - **Protocol 2** (pf-simple 0.15.0) adds one optional thing: reusing the
   serving side's accept legs (§12). Nothing depends on it, so a client
   offering `0-2` works with hubs of every age.
+- **Protocol 3** (pf-simple 0.16.0) is the QUIC transport (§13). It is
+  spoken only over QUIC and negotiated there; the WebSocket endpoints
+  stay at 0 to 2.
 
 ### 5.1 What the client offers
 
 In `X-PF-Tunnel-Proto`, the client sends `min-max`, two decimal numbers
 with `0 <= min <= max`. A single number `n` means `n-n`.
 
-- `max` is the highest protocol the client implements. Today that is `1`.
+- `max` is the highest protocol the client implements over WebSocket. Today that is `2`.
 - `min` is the protocol of the newest **feature** this request depends on:
 
   | Feature | Protocol | Requests that depend on it |
@@ -903,3 +909,927 @@ hub's and the client's protocols: 2 with 2, 1 and 0, and 1 and 0 with 2.
 Where both speak 2, it checks that legs are reused, including after a
 connection the connecting side failed. Everywhere else, it checks that
 legs are never reused.
+
+## 13. Protocol 3: the QUIC transport
+
+Protocol 3 lets a client reach the hub over **QUIC** instead of
+WebSockets. The relay is unchanged: the same words, tokens, tenants and
+rules (§3, §6), the same meeting of a serving side and a connecting side.
+Only the transport between a client and the hub is new.
+
+- **Protocol 3 lives in its own SDK, `pfrelay-quic`.** All of it goes
+  there: discovery, the QUIC connection, keepalive, `serve`, `connect` and
+  `check`.
+  - The Go SDK comes first, as a separate package built on quic-go, so
+    pfrelay and pf-client never carry that library.
+  - Python, Rust and Java follow later, each as `pfrelay-quic`.
+  - The conformance suite checks each of them, as it does the WebSocket
+    SDKs (§13.13).
+- **`pf-client-quic` is a thin command line over that SDK,** as pf-client
+  is over pfrelay. Its `serve`, `connect` (including stdio) and `check` are
+  the SDK's, so a program using the SDK behaves exactly like the binary.
+- **The SDK keeps pfrelay's shape.** Its API mirrors pfrelay's: a client
+  made from a hub URL, a word and tokens; `Serve`, `Dial`, `Check`; the
+  same events and errors. Moving a program from WebSocket to QUIC should
+  mean changing the import, little more. The shape is not on the wire, so
+  it belongs to the SDK's own docs, not to this protocol.
+- **Protocol 3 exists only over QUIC.** The WebSocket endpoints speak
+  protocols 0 to 2, unchanged, and know nothing of it (§13.11). A QUIC
+  client and a WebSocket client work together through the hub, which
+  bridges them (§13.9): compatibility is by bridging, not by a shared
+  version range.
+- **Both transports meet at the hub.** A side on QUIC works with a side on
+  WebSockets, in either role (§13.9).
+- **There is no fallback.** If QUIC cannot reach the hub, pf-client-quic
+  says it failed to connect. Where UDP is blocked, use pf-client.
+
+### 13.1 Overview
+
+```
+application --TCP-- pf-client-quic connect ==QUIC==  hub  ==QUIC or WS== serving side --TCP-- target
+```
+
+1. **Discovery.** Over the existing HTTPS endpoint, the client asks the
+   hub where its QUIC listener is and which certificate it uses (§13.2).
+2. **The client opens a QUIC connection to that listener.** It pins the
+   certificate by its fingerprint (§13.3).
+3. **Each request is one bidirectional QUIC stream** (§13.4).
+   - `connect` is one stream per TCP connection, so stdio uses exactly one
+     stream.
+   - `serve` is one stream kept open as the registration. One QUIC
+     connection may hold several registrations.
+   - For each connection to a registration, the hub opens a new stream
+     **to** the serving side. That stream replaces both the open message
+     and the `accept` request.
+4. **On a stream,** the connection's bytes travel in small frames, with
+   `eof` and `err` as in §8 (§13.5).
+
+QUIC streams are cheap, so a connection simply gets a new stream.
+Protocol 2's leg reuse has no counterpart here.
+
+**The discovery endpoint and the QUIC listener are the same hub process.**
+The QUIC listener is not load-balanced away from the HTTPS endpoint, so
+what discovery answers is what the listener does.
+
+### 13.2 Discovery: `quic`
+
+This is a plain `GET https://host[:port]/pf/api/tunnel/quic`, under §2
+and §4. Its certificate is verified normally (§9). That is what makes the
+fingerprints it returns trustworthy.
+
+- **No protocol negotiation.** Discovery is not a WebSocket request and
+  carries no `X-PF-Tunnel-Proto`; the protocol over QUIC is negotiated in
+  each QUIC request (§13.4). The client sends `X-PF-Version` as usual.
+- **What the run is for.** The request MUST carry `X-PF-Tunnel-Op:
+  serve` or `X-PF-Tunnel-Op: connect`. Without it, or with any other value,
+  the answer is 400.
+  - This header is new. It exists only on this endpoint, which only
+    protocol 3 has, so no older peer ever sees it.
+  - A check counts as `connect`.
+- **Credentials** are the ones the run is about to use, so discovery tells
+  nobody more than `check` would:
+
+  | `X-PF-Tunnel-Op` | Headers | Accepted when |
+  |---|---|---|
+  | `serve` | `X-PF-Serve-Token`, or none to serve anonymously | the serve token is valid; or there is none and the hub allows anonymous serving |
+  | `connect` | `X-PF-Tunnel-Word`, and `X-PF-Client-Token` if the tunnel has one | `check` would answer 204 (§6.4) |
+
+**Answers:**
+
+| Status | Meaning | Retry? |
+|---|---|---|
+| 200 | JSON, below | — |
+| 403 | the credentials were refused, as for `serve` or `check`; guessing protection applies (§6.1) | no |
+| 400 | no `X-PF-Tunnel-Op`, or an unknown one | no |
+| 404 | the hub does not offer QUIC: it is older than pf-simple 0.16.0, or its relay hub is off | no |
+| 501, JSON body | the hub offers QUIC, but its QUIC listener is off, or has no advertised host | yes, later |
+| 429 | as in §6.1 | yes, later |
+
+**A hub without QUIC** knows no `quic` endpoint, and answers it 404, with
+or without a body. The client MUST stop with a clear message, such as
+"this hub does not offer QUIC: it is older than pf-simple 0.16.0, or its
+relay hub is off; upgrade it, or use pf-client (WebSocket)". Waiting cannot
+help, so it does not retry.
+
+The 200 body:
+
+```json
+{
+  "host": "gate.wushilin.net",
+  "port": 443,
+  "fingerprints": ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]
+}
+```
+
+- **`host`** is the advertised host that the hub's admin set in the
+  console or the config (§13.10). It is either:
+  - a DNS name;
+  - an IPv4 address; or
+  - an IPv6 address **without** brackets, such as `2001:db8::1`.
+
+  It can change without a restart. The hub cannot know its public address
+  behind a proxy or a NAT, so it never guesses one.
+- **`port`** is 1 to 65535. A client refuses any other value.
+- **`fingerprints`** are 1 to 4 lowercase hex SHA-256 values, each of the
+  **DER encoding of a leaf certificate** the listener may present. While
+  a certificate is being replaced there are two of them (§13.10).
+- Clients MUST ignore JSON fields they do not know.
+
+**When to discover again:**
+- at the start of each run;
+- before each new QUIC connection, such as a re-registration after a lost
+  link, so a changed address or certificate is picked up;
+- once more after a fingerprint mismatch (§13.3).
+
+**A connecting side started before its serving side** gets 403 from
+discovery, as it would from `check`. For a one-off `connect` (stdio) that
+is the answer. A connecting listener (`pf-client-quic connect` on a local
+port) MUST NOT treat it as fatal: it reports it, and discovers again for
+the next TCP connection, as §9 says ("open each connection regardless").
+
+
+### 13.3 The QUIC connection
+
+- **QUIC version 1** (RFC 9000) with TLS 1.3 (RFC 9001), and nothing else.
+  A client that gets a Version Negotiation packet fails loudly: "the hub's
+  QUIC listener does not speak QUIC version 1".
+- **ALPN `pf-tunnel`.** The protocol number is negotiated per request
+  (§13.4), not by ALPN.
+- **SNI** is the advertised `host` when it is a DNS name. When it is an IP
+  address, the client SHOULD send no SNI (RFC 6066 §3); some QUIC
+  libraries, such as kwik, send it anyway. The hub MUST ignore SNI: it has
+  one certificate, and the pin is what the client checks.
+- **Certificate pinning.**
+  - The client MUST accept the hub's certificate if and only if the
+    SHA-256 of its leaf certificate's DER encoding is one of the
+    discovered `fingerprints`.
+  - The check MAY be made inside the TLS library's verification hook, or
+    after the handshake but **before the client opens any stream**. Some
+    libraries, such as aioquic and kwik, may offer only the latter.
+  - Only the chain, the name and the dates go unchecked. The TLS handshake
+    itself is verified as usual, including the CertificateVerify
+    signature. Without that, a pinned fingerprint proves nothing.
+  - **On a mismatch,** the client discovers once more (§13.2) and tries
+    again with the new fingerprints. A second mismatch fails the attempt
+    loudly: "the hub's QUIC certificate does not match what its HTTPS
+    endpoint announced". The certificate is never accepted. A one-off
+    request (connect, check) reports it and stops; a serving side counts it
+    as a failed attempt and tries again with its usual growing pause
+    (§9), since a hub replacing its certificate, or a fault that is put
+    right, should not leave it stopped for good.
+- **The hub's certificate.**
+  - An X.509 v3 certificate, self-signed and generated by the hub.
+  - Its key is ECDSA P-256, and it signs with `ecdsa_secp256r1_sha256`.
+  - Its subject alternative name is the advertised host: a dNSName for a
+    DNS name, an iPAddress for an IP address. Nobody checks it, but some
+    libraries refuse a certificate without one.
+  - Changing the advertised host does not replace the certificate, so the
+    fingerprint stays. The name in the certificate follows at the next
+    replacement (§13.10).
+- **No 0-RTT, no resumption.**
+  - The hub MUST NOT accept 0-RTT data, and the client MUST NOT send it. A
+    replayed `serve` would be a takeover (§6.2).
+  - The hub MUST NOT issue session tickets, so every handshake is a full
+    one and shows the certificate to be pinned. Clients keep their QUIC
+    connections for a long time (below), so this costs little.
+- **Keepalive and idle timeout** are part of every QUIC connection to the
+  hub (§13.6).
+- **Only bidirectional streams.** Both ends allow 0 unidirectional
+  streams. Neither uses QUIC DATAGRAM frames, nor offers the extension.
+- **Library version.** The Go side uses quic-go v0.65.0 or later, for
+  path validation after NAT rebinding on the hub (§13.6).
+- **Connections and requests.**
+  - A QUIC connection carries any number of requests, and any number of
+    registrations (§13.4).
+  - A client SHOULD keep one QUIC connection per hub for a whole run, and
+    open a new one only when it is lost.
+
+#### Stream limits and flow control
+
+The numbers are per QUIC connection.
+
+| | Before the connection's first successful request | After it |
+|---|---|---|
+| bidirectional streams the hub allows the client | 1000 | 1000 |
+| the hub's connection receive window | at most 256 KiB | allowed to grow to at least 16 MiB |
+| the hub's stream receive window, on each client stream | at least 64 KiB | at least 64 KiB |
+
+- **Window growth.** QUIC libraries set an initial window and a maximum.
+  The window grows as data is read, up to the maximum, and quic-go lets
+  the hub veto each increase. So "allowed to grow" is a rule about the
+  maximum, and about not vetoing growth once the connection has a
+  successful request.
+- **Memory before authentication.**
+  - **The hub reads one request at a time** on a connection that has had
+    no successful request yet. The bytes on its other streams stay unread,
+    so they count against the connection window and are never given back.
+  - So an unauthenticated connection can make the hub hold at most 256
+    KiB, plus the one request (4096 bytes) it is reading. With §13.8's
+    limit of 64 connections, that is 16 MiB per address.
+  - A small stream limit before authentication is not an option. quic-go,
+    like most libraries, cannot raise MAX_STREAMS later.
+- **Memory after authentication.** One valid word unlocks 1000 streams of
+  up to 128 KiB each, counting window and buffer. So the hub also allows
+  at most 4096 open client streams per address, across its connections.
+  Beyond that, a request gets 429.
+- **Hub-wide caps.** Per-address limits do not bound the whole hub: IPv6
+  gives one client many /64s, and anyone with a word can stall their own
+  serving side. So the hub also caps, across all addresses:
+  - its QUIC connections (default 10000): beyond it, it refuses
+    handshakes (`CONNECTION_REFUSED`);
+  - the bytes it buffers for QUIC streams (default 1 GiB): beyond it,
+    new requests get 429 (`"scope": "address"`).
+
+  Both are settings (§13.10).
+- **One stalled stream must not starve the others.**
+  - **Each end,** hub and clients alike, reads each carrying stream's
+    data into a buffer of its own, of up to 64 KiB per stream, and stops
+    reading that stream when its buffer is full. So the connection window
+    is given back, and a stalled stream holds up only itself. For the
+    hub, that starts once it has accepted the stream's request.
+  - Without this, a serving side with a few hundred stalled targets
+    would fill its own connection window. New opens and `end` messages
+    would then stall, and the hub would time out healthy connections.
+  - Each end SHOULD make its connection window at least 16 times its
+    stream window.
+- **A serving side** MUST allow the hub at least 128 concurrent
+  bidirectional streams per connection, as many as it may hold
+  connections waiting to be accepted (§9). It SHOULD allow 1000.
+  - §9's 128 is per registration, but stream credit is per connection.
+    So a serving side SHOULD hold at most 7 registrations (1000 / 128) on
+    one QUIC connection, and open another connection for more.
+  - Its stream receive window MUST be at least 64 KiB.
+  - Its connection receive window MUST be allowed to grow to at least 16
+    MiB, so that a few slow targets cannot hold up the rest, or the
+    registration's `end` message (§13.4).
+- **A connecting client** allows the hub stream windows of at least 64
+  KiB, and lets its connection window grow to at least 16 MiB.
+- **No stream credit at once is a rule for the hub.** quic-go reports it
+  at once; quinn and aioquic may block or queue instead. A future hub in
+  those libraries must still fail the connection at once (§13.4).
+
+### 13.4 Requests and answers
+
+#### Messages
+
+Before frames, a stream carries **messages**: a 2-byte big-endian length,
+then that many bytes of UTF-8 JSON (an object), at most 4096 bytes long.
+
+- **A client stream** begins with one **request** from the client, and one
+  **answer** from the hub.
+  - The request MUST be complete within 10 seconds of the stream being
+    opened. Otherwise the hub resets the stream (`request-timeout`,
+    §13.7).
+  - The client waits up to 15 seconds for the answer. Then it resets the
+    stream (`request-timeout`) and reports that the hub did not answer.
+- **A hub-opened stream** (`serve`, below) begins with the hub's open and
+  the serving side's answer.
+- **The serve stream** carries further messages from the hub after its
+  answer (`serve`, below).
+
+**What is frozen.** The client request's envelope, a length then a JSON
+object with `op` and `proto`, and the answer's `status` and `proto`, stay
+the same in every future protocol. So any later hub can always answer any
+later client, if only with 426. Messages on hub-opened streams and on the
+serve stream follow the protocol that the registration negotiated.
+
+#### The request
+
+The request carries the same values as the WebSocket headers (§4), as
+JSON fields:
+
+```json
+{"op": "connect", "proto": "3", "version": "pf-client-quic 0.16.0",
+ "word": "…", "clientToken": "…"}
+```
+
+| Field | Ops | Header it replaces |
+|---|---|---|
+| `op` | all | the endpoint: `serve`, `connect` or `check` |
+| `proto` | all | the protocol range over QUIC, `min-max` or one number: today `3` (§13.11) |
+| `version` | all | `X-PF-Version`, for logs only (§5.4) |
+| `word` | all | `X-PF-Tunnel-Word` |
+| `serveToken` | serve | `X-PF-Serve-Token`; leave it out to serve anonymously |
+| `name` | serve | `X-PF-Tunnel-Name`, as plain UTF-8, not escaped |
+| `target` | serve | `X-PF-Tunnel-Target` |
+| `clientTokenSHA256` | serve | `X-PF-Client-Token-SHA256` |
+| `clientToken` | connect, check | `X-PF-Client-Token` |
+
+#### The answer
+
+The answer is `{"status": <code>, "proto": <n>, …}`.
+
+- **`status`** uses the status codes of the matching WebSocket endpoint
+  (§6.2 to §6.4), with 200 in place of 101. So the tables there apply
+  unchanged, including 403 delays, 409 and 503.
+- **`proto`** is the protocol the hub chose over QUIC: today always 3.
+- **A refusal** adds `"error": "<message>"`. A 429 also adds
+  `"retryAfter": <seconds>` and `"scope"`: `"address"` when the client's
+  address is blocked, `"connection"` when only this connection is
+  (§13.8). The stream then ends as §13.5 describes for a
+  refusal.
+- **A request the hub cannot read** gets one of these:
+
+  | Problem | Answer |
+  |---|---|
+  | the `proto` range does not include a protocol the hub speaks over QUIC (today, 3) | 426, `proto` being the hub's protocol, and an error saying which side to upgrade |
+  | malformed range, not JSON, not an object, unknown `op`, a field of the wrong type | 400 with the reason |
+  | longer than 4096 bytes, or a FIN before the message is complete | no answer: the hub resets the stream (`protocol`, §13.7) |
+
+- Unknown fields are ignored, on both sides.
+- `version` stays an HTTPS-only endpoint (§6.5).
+
+#### Other inputs, and timers
+
+- **Bytes after the request on a `serve` or `check` stream,** other than
+  the FIN that ends it, break the protocol: the hub resets the stream
+  (`protocol`).
+- **A second `eof`, or any frame after `err`,** breaks the protocol too.
+  The receiver resets the stream (`protocol`) and reports a broken
+  stream.
+- **The 501 body** of discovery is `{"error": "<message>"}`, as every
+  refusal (§6).
+- **The 10-second request timer** runs only once the hub has started
+  reading a stream. Streams waiting their turn before authentication
+  (§13.3) do not time out while they wait.
+- **A serving side waits 10 seconds** for the open on a stream the hub
+  opened. Then it resets the stream (`request-timeout`).
+
+#### `serve`
+
+**The answer is 200 when registered,** with the registration's id:
+
+```json
+{"status": 200, "proto": 3, "reg": "5b2d4e8f1a6c9b0d"}
+```
+
+The id is random, at least 64 bits as 16 hex digits, and new for each
+registration. It is for matching opens to registrations (below), not a
+secret: holding it grants nothing.
+
+**The serve stream stays open as the registration.**
+- The client sends nothing more on it after the request. In particular it
+  MUST NOT send FIN as part of sending the request, as some
+  request/response helpers do. A FIN from the client ends the
+  registration.
+- **To unregister,** the client sends FIN. The hub answers with FIN.
+- **When the hub ends a registration,** it sends one more message, then
+  FIN:
+
+  ```json
+  {"end": "takeover", "error": "another registration of this word took over"}
+  ```
+
+  | `end` | When | The serving side |
+  |---|---|---|
+  | `takeover` | a `serve` of the same tenant and word took over (§6.2) | registers again, with the usual growing pause, as a WebSocket serving side does today |
+  | `tenant` | its tenant was deleted or rotated | registers again only if the tunnel has been up, as after a 403 (§9) |
+  | `off` | the relay or anonymous serving was switched off | registers again, with the usual growing pause (§9) |
+  | `shutdown` | the hub is stopping | registers again, with the usual growing pause |
+  | anything else | — | registers again, with the usual growing pause |
+
+  The serving side reports `error` to the user. It decides only from
+  `end`, never from `error`.
+- **Two live serving sides of one word** therefore take it from each
+  other in turn, as over WebSocket. That is the owner's decision: the
+  same behavior on both transports. Each takeover is reported, and logged
+  by the hub.
+- **Other messages** on the serve stream, unknown ones included, are
+  ignored.
+- **A RESET of the serve stream** from either side, or a lost QUIC
+  connection, ends the registration with no reason. The serving side
+  registers again, as after a lost control channel (§9).
+- **Ending a registration** ends every connection in it, as a lost
+  control channel does (§7).
+
+**Takeover.** The rules of §6.2 apply across transports and connections.
+A `serve` of the same tenant and word takes over the registration, whether
+it is a QUIC one (on this connection or another) or a WebSocket one. A QUIC
+takeover of a WebSocket registration closes that registration's idle legs,
+as any takeover does (§12.6).
+
+**For each connection, the hub opens a stream to the serving side.** Its
+first message is the **open**:
+
+```json
+{"open": "8f14e45fceea167a", "reg": "5b2d4e8f1a6c9b0d"}
+```
+
+- **The hub opens no stream for a registration before sending its 200.**
+- **But streams are not ordered with one another.** So the serving side
+  can receive an open before the 200 of its own `serve`. If it names a
+  `reg` the serving side does not know, it waits for its outstanding
+  `serve` answers on that connection. If the `reg` is still unknown once
+  they have arrived, or after 10 seconds, it refuses the open (below).
+
+The serving side answers with one message:
+
+| Answer | Meaning |
+|---|---|
+| `{"status": 200}` | it carries the connection; the stream then carries it (§13.5) |
+| `{"status": 502, "error": "<reason>"}` | it refuses it, for example because the target is unreachable. As with `X-PF-Tunnel-Error` (§6.6), the reason is printable ASCII of at most 128 characters, and the hub passes it on. |
+| `{"status": 410, "error": "no such registration"}` | the open names a `reg` it does not know, or has just ended. The hub tells the connecting side "the tunnel closed". |
+
+Rules for this stream:
+
+- **The answer comes promptly.** As over WebSocket, a serving side SHOULD
+  connect to its target first, and refuse with the reason when it cannot
+  (§9).
+- **The hub waits 10 seconds for the answer.** Then it resets the stream
+  (`request-timeout`) and fails the connection as in §6.3.
+- **The hub sends no frames on the stream before the serving side's 200.**
+  It holds the connecting side's early data until then (`connect`, below).
+- **No streams left.** When the serving side has no stream credit left
+  (MAX_STREAMS), the hub does not wait. It fails the connection at once,
+  with "the serving side has too many connections open".
+- **A WebSocket `accept` for a connection whose serving side is on QUIC**
+  gets 404, as for a connection that is not pending (§6.6).
+
+#### `connect`
+
+**The hub answers as soon as it has checked the request,** before asking
+the serving side, as the WebSocket 101 does (§6.3):
+
+```json
+{"status": 200, "proto": 3, "conn": "8f14e45fceea167a"}
+```
+
+- **200 never means that the target was reached.** If the serving side
+  refuses the connection, does not answer within 10 seconds, or the target
+  fails, the client hears it as an `err` frame on the stream, as a
+  WebSocket connecting side hears `err:` (§13.5).
+- **Accepted** means, depending on how the serving side is connected:
+  - over QUIC, its `{"status": 200}`;
+  - over WebSocket, the 101 of its `accept` (§6.6);
+  - on a reused WebSocket leg, its `bound` (§12.7).
+- **Early data.**
+  - The client MAY send frames right after its request, without waiting
+    for the answer. So a connection costs no extra round trip.
+  - Until the connection is accepted, the hub holds that data as §13.3
+    describes. A client blocked by flow control is not in error.
+  - If the connection is refused, the hub discards that data (§13.5).
+  - Then the client's writes fail. **The client MUST keep reading** after
+    a failed write, and report the `err` reason it reads, not the write
+    error.
+- **A client that gives up,** at any time, sends `err`, or resets its
+  stream (`cancelled`). The hub handles both in every state. It cannot
+  know what the client has seen, and the client cannot know whether the
+  serving side has accepted yet.
+  - **If the serving side has not accepted yet,** the hub withdraws the
+    open. It resets a QUIC stream it had opened (`cancelled`). An `accept`
+    that arrives later over WebSocket gets 404, as for an ended connection
+    (§6.6).
+  - **Otherwise** the serving side hears `err`: the client's reason, or
+    "the link to the connecting side was lost" (§13.9).
+
+#### `check`
+
+The answer is `{"status": 204, "proto": 3}` or a refusal, as in §6.4. Then
+both sides send FIN.
+
+### 13.5 Streams
+
+After the request and its answer (or, on a hub-opened stream, the open and
+its answer), each direction of a stream carries **frames**.
+
+#### Frames
+
+Every frame, of every type, now and in all future protocols, is:
+
+| Type | Length | Payload |
+|---|---|---|
+| 1 byte | 2 bytes, big-endian | that many bytes |
+
+| Type | Name | Length | Meaning |
+|---|---|---|---|
+| `0x00` | data | 0 to 65535 | the next bytes of the connection |
+| `0x01` | eof | 0 | the sender's half-close (§8.2) |
+| `0x02` | err | 1 to 1024 | the connection is being dropped, and why (§8.3): UTF-8 |
+
+- **Unknown types are skipped** by their length, like unknown text frames
+  (§8.1).
+- **Order.** Frames are read in the order they were sent, so `eof` follows
+  the last byte of data.
+
+#### The rules of §8, on QUIC
+
+- **Half-close.** After `eof` the sender sends no more data. Data after
+  `eof` breaks the stream. The other direction carries on until its own
+  `eof`.
+- **Failure.** An end that drops the connection sends `err` and nothing
+  after it. `err` may still follow the sender's own `eof`: as in §8.3, a
+  finish can turn into a failure later.
+- **Half-close idle.** After a half-close, the hub ends a connection that
+  carries nothing either way for 30 seconds (§8.2), with `err`.
+
+#### Ending a stream
+
+**Every stream MUST be driven to its end in both directions.** QUIC gives
+back stream credit only when both directions are over. A stream left half
+open would slowly use up the peer's MAX_STREAMS, until the serving side
+seems to have "too many connections open".
+
+Each direction ends in one of two ways: its sender sends FIN or
+RESET_STREAM, or its receiver sends STOP_SENDING, which the sender answers
+with RESET_STREAM.
+- **An end MUST answer STOP_SENDING with RESET_STREAM.** quic-go does
+  this by itself. quinn only records the STOP_SENDING, so a Rust SDK must
+  watch for it, even on streams it is not writing to, and reset the
+  stream itself.
+- The answering RESET_STREAM SHOULD echo the STOP_SENDING's code. Some
+  libraries send 0 instead.
+- **No end decides anything from the code** of a RESET_STREAM or a
+  STOP_SENDING, only from the stream's state (§13.7).
+
+**To reset a stream** means, everywhere in this section: RESET_STREAM for
+the own direction and STOP_SENDING for the other, both with the same
+code. It ends both directions at once.
+
+| The stream | What each end does |
+|---|---|
+| **Clean finish** | Each end sends `eof`, then FIN once it has also received the other's `eof`. Each reads to the other's FIN, for at most 3 seconds after its own. Then it resets the stream (`cancelled`). |
+| **Failure: the end that sends `err`** | Sends `err`, then FIN. Keeps reading, and discards what it reads, until the other direction ends, for at most 3 seconds (below). Then sends STOP_SENDING (`cancelled`) if it has not ended. |
+| **Failure: the end that receives `err`** | Stops using the data. Ends its own direction at once: RESET_STREAM (`cancelled`), or FIN. Neither is a broken stream: the `err` already said why. |
+| **A refused request** (any answer but 200 or 204) | The hub sends the answer, then FIN, and STOP_SENDING (`refused`) for the client's direction, which discards any early data. The client ends its direction with RESET_STREAM (`refused`) or FIN. |
+| **A refused open** (502, 410) | The serving side sends the answer, then FIN. The hub, which sent only the open, sends FIN. |
+| **`check`** | The client MAY send FIN with its request. The hub sends FIN after the answer. |
+| **The serve stream, ended by the hub** | The hub sends `end`, then FIN. The client sends FIN. |
+| **The serve stream, ended by the client** (unregister) | The client sends FIN. The hub sends FIN. |
+| **A registration's connections, when it ends** (by `end`, unregister, takeover, or a lost serve stream) | The hub sends each of the registration's streams `err` "the tunnel closed", and each then ends as a failure. The other side of each connection hears the same reason (§13.9). |
+
+- **A `connect` client sends FIN only as the table says,** after its own
+  `eof` and the hub's. A FIN with the request is out of turn.
+
+- **FIN out of turn.** A FIN in any state other than these, or in the
+  middle of a frame or a message, is a broken stream.
+- **Broken stream.** A RESET_STREAM that arrives before the receiver has
+  sent or received `err`, a refusal, an `end` or a STOP_SENDING on that
+  stream; a FIN out of turn; a lost QUIC connection, or a frame that breaks these
+  rules. The receiver reports the connection as failed, and has no reason
+  to report beyond "the link was lost" or "the peer broke the protocol".
+- **Delivering a reason.** QUIC libraries do not tell a sender when its
+  data was acknowledged. Closing a QUIC connection drops data still
+  queued. So:
+  - An end that sends `err`, an `end` message, or a refusal keeps the
+    stream, and the connection, until the peer has ended its direction
+    (FIN or RESET_STREAM), for at most 3 seconds. Only then does it
+    close the connection or exit.
+  - The receiver of any of these MUST end its direction promptly, as the
+    table says.
+  - This is the counterpart of the 3-second close wait in §8.4.
+- **A write can fail before the reason is read.** A STOP_SENDING can
+  overtake the `err` frame, or the refusal, that was sent before it. This
+  can happen on any stream, in either role. So an end whose write fails
+  MUST keep reading. It reports the `err`, answer or `end` it reads, and
+  reports the write error only if none comes.
+- **The hub resets streams** (both directions, as defined above) **only
+  for its own reasons:** a request, open or
+  answer that did not come in time (`request-timeout`), a peer that broke
+  the protocol (`protocol`), or a connecting side that gave up
+  (`cancelled`). It never resets a stream to pass on what happened to the
+  other side of the connection. That always travels as `err` (§13.9).
+
+#### Reasons
+
+- **Untrusted.** A receiver treats an `err` as untrusted: it strips
+  characters that are not printable and cuts it to 200 characters before
+  logging it, as in §8.3.
+- **Toward WebSocket.** Before passing a reason to a WebSocket peer, the
+  hub does the same. It cuts at a UTF-8 character boundary, so that
+  `err:` and the reason fit in 1024 bytes.
+- **From WebSocket.** An `err:` with an empty reason becomes the QUIC
+  `err` "the peer gave no reason", since a QUIC `err` is never empty.
+
+**Why frames, and not raw bytes and FIN?** In QUIC nothing can follow a
+FIN, and a RESET_STREAM carries only a number. So with raw bytes, a
+failure after a half-close would have no way to arrive, and no failure
+could carry its reason. Frames carry `eof` and `err` in order with the
+data. They map one to one onto the WebSocket frames, so the hub bridges
+the two transports without losing anything (§13.9). Each frame costs 3
+bytes per 64 KiB.
+
+### 13.6 Keepalive
+
+Keepalive belongs to the **QUIC connection**, not to its streams. It
+replaces the WebSocket pings of the control channel (§7) and of streams
+(§8.5). It applies to every QUIC connection to the hub: serving or
+connecting, busy or idle, for as long as the connection is open.
+
+- **Idle timeout.**
+  - Both ends MUST set the transport parameter `max_idle_timeout` to 30
+    seconds. QUIC uses the smaller of the two values.
+  - An end that receives nothing from the other for that long treats the
+    connection as dead. It is closed silently, as QUIC defines.
+- **Keepalive on both ends.**
+  - Each end MUST run QUIC keepalive with an interval of at most 10
+    seconds: after 10 seconds in which it has received nothing, it sends
+    an ack-eliciting packet, such as a PING frame.
+  - This is how quic-go's keepalive works: it counts from the last packet
+    received. An end that keeps hearing from its peer need not ping.
+  - So no 10 seconds pass without an ack-eliciting packet in at least one
+    direction. The ACK that answers it travels the other way, and keeps
+    that direction alive too.
+  - A dead hub is noticed within 30 seconds, as on a WebSocket stream
+    (§8.5).
+- **Why 10 seconds.** UDP mappings in NATs and firewalls commonly expire
+  after 30 seconds, and some after less. The PINGs keep the mapping open
+  from both sides, including a serving side that carries nothing for
+  hours.
+- **What a dead connection ends.**
+  - **Its registrations,** and every connection in them, as a lost control
+    channel does (§7). The serving side SHOULD discover and register again
+    (§9, §13.2).
+  - **Its streams.** Each is a broken stream. The hub tells the other
+    side of each connection with `err`: "the link to the connecting side
+    was lost" or "the link to the serving side was lost" (§13.9).
+- **Streams send no keepalive of their own.** An idle stream in an alive
+  connection stays open for as long as it likes. The one exception is the
+  30-second limit after a half-close (§8.2), which still applies.
+- **Address changes** (NAT rebinding, a new network). The hub MUST accept
+  a client's new address through QUIC path validation (RFC 9000 §9), and
+  the client MUST NOT disable connection migration. A change of address
+  then costs nothing, and does not end the connection. For guessing
+  protection, the connection keeps the address it was opened from
+  (§13.8).
+- **For implementers.**
+  - In quic-go these rules are `MaxIdleTimeout: 30s` and
+    `KeepAlivePeriod: 10s` in both sides' `quic.Config`, with `Allow0RTT:
+    false`, and `SessionTicketsDisabled: true` in the hub's `tls.Config`.
+  - Libraries without a keepalive setting, such as aioquic and kwik,
+    need a timer of the SDK's own that sends a PING by the same rule.
+
+### 13.7 Error codes
+
+QUIC's RESET_STREAM, STOP_SENDING and CONNECTION_CLOSE carry an
+application error code. Protocol 3 uses these:
+
+| Code | Name | Used when |
+|---|---|---|
+| `0x0` | `none` | a QUIC connection is closed because it is no longer needed: a client at the end of its run; the hub closing an unused connection (§13.8) |
+| `0x1` | `broken` | an end drops a stream or a connection for which it has no other code, such as a local failure it cannot describe |
+| `0x2` | `refused` | a refused request: the hub's STOP_SENDING, and the client's RESET_STREAM (§13.5) |
+| `0x3` | `protocol` | the peer broke this protocol: a bad message or frame, a FIN out of turn |
+| `0x4` | `request-timeout` | a request, open or answer did not come in time; a connection with no successful request in time (§13.8) |
+| `0x5` | `cancelled` | the end gives up on a stream: after `err` (§13.5), or a connecting side giving up before it is accepted (§13.4) |
+| `0x6` | `going-away` | the hub or the client is shutting down and closes its QUIC connections |
+| `0x7` | `limit` | the hub closes a connection over a limit (§13.8) |
+
+- The codes are for logs and for choosing a message. A reason that
+  matters to the user travels in an `err` frame, an answer, or an `end`
+  message.
+- An unknown code means `broken`.
+- **A refused handshake carries none of these.** Application codes cannot
+  travel in QUIC's Initial and Handshake packets (RFC 9000 §10.2.3), so a
+  hub refusing a handshake sends the transport error `CONNECTION_REFUSED`.
+  The client treats it like a 429: it reports "the hub refused the
+  connection", and retries later with the usual growing pause.
+
+### 13.8 Guessing protection and limits
+
+The hub protects its QUIC listener at least as well as its HTTPS
+endpoints, without ever ending a tunnel that works.
+
+- **The address.** Refusals are counted per source address, with IPv6
+  addresses grouped by /64, as over HTTPS. A QUIC connection keeps the
+  address it was opened from, even after it migrates (§13.6). Requests
+  reach the hub only after a completed handshake, which has validated that
+  address, so it cannot be spoofed.
+- **Refusals.**
+  - A refused `serve`, `connect`, `check` or discovery counts toward the
+    same per-address total as the HTTPS endpoints (§6.1), and is delayed
+    in the same way.
+  - While an address is at 429, the hub answers each new request from it
+    with 429, on every QUIC connection.
+  - After 5 refused requests on one connection within 60 seconds, the
+    hub answers every further request on that connection with 429, until
+    those 60 seconds are over, whatever the address's total. So many
+    guesses cannot wait on parallel streams of one connection.
+  - A 429 answer is not itself a refusal: it counts toward neither total.
+  - A client that gets a 429 with `"scope": "connection"` opens a new
+    connection for its next requests. It closes the old one (`none`) once
+    it holds nothing. With `"scope": "address"`, it waits `retryAfter`.
+- **What a limit closes.** The hub closes a connection over a limit
+  (`limit`) only if it holds no registration and no accepted stream.
+  **A registration or an accepted connection is never ended for guessing
+  protection.** That includes other users behind the same NAT. Over
+  WebSocket, a 429 never ends a channel either.
+- **Unauthenticated connections.**
+  - A connection that has not made a successful request within 10 seconds
+    of its handshake is closed (`request-timeout`).
+  - A connection that holds no registration and no open stream for 5
+    minutes is closed (`none`). The client opens a new one when it next
+    needs one.
+  - **Both closes are routine.** The client shows no error. It discovers
+    again and opens a new connection when it next needs one.
+- **Connections per address.** The hub accepts at most 64 QUIC
+  connections per address. Beyond that, it refuses the handshake
+  (`CONNECTION_REFUSED`, §13.7).
+  - Only connections whose address is validated count: completed
+    handshakes, or handshakes past a Retry.
+  - Once an address has handshakes pending, the hub sends Retry to its new
+    ones (quic-go's `VerifySourceAddress`). So spoofed Initials cannot
+    fill a NAT's 64 slots.
+- **Handshake floods.** The hub SHOULD send QUIC Retry packets when under
+  load, so that it does not spend effort on spoofed addresses. QUIC's
+  anti-amplification limit applies in any case.
+- **Memory.** Before its first successful request, a connection can make
+  the hub hold at most 256 KiB (§13.3).
+- **Relay limits.** Tenant limits (256 words) and every other relay limit
+  are the same whichever transport is used.
+
+### 13.9 Mixing transports
+
+The hub pipes bytes between the two sides of a connection, whatever each
+side uses.
+
+| WebSocket (§8) | QUIC (§13.5) |
+|---|---|
+| binary frames (up to 1 MiB) | `0x00` data frames; the hub splits WebSocket data into frames of at most 65535 bytes |
+| text `eof` | `0x01` eof |
+| text `err:<reason>` | `0x02` err, cleaned up toward WebSocket (§13.5) |
+| close after a clean finish or an `err` | the ends of §13.5 |
+
+#### When one side breaks or fails
+
+What the hub sends the **surviving** side depends on how that side is
+connected:
+
+| The surviving side | What it receives |
+|---|---|
+| **on QUIC**, either role | `err` with the reason at once, and the stream ends as for a failure (§13.5) |
+| **on a WebSocket stream**, connecting, or serving without reuse | as today (§8.3): `eof` in the direction that ended, and `err:` once the whole connection ends, or after the 30-second idle timeout |
+| **on a WebSocket serving leg offered reuse** | as today (§12.5): the hub ends the generation with `eof` and `idle`, and the leg goes back to the pool. A QUIC `err` from the other side reaches this leg only as that `eof`; its reason is logged by the hub, not sent. |
+
+- **The reason** is that of the other side's `err`, or, for a break, one
+  the hub writes, such as "the link to the serving side was lost".
+- **Never a break.** The hub never passes on a break as a break. It does
+  not reset a stream, or drop a WebSocket, because the other side's link
+  was lost.
+
+#### How each pairing works
+
+- **The connecting side is on QUIC and the serving side on WebSockets.**
+  - The hub answers 200 at once, sends the open message on the control
+    channel, and waits for the `accept` leg (§6.6). That leg may be a
+    reused protocol 2 leg (§12.7).
+  - A reused leg answers `bound` before its serving side dials the
+    target, so an unreachable target arrives later, as `err`. This is one
+    more reason why 200 never means that the target was reached.
+  - If `bound` does not come in time, the hub falls back to a new
+    `accept`, all within the same 10 seconds, as today.
+- **The connecting side is on WebSockets and the serving side on QUIC.**
+  - The hub sends the WebSocket 101 at once, as in §6.3, and opens a
+    stream to the serving side.
+  - A refusal reaches the connecting side as `err:<reason>`, just as fast
+    as a WebSocket `accept` refusal (§9).
+- **Both sides are on QUIC.** The hub copies frames between the two
+  streams.
+
+### 13.10 Hub configuration (not on the wire)
+
+`[tunnel.quic]`. Every setting can be changed in the console without a
+restart.
+
+| Key | Meaning |
+|---|---|
+| `enabled` | QUIC listener on or off; off makes discovery answer 501 |
+| `listen` | the UDP address, such as `:443`; changing it restarts the listener, which ends its QUIC connections (`going-away`) |
+| `advertise_host`, `advertise_port` | what discovery answers; with no host set, discovery answers 501 |
+| `max_connections`, `max_buffered` | the hub-wide caps of §13.3 (10000, 1 GiB) |
+| certificate | generated by the hub (§13.3), valid for 60 days, and kept beside the config. The hub looks every hour and replaces it once less than 15 days are left. |
+
+**Replacing the certificate.**
+- The listener presents only the new certificate on new handshakes.
+  Existing connections keep going.
+- For 10 minutes, discovery lists both fingerprints. That covers a client
+  between its discovery and its handshake.
+- A client that discovered just before the change gets a mismatch,
+  discovers again, and succeeds (§13.3).
+
+The console's relay tab shows each side's transport, `ws` or `quic`.
+
+### 13.11 Protocol numbers
+
+- **Two transports, two ranges.** The WebSocket endpoints speak protocols
+  0 to 2 (§5), and nothing about them changes: `X-PF-Tunnel-Proto`, the
+  features of §5.1 and the gates of §12 stay as they are, and the hub
+  still answers WebSocket requests with at most 2.
+- **Protocol 3 is the first protocol over QUIC,** and today the only one.
+  It is negotiated in the `proto` field of each QUIC request (§13.4),
+  which a later QUIC protocol (4, …) extends the same way.
+- **No client speaks both.** pfrelay and pf-client speak 0 to 2 over
+  WebSocket; pfrelayquic and pf-client-quic speak 3 over QUIC. They work
+  with each other through the hub's bridge (§13.9), in either role.
+- **The hub's version answer** (§6.5) still gives its WebSocket range.
+- **Nothing is decided from `version`** (§5.4), over QUIC as over
+  WebSocket.
+
+### 13.12 Decisions
+
+These were open questions, now settled by the owner:
+
+1. **Discovery asks for the run's credentials** (§13.2). The alternative,
+   answering anyone, was rejected.
+2. **`connect` is answered at once,** with failures as `err` frames
+   (§13.4). The client needs that path anyway, for an unreachable target
+   behind a reused WebSocket leg (§13.9), and one path is easier to get
+   right in four SDKs.
+3. **A QUIC connection holds any number of registrations,** each opened
+   stream naming its registration (§13.4). This avoids one connection,
+   handshake, NAT mapping and PING timer per word, and changing it later
+   would take a protocol 4.
+4. **A serving side that is taken over registers again,** over QUIC as
+   over WebSocket (§13.4). Two live serving sides of one word take it
+   from each other in turn. Stopping instead was rejected, to keep the
+   two transports alike.
+
+### 13.13 Conformance
+
+The suite runs every SDK's driver against a test hub, as for WebSocket
+(§11).
+
+**A QUIC driver** answers `protocols` with `3-3`. The suite then runs
+every case with the hub's QUIC listener on, the driver on QUIC and the Go
+SDK on the other side of each case on WebSocket, so each case also
+crosses the bridge (`conformance_test.go`, `TestConformanceQUIC` for the
+Go driver). The cases that need protocol 2 (reuse) or an older hub do not
+apply to it.
+
+**Hooks in the test hub,** to reach the cases a real hub rarely shows:
+- present a wrong certificate, or one replaced since discovery;
+- answer discovery with 501, or with a 404 as a hub without QUIC does;
+- withhold flow-control credit from a client;
+- for the hub's own rules, such as failing at once without stream credit,
+  a raw quic-go peer in the suite plays a serving side that grants the hub
+  little or no credit;
+- send STOP_SENDING and withhold the `err`, to check that an end keeps
+  reading after a failed write;
+- answer STOP_SENDING with a RESET_STREAM of code 0, as some libraries
+  do;
+- delay an open past 10 seconds, or answer it before the `serve` answer
+  arrives;
+- send each `end` code;
+- send unknown frame types, unknown messages and unknown error codes;
+- break the protocol: data after `eof`, a FIN out of turn, an oversize
+  message;
+- shorten the timers, as the WebSocket suite does.
+
+**What the suite checks only at packet level,** through the test hub's
+quic-go tracing (qlog):
+- `max_idle_timeout` is 30 seconds;
+- no 10 seconds pass without an ack-eliciting packet in at least one
+  direction, allowing some slack;
+- no early data.
+
+**A hook for resumption:** the test hub can issue session tickets and
+offer 0-RTT, as a hub must not. The suite then checks that the client
+still makes a full handshake, checks the pin, and sends no early data.
+
+#### The cross-transport matrix
+
+One table-driven test, `TestCrossTransport`, runs every **case** below on
+every **pairing**, through one hub with shortened timers. It is the
+answer to "does every side work with every other side, and fail the same
+way?"
+
+**Pairings: 2 connecting sides × 4 serving sides = 8.**
+
+| Connecting side | Serving side |
+|---|---|
+| WebSocket (pfrelay, protocol 2) | WebSocket, protocol 1 (no reuse) |
+| QUIC (pfrelayquic) | WebSocket, protocol 2, on a fresh leg |
+| | WebSocket, protocol 2, on a reused leg |
+| | QUIC (pfrelayquic) |
+
+**Cases: every point where a connection can end.**
+
+| # | Case | The connecting side must report | The serving side must report |
+|---|---|---|---|
+| 1 | clean echo, each side half-closing in turn | finished | finished |
+| 2 | wrong client token | refused: access denied | nothing (no open) |
+| 3 | target unreachable | failed: the serving side's reason | refused at once |
+| 4 | serving side never answers the open | failed: did not answer, after the timer | nothing, or a late open refused |
+| 5 | target resets mid-stream | failed: the target's reason | failed |
+| 6 | application resets mid-stream | failed | failed: the application's reason |
+| 7 | serving side's link lost mid-stream | failed: link to the serving side lost | — |
+| 8 | connecting side's link lost mid-stream | — | failed: link to the connecting side lost |
+| 9 | failure after a half-close (late `err`) | failed, not finished | failed |
+| 10 | half-closed, then silent past the idle timer | failed: idle | failed: idle |
+| 11 | connecting side gives up before the serving side answers | cancelled | open withdrawn, or nothing |
+| 12 | registration ends mid-stream (unregister, takeover) | failed: the tunnel closed | failed: the tunnel closed |
+
+**After each case, the test also checks:**
+- the hub holds no pipe, pending connection or open stream for it (no
+  leak);
+- on the reused-leg pairing, the leg is back in the pool, except where
+  §12.5 says the leg is lost;
+- the reason the surviving side reports is the one in the table, matched
+  by substring, as `tunnel_break_test.go` does.
+
+It is one loop over pairings and cases, with one helper per side to start
+it and to break it. Adding a transport later means adding rows, not
+tests.
+
+**Pairings with other SDKs.** The conformance suite runs every QUIC SDK
+against every WebSocket SDK, in both roles, through the same hub,
+including a reused protocol 2 leg on the WebSocket side.

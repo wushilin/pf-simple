@@ -219,6 +219,15 @@ Notes:
 - `X-PF-Version` is `pfrelay-rs <version>` unless `.agent()` says otherwise.
   It is for the hub's log and console only.
 
+## Other transports
+
+`pfrelay::transport` lets another crate reach the hub some other way while
+the `Client` keeps everything else: listeners, retries, events, stats,
+forwarders and `watch`. [`pfrelay-quic`](../rust-quic) plugs QUIC
+(tunnel protocol 3, `docs/PROTOCOL.md` §13) in through
+`ClientBuilder::transport`. Programs that use pfrelay over WebSocket need
+none of it.
+
 ## Conformance
 
 `src/bin/driver.rs` is the conformance driver

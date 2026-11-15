@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/wushilin/pf-simple/pfrelay"
+	"github.com/wushilin/pf-simple/pfrelayquic"
 )
 
 // Mode is how a driver uses the SDK.
@@ -90,7 +91,13 @@ type ConnAnswer struct {
 	Received int64        `json:"received"`
 }
 
+// transport is "quic" in the QUIC build of this driver (go build -ldflags
+// "-X main.transport=quic"): it then drives pfrelayquic, which speaks
+// protocol 3 only.
+var transport = ""
+
 func main() {
+	quic := transport == "quic"
 	if len(os.Args) < 2 {
 		fail(2, "usage: go-driver serve|connect|check|version [flags]")
 	}
@@ -109,7 +116,11 @@ func main() {
 	protoMax := fs.Int("proto-max", pfrelay.ProtoMax, "the newest tunnel protocol to offer; 0: announce none, like a client from before 0.14")
 	_ = fs.Parse(os.Args[2:])
 	if cmd == CmdProtocols {
-		say(pfrelay.ProtoRange(pfrelay.ProtoMin, pfrelay.ProtoMax))
+		if quic {
+			say(pfrelay.ProtoRange(pfrelayquic.Proto, pfrelayquic.Proto))
+		} else {
+			say(pfrelay.ProtoRange(pfrelay.ProtoMin, pfrelay.ProtoMax))
+		}
 		return
 	}
 	if *protoMax < 0 || *protoMax > pfrelay.ProtoMax {
@@ -133,12 +144,16 @@ func main() {
 	if *word == "" {
 		*word = "aaaa-bbbb-cccc" // version needs none, but a client is made with one
 	}
-	c, err := pfrelay.NewClient(*server, *word, tlsConfig)
+	newClient, agent := pfrelay.NewClient, "pfrelay-go conformance"
+	if quic {
+		newClient, agent = pfrelayquic.NewClient, "pfrelayquic-go conformance"
+	}
+	c, err := newClient(*server, *word, tlsConfig)
 	if err != nil {
 		fail(2, err.Error())
 	}
 	c.ServeToken, c.ClientToken, c.Name, c.Target = *serveToken, *clientToken, *name, *target
-	c.Agent = "pfrelay-go conformance"
+	c.Agent = agent
 	c.MaxProto = *protoMax
 	if *protoMax == 0 {
 		c.MaxProto = -1 // announce no protocol at all

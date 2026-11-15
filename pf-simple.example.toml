@@ -60,6 +60,19 @@ password = "change-me"
 # max_idle = 10       # idle connections one tunnel keeps at most
 # tenant_cap = 256    # ...all the tunnels of one token
 # hub_cap = 4096      # ...the whole hub
+#
+# The QUIC listener (tunnel protocol 3), for pf-client-quic and the
+# pfrelay-quic SDKs; off unless enabled. Clients find it through the hub's
+# https address, which tells them the address below and the certificate to
+# trust; the hub makes that certificate itself, keeps it beside this file,
+# and renews it. The Relay hub tab changes these and writes them here.
+# [tunnel.quic]
+# enabled = true
+# listen = ":12354"                     # UDP; open it in the firewall
+# advertise_host = "relay.example.com"  # what clients are told to reach; required
+# advertise_port = 12354                # left out: the port listened on
+# max_connections = 10000               # QUIC connections at once
+# max_buffered_mib = 1024               # what QUIC streams may buffer in all
 
 # One [[forward]] table per listener. listen and target are required. A file
 # may also have no forwards and only a [console].

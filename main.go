@@ -65,6 +65,7 @@ func main() {
 			tenants = cfg.tunnel.tenants
 		}
 		console.tunnels = newTunnelHub(tenants, halfCloseIdleTimeout, mgr.allocID, relayStatePath(cfg.configPath))
+		quicHub := newQUICHub(console.tunnels, cfg.configPath)
 		// Before anything listens, so a bad certificate stops the start.
 		console.tls = newTLSManager(cfg.console.addr, cfg.configPath)
 		if err := console.tls.start(cfg.console.tlsMode, cfg.console.tlsDir, cfg.console.tlsNames); err != nil {
@@ -77,11 +78,13 @@ func main() {
 		console.tunnels.anonymous = cfg.tunnel != nil && cfg.tunnel.anonymous
 		if cfg.tunnel != nil {
 			console.tunnels.reuse = cfg.tunnel.reuse
+			quicHub.set = cfg.tunnel.quic
 		}
 		if cfg.configPath != "" {
 			console.tunnels.persist = mgr.saveTenants
 			console.tunnels.persistSettings = mgr.saveTunnelSettings
 			console.tunnels.persistReuse = mgr.saveTunnelReuse
+			quicHub.persist = mgr.saveTunnelQUIC
 		}
 	}
 
@@ -119,6 +122,11 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 			mode += ", tunnels on"
 		}
 		log.Printf("console on %s://%s%s/ (%s)", scheme, ln.Addr(), consolePrefix, mode)
+		if q := console.tunnels.quic; q != nil && q.set.Enabled {
+			if err := q.start(); err != nil {
+				log.Printf("relay: %v; the QUIC listener stays off until it is fixed in the console", err)
+			}
+		}
 		if tlsOn {
 			log.Printf("console TLS: %s", console.tls.describe())
 		} else if console.tunnels.enabled {

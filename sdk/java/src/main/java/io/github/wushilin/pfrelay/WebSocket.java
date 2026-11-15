@@ -17,7 +17,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * and out, no extensions. The client side masks what it sends and expects
  * unmasked frames; the server side (used by tests) is the reverse.
  */
-final class WebSocket {
+final class WebSocket implements Link {
     static final int OP_CONT = 0x0;
     static final int OP_TEXT = 0x1;
     static final int OP_BINARY = 0x2;
@@ -51,20 +51,24 @@ final class WebSocket {
     }
 
     /** How long the peer may stay silent; 0 means no limit. */
-    void setReadTimeout(int ms) throws SocketException {
+    @Override
+    public void setReadTimeout(int ms) throws SocketException {
         socket.setSoTimeout(ms);
     }
 
     /** How long one frame write may take before the connection is cut; 0 means no limit. */
-    void setWriteTimeout(long ms) {
+    @Override
+    public void setWriteTimeout(long ms) {
         writeTimeoutMs = ms;
     }
 
-    void writeFrame(int op, byte[] p) throws IOException {
+    @Override
+    public void writeFrame(int op, byte[] p) throws IOException {
         writeFrame(op, p, 0, p.length);
     }
 
-    void writeFrame(int op, byte[] p, int off, int len) throws IOException {
+    @Override
+    public void writeFrame(int op, byte[] p, int off, int len) throws IOException {
         wlock.lock();
         try {
             writeLocked(op, p, off, len);
@@ -78,7 +82,8 @@ final class WebSocket {
      * link is in use anyway. Returns whether it wrote. For keepalive pings,
      * which must never queue up behind a write that the network holds back.
      */
-    boolean tryWriteFrame(int op, byte[] p) throws IOException {
+    @Override
+    public boolean tryWriteFrame(int op, byte[] p) throws IOException {
         if (!wlock.tryLock()) {
             return false;
         }
@@ -146,14 +151,16 @@ final class WebSocket {
      * Bounds what is left of this connection: from now on it is cut after
      * {@link #CLOSE_TIMEOUT_MS}, whatever is still writing or waiting.
      */
-    void beginClose() {
+    @Override
+    public void beginClose() {
         if (closing.compareAndSet(false, true)) {
             Sched.after(CLOSE_TIMEOUT_MS + 500, this::abort);
         }
     }
 
     /** Cuts the connection at once; whatever blocks on it fails. */
-    void abort() {
+    @Override
+    public void abort() {
         if (aborted.compareAndSet(false, true)) {
             try {
                 raw.close();
@@ -182,6 +189,8 @@ final class WebSocket {
         boolean masked;
         final byte[] mask = new byte[4];
         int at;
+        /** The whole payload, when the link made the frame up from another encoding ({@link Framed}). */
+        byte[] synth;
     }
 
     private int readByte() throws IOException {
@@ -192,7 +201,8 @@ final class WebSocket {
         return c;
     }
 
-    Frame readHeader() throws IOException {
+    @Override
+    public Frame readHeader() throws IOException {
         int b0 = readByte();
         int b1 = readByte();
         Frame f = new Frame();
@@ -227,7 +237,8 @@ final class WebSocket {
     }
 
     /** Reads some of the frame's remaining payload; at least one byte if any is left. */
-    int readBody(Frame f, byte[] p, int off, int len) throws IOException {
+    @Override
+    public int readBody(Frame f, byte[] p, int off, int len) throws IOException {
         if (len > f.left) {
             len = (int) f.left;
         }
@@ -249,7 +260,8 @@ final class WebSocket {
     }
 
     /** Reads the whole payload of a frame, which may be at most max bytes. */
-    byte[] readPayload(Frame f, int max) throws IOException {
+    @Override
+    public byte[] readPayload(Frame f, int max) throws IOException {
         if (f.left > max) {
             throw new IOException("a frame larger than " + max + " bytes");
         }

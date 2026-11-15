@@ -2,7 +2,9 @@
 //! through one, from your own program.
 //!
 //! The protocol is described in `docs/PROTOCOL.md` of the pf-simple
-//! repository. This crate speaks tunnel protocols 0 and 1.
+//! repository. This crate speaks tunnel protocols 0 to 2 over WebSocket;
+//! other transports, such as QUIC in the `pfrelay-quic` crate, plug in
+//! through [`transport`].
 //!
 //! ```no_run
 //! # async fn demo() -> pfrelay::Result<()> {
@@ -45,7 +47,9 @@ mod http;
 mod listener;
 mod proto;
 mod reuse;
+pub mod transport;
 mod values;
+mod alt;
 mod ws;
 
 pub use client::{Client, ClientBuilder, ServerInfo, Timing, DEFAULT_AGENT, DEFAULT_MAX_IDLE_LEGS, DEFAULT_NAME};
