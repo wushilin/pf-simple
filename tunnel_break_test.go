@@ -213,12 +213,21 @@ func TestRelayBrokenConnections(t *testing.T) {
 			}},
 		{name: "the hub drops off the network", why: [2]string{"the link between pf-client connect and the server was lost", "the link between pf-client serve and the server was lost"}, limit: idle, prompt: []string{connect, serve}, tunnelGone: true,
 			brk: func(e *brokenEnv) {
+				// Both links at the same moment: first nothing more from the
+				// hub reaches either side, then they are cut. Cutting one and
+				// then the other would let the hub, seeing the first go, close
+				// the second leg in good order before it is cut.
+				var pairs []*linkPair
 				for _, l := range []*flakyLink{e.connectLink, e.serveLink} {
 					l.mu.Lock()
-					for _, p := range l.pairs {
-						p.cut()
-					}
+					pairs = append(pairs, l.pairs...)
 					l.mu.Unlock()
+				}
+				for _, p := range pairs {
+					p.dropDown.Store(true)
+				}
+				for _, p := range pairs {
+					p.cut()
 				}
 			}},
 		// 5. The link from the hub to pf-client serve: the connection's own

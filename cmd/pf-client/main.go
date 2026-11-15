@@ -365,6 +365,13 @@ func run(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if stdio {
+		// A caller such as ssh hangs up as it leaves: let the connection
+		// finish cleanly first (see hangupGrace).
+		var cancel context.CancelFunc
+		ctx, cancel = onHangup(ctx, hangupGrace)
+		defer cancel()
+	}
 
 	tlsConfig, err := trust(ctx, o.server, o.ca, o.insecure, !stdio)
 	if err != nil {
