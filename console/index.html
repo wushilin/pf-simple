@@ -169,6 +169,24 @@
             </form>
           </span>
         </div>
+        <div class="relay-setting" id="relay-quic-row">
+          <input class="switch" type="checkbox" role="switch" id="relay-quic" aria-label="QUIC listener">
+          <span class="relay-setting-text">
+            <b>QUIC listener</b>
+            <span id="relay-quic-note">Lets pf-client-quic and the pfrelay-quic SDKs reach this hub over QUIC (tunnel protocol 3): faster to connect, one UDP port. They find it through this server's https address, which tells them the address below and the certificate to trust. They work with pf-client on the other side of a tunnel. UDP must reach the port.</span>
+            <span class="relay-quic-state" id="relay-quic-state"></span>
+            <form class="reuse-form" id="quic-form" autocomplete="off">
+              <label title="The UDP address the listener binds, such as :12354">Listen <input type="text" id="quic-listen" placeholder=":12354" required></label>
+              <label title="The name or address clients are told to reach, as seen from outside (a NAT or proxy in front changes it)">Advertised host <input type="text" id="quic-host" placeholder="relay.example.com"></label>
+              <label title="The UDP port clients are told; empty: the port listened on">Port <input type="number" id="quic-port" min="0" max="65535"></label>
+              <label title="The most QUIC connections the hub holds at once">Max connections <input type="number" id="quic-conns" min="1" required></label>
+              <label title="The most the hub buffers for QUIC streams in all">Max buffered <input type="number" id="quic-buffered" min="1" required> MiB</label>
+              <button class="btn btn-primary" type="submit" id="quic-save">Save</button>
+              <button class="act" type="button" id="quic-cert" title="Make a new certificate now; new handshakes get it at once, existing connections carry on">Replace certificate</button>
+              <span class="tenant-error" id="quic-error" role="alert"></span>
+            </form>
+          </span>
+        </div>
         <div class="relay-none" id="relay-settings-fixed" hidden>Set on the command line. Start pf-simple from a config file to change these here.</div>
       </div>
       <div id="relay-details">

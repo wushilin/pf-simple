@@ -40,7 +40,7 @@ public final class Conn implements Closeable {
     private static final byte[] EOF_TEXT = "eof".getBytes(StandardCharsets.US_ASCII);
     private static final Object EOF_MARK = new Object();
 
-    private final WebSocket ws;
+    private final Link ws; // a WebSocket, or a stream of another transport (Framed)
     private final Client client;
     private final Registry.Record rec;
     private final int linkSilenceMs;
@@ -76,7 +76,7 @@ public final class Conn implements Closeable {
     private final OutputStream output = new Out();
 
     /** Takes over ws, and reports the connection opened. */
-    Conn(WebSocket ws, Client client, ConnId id, Side side) throws IOException {
+    Conn(Link ws, Client client, ConnId id, Side side) throws IOException {
         this(ws, client, id, side, null);
     }
 
@@ -85,7 +85,7 @@ public final class Conn implements Closeable {
      * registration whose idle pool the leg may join, when the hub offered
      * reuse on it; null otherwise.
      */
-    Conn(WebSocket ws, Client client, ConnId id, Side side, Registration reuse) throws IOException {
+    Conn(Link ws, Client client, ConnId id, Side side, Registration reuse) throws IOException {
         this.ws = ws;
         this.client = client;
         this.reuse = reuse;
@@ -98,7 +98,8 @@ public final class Conn implements Closeable {
         rec.conn = this;
         // Pings come from a timer of their own, not in reply to the peer's, so
         // reading never has to write and the two directions stay independent.
-        pinger = Sched.every(timing.pingEveryMs(), () -> {
+        // A framed link has none: its transport keeps the connection alive.
+        pinger = ws.framed() ? null : Sched.every(timing.pingEveryMs(), () -> {
             try {
                 ws.tryWriteFrame(WebSocket.OP_PING, new byte[0]);
             } catch (IOException e) {
@@ -107,6 +108,12 @@ public final class Conn implements Closeable {
         });
         Sched.go(this::readLoop);
         client.opened(rec);
+    }
+
+    private void stopPinger() {
+        if (pinger != null) {
+            pinger.cancel(false);
+        }
     }
 
     /** The hub's id for this connection, the same on both ends. */
@@ -252,7 +259,7 @@ public final class Conn implements Closeable {
             return;
         }
         closed = true;
-        pinger.cancel(false);
+        stopPinger();
         ws.beginClose();
         try {
             if (sentClose.compareAndSet(false, true)) { // nothing may follow a close frame
@@ -275,7 +282,7 @@ public final class Conn implements Closeable {
     void cut(String reason) {
         failed.set(true);
         closed = true;
-        pinger.cancel(false);
+        stopPinger();
         ws.beginClose();
         Sched.go(() -> {
             try {
@@ -326,14 +333,14 @@ public final class Conn implements Closeable {
         if (!wroteEOF.get() && !failed.get() && !halfCloseForClose()) {
             // a writer is stuck behind a stalled link: cut it, and every write with it
             closed = true;
-            pinger.cancel(false);
+            stopPinger();
             ws.beginClose();
             ws.abort();
             client.closed(rec, broke.get());
             return;
         }
         closed = true;
-        pinger.cancel(false);
+        stopPinger();
         if (reuse != null && readEOF.get() && wroteEOF.get() && !failed.get() && failure.get() == null
                 && broke.get() == null && goneReason == null) {
             finishOffered();
@@ -380,7 +387,7 @@ public final class Conn implements Closeable {
                     ws.setWriteTimeout(Client.CONTROL_WRITE_TIMEOUT_MS); // the leg is no longer carrying data
                     ws.writeFrame(WebSocket.OP_TEXT, Registration.IDLE_TEXT);
                     client.closed(rec, null);
-                    reuse.idleLeg(ws);
+                    reuse.idleLeg((WebSocket) ws); // only a WebSocket is offered reuse
                     return;
                 } catch (IOException e) {
                     reuse.release();
@@ -475,8 +482,10 @@ public final class Conn implements Closeable {
                             String reason = cleanReason(msg.substring(4), 200);
                             if (readEOF.get()) {
                                 goneReason = reason; // a finish that turns out to be a failure
+                                ws.peerFailed();
                             } else {
                                 failRead(new RemoteException(reason));
+                                ws.peerFailed();
                                 return;
                             }
                         }
@@ -516,7 +525,7 @@ public final class Conn implements Closeable {
         } catch (IOException e) {
             lost(e);
         } finally {
-            pinger.cancel(false); // nothing more to keep alive
+            stopPinger(); // nothing more to keep alive
             gone.countDown();
         }
     }

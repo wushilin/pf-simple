@@ -55,6 +55,9 @@ type Conn struct {
 	// client is true on the dialing side, which masks what it sends and
 	// expects unmasked frames; the server side is the reverse.
 	client bool
+	// framed is true for a QUIC stream of protocol 3 (framed.go): the same
+	// frames in another encoding, with FIN for the close.
+	framed bool
 	// writeTimeout bounds each frame write; zero means none, for tunnel data
 	// that the network may hold back for as long as it likes. readTimeout,
 	// when set, is how long the peer may stay silent. Both are durations;
@@ -317,6 +320,9 @@ func Dial(ctx context.Context, rawURL string, header http.Header, tlsConfig *tls
 func (c *Conn) WriteFrame(op byte, payload []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	if c.framed {
+		return c.writeFramed(op, payload)
+	}
 	buf := append(c.wbuf[:0], 0x80|op) // FIN
 	var maskBit byte
 	if c.client {
@@ -344,7 +350,13 @@ func (c *Conn) WriteFrame(op byte, payload []byte) error {
 		buf = append(buf, payload...)
 	}
 	c.wbuf = buf
+	c.armWrite()
+	_, err := c.conn.Write(buf)
+	return err
+}
 
+// armWrite sets the write deadline for the next write. Call it under wmu.
+func (c *Conn) armWrite() {
 	c.dmu.Lock()
 	switch {
 	case c.expired:
@@ -357,8 +369,6 @@ func (c *Conn) WriteFrame(op byte, payload []byte) error {
 		_ = c.conn.SetWriteDeadline(time.Time{})
 	}
 	c.dmu.Unlock()
-	_, err := c.conn.Write(buf)
-	return err
 }
 
 // BeginClose bounds every write from now on, including one already blocked.
@@ -419,9 +429,13 @@ type frame struct {
 	masked bool
 	mask   [4]byte
 	at     int
+	synth  []byte // the whole payload, already read: framed text frames
 }
 
 func (c *Conn) readHeader() (frame, error) {
+	if c.framed {
+		return c.readFramedHeader()
+	}
 	if rt := time.Duration(c.readTimeout.Load()); rt > 0 {
 		_ = c.conn.SetReadDeadline(time.Now().Add(rt))
 	}
@@ -465,7 +479,7 @@ func (c *Conn) readBody(f *frame, p []byte) (int, error) {
 	if uint64(len(p)) > f.left {
 		p = p[:f.left]
 	}
-	if rt := time.Duration(c.readTimeout.Load()); rt > 0 {
+	if rt := time.Duration(c.readTimeout.Load()); rt > 0 && !c.framed {
 		_ = c.conn.SetReadDeadline(time.Now().Add(rt))
 	}
 	n, err := c.rd.Read(p)
@@ -483,6 +497,9 @@ func (c *Conn) readBody(f *frame, p []byte) (int, error) {
 }
 
 func (c *Conn) readPayload(f frame, max uint64) ([]byte, error) {
+	if f.synth != nil {
+		return f.synth, nil
+	}
 	if f.left > max {
 		return nil, errors.New("frame too large")
 	}

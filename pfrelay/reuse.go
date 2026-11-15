@@ -2,6 +2,7 @@ package pfrelay
 
 import (
 	"context"
+	"github.com/wushilin/pf-simple/internal/relayhook"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,11 @@ type registration struct {
 	// leg and asked for again.
 	bound  map[string]*attempt
 	opened map[string]time.Time
+
+	// alt holds the opens of a registration over another transport
+	// (alt.go), until they are accepted or refused.
+	alt      relayhook.Registration
+	altOpens map[string]relayhook.Open
 }
 
 // attempt is a connection taken on a reused leg, until the hub has seen
@@ -178,6 +184,13 @@ func offered(h map[string][]string) bool {
 // accept brings this side's leg of connection id to the hub. reusable asks
 // for reuse, which needs the registration's session.
 func (c *Client) accept(ctx context.Context, reg *registration, id string, reusable bool) (*tunnel.Stream, error) {
+	if reg != nil && reg.alt != nil {
+		o := reg.takeAlt(id)
+		if o == nil {
+			return nil, errNoOpen
+		}
+		return o.Accept(ctx)
+	}
 	h := c.header(id)
 	if reusable && reg != nil && reg.session != "" {
 		h.Set(tunnel.HeaderSession, reg.session)

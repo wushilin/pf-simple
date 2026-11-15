@@ -343,6 +343,8 @@ struct Shared {
     /// end saw no error of its own.
     end_hint: Mutex<Option<Error>>,
     registry: Arc<Registry>,
+    /// A protocol 3 stream over QUIC (PROTOCOL.md §13.5), not a WebSocket.
+    framed: bool,
 }
 
 type Frames = FrameReader<ReadHalf<Tls>>;
@@ -449,6 +451,14 @@ impl Conn {
         Conn::on_leg(Leg { frames, w }, id, side, registry, reuse)
     }
 
+    /// A connection on a QUIC stream that has passed its request and answer
+    /// (or its open and answer): protocol 3's framing, with the stream's
+    /// FIN for the close (PROTOCOL.md §13.5).
+    pub(crate) fn start_framed(stream: Tls, id: &str, side: Side, registry: Arc<Registry>) -> Conn {
+        let (r, w) = tokio::io::split(stream);
+        Conn::on_leg(Leg { frames: FrameReader::framed(r), w }, id, side, registry, None)
+    }
+
     /// A connection on a leg: a new one, or a reused one that answered
     /// `bound`. Nothing else reads or writes the leg from now on.
     pub(crate) fn on_leg(
@@ -459,6 +469,7 @@ impl Conn {
         reuse: Option<Arc<Registration>>,
     ) -> Conn {
         let Leg { frames, w } = leg;
+        let framed = frames.is_framed();
         let rec = registry.add(id, side);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
@@ -477,6 +488,7 @@ impl Conn {
             ended: watch::channel(false).0,
             end_hint: Mutex::new(None),
             registry: registry.clone(),
+            framed,
         });
         let _ = shared.rec.stream.set(Arc::downgrade(&shared));
         let (ev_tx, ev_rx) = mpsc::channel(READ_QUEUE);
@@ -836,6 +848,11 @@ async fn watch_after_eof(frames: &mut Frames, sh: &Shared) -> bool {
                 return false;
             }
             OP_TEXT => {
+                if sh.framed && frame.payload == b"eof" {
+                    // A second eof breaks the protocol (§13.4).
+                    sh.set_failure(Failure::Protocol("a second eof from the far end".into()));
+                    return false;
+                }
                 if frame.payload == MSG_IDLE && sh.reuse.is_some() {
                     // Valid only once this end has half-closed too; in any
                     // other state it is a violation, which ends the leg.
@@ -874,8 +891,20 @@ async fn await_idle(sh: &Shared, wait: Duration) -> bool {
 
 /// Writes one frame. Once closing has begun, the write may take at most
 /// CLOSE_TIMEOUT, also when it was already under way.
-async fn put(w: &mut WriteHalf<Tls>, closing: &mut watch::Receiver<bool>, op: u8, payload: &[u8]) -> io::Result<()> {
-    let fut = ws::write_frame(w, op, payload);
+async fn put(
+    w: &mut WriteHalf<Tls>,
+    closing: &mut watch::Receiver<bool>,
+    framed: bool,
+    op: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let fut = async {
+        if framed {
+            ws::write_framed(w, op, payload).await
+        } else {
+            ws::write_frame(w, op, payload).await
+        }
+    };
     tokio::pin!(fut);
     let bounded = |r: std::result::Result<io::Result<()>, _>| {
         r.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out while closing")))
@@ -933,7 +962,7 @@ async fn write_loop(
                 // Answer the far end's close, as RFC 6455 requires.
                 close_sent = true;
                 if !broken {
-                    let _ = put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await;
+                    let _ = put(&mut w, &mut closing, sh.framed, OP_CLOSE, &CLOSE_NORMAL).await;
                 }
                 broken = true;
                 sh.write_error.lock().unwrap().get_or_insert(Failure::PeerClosed);
@@ -945,10 +974,10 @@ async fn write_loop(
                         continue;
                     }
                     let r = match cmd {
-                        Cmd::Data(b) => put(&mut w, &mut closing, OP_BINARY, &b).await,
+                        Cmd::Data(b) => put(&mut w, &mut closing, sh.framed, OP_BINARY, &b).await,
                         Cmd::Eof => {
                             eof_written = true;
-                            put(&mut w, &mut closing, OP_TEXT, b"eof").await
+                            put(&mut w, &mut closing, sh.framed, OP_TEXT, b"eof").await
                         }
                     };
                     if let Err(e) = r {
@@ -958,8 +987,8 @@ async fn write_loop(
                 }
             },
             _ = ping.tick() => {
-                if !broken {
-                    if let Err(e) = put(&mut w, &mut closing, OP_PING, &[]).await {
+                if !broken && !sh.framed {
+                    if let Err(e) = put(&mut w, &mut closing, sh.framed, OP_PING, &[]).await {
                         broken = true;
                         broke(&sh, e);
                     }
@@ -973,15 +1002,15 @@ async fn write_loop(
             if !broken {
                 let msg = format!("err:{reason}");
                 let mut text = msg.as_bytes();
-                if text.len() > ws::MAX_TEXT_FRAME as usize {
+                if !sh.framed && text.len() > ws::MAX_TEXT_FRAME as usize {
                     let mut cut = ws::MAX_TEXT_FRAME as usize;
                     while !msg.is_char_boundary(cut) {
                         cut -= 1;
                     }
                     text = &text[..cut];
                 }
-                if put(&mut w, &mut closing, OP_TEXT, text).await.is_ok() && !close_sent {
-                    let _ = put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await;
+                if put(&mut w, &mut closing, sh.framed, OP_TEXT, text).await.is_ok() && !close_sent {
+                    let _ = put(&mut w, &mut closing, sh.framed, OP_CLOSE, &CLOSE_NORMAL).await;
                 }
             }
         }
@@ -992,10 +1021,10 @@ async fn write_loop(
                     break;
                 }
                 let r = match cmd {
-                    Cmd::Data(b) => put(&mut w, &mut closing, OP_BINARY, &b).await,
+                    Cmd::Data(b) => put(&mut w, &mut closing, sh.framed, OP_BINARY, &b).await,
                     Cmd::Eof => {
                         eof_written = true;
-                        put(&mut w, &mut closing, OP_TEXT, b"eof").await
+                        put(&mut w, &mut closing, sh.framed, OP_TEXT, b"eof").await
                     }
                 };
                 if let Err(e) = r {
@@ -1006,7 +1035,7 @@ async fn write_loop(
             if !broken && !eof_written && !sh.failed.load(Ordering::Acquire) {
                 eof_written = true;
                 sh.rec.wrote_eof.store(true, Ordering::Release);
-                if let Err(e) = put(&mut w, &mut closing, OP_TEXT, b"eof").await {
+                if let Err(e) = put(&mut w, &mut closing, sh.framed, OP_TEXT, b"eof").await {
                     broken = true;
                     broke(&sh, e);
                 }
@@ -1021,7 +1050,7 @@ async fn write_loop(
                         if let Some(frames) = frames {
                             if reg.keep() {
                                 let answered =
-                                    tokio::time::timeout(IDLE_WRITE_TIMEOUT, put(&mut w, &mut closing, OP_TEXT, MSG_IDLE)).await;
+                                    tokio::time::timeout(IDLE_WRITE_TIMEOUT, put(&mut w, &mut closing, sh.framed, OP_TEXT, MSG_IDLE)).await;
                                 if matches!(answered, Ok(Ok(()))) {
                                     reg.adopt(Leg { frames, w });
                                     return;
@@ -1032,7 +1061,7 @@ async fn write_loop(
                         // Not kept: the hub's "idle" is answered with a
                         // close. Nobody reads the leg any more, so nothing
                         // waits for the reply.
-                        let _ = put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await;
+                        let _ = put(&mut w, &mut closing, sh.framed, OP_CLOSE, &CLOSE_NORMAL).await;
                         let _ = tokio::time::timeout(Duration::from_secs(1), w.shutdown()).await;
                         return;
                     }
@@ -1042,7 +1071,7 @@ async fn write_loop(
             if clean && !sh.failed.load(Ordering::Acquire) {
                 // A clean finish: the closing handshake, then wait briefly
                 // for the far end's close so the last bytes are not reset.
-                if (close_sent || put(&mut w, &mut closing, OP_CLOSE, &CLOSE_NORMAL).await.is_ok())
+                if (close_sent || put(&mut w, &mut closing, sh.framed, OP_CLOSE, &CLOSE_NORMAL).await.is_ok())
                     && !broken
                 {
                     // The far end's close, or nobody reading any more: a
@@ -1062,6 +1091,13 @@ async fn write_loop(
             }
             // Anything else cuts the stream: the socket is dropped.
         }
+    }
+    if sh.framed && sh.write_error.lock().unwrap().is_some() && !*sh.gone.borrow() {
+        // A write can fail before the reason is read: a STOP_SENDING may
+        // overtake the err that was sent before it. Keep reading for the
+        // reason, which is reported instead of the write error (§13.5).
+        let mut gone = sh.gone.subscribe();
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, gone.wait_for(|g| *g)).await;
     }
 }
 

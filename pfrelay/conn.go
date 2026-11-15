@@ -392,11 +392,11 @@ func (c *Conn) SetWriteDeadline(t time.Time) error { c.wdl.set(t); return nil }
 // cannot be reached, or cannot reach its target, the first Read returns a
 // *RemoteError saying so.
 func (c *Client) Dial(ctx context.Context) (*Conn, error) {
-	ws, err := c.dial(ctx, "connect", c.connectHeader())
+	stream, id, err := c.connectStream(ctx)
 	if err != nil {
 		return nil, explain(err)
 	}
-	return c.newConn(tunnel.NewStream(ws), ws.Header.Get(tunnel.HeaderConn), SideConnect), nil
+	return c.newConn(stream, id, SideConnect), nil
 }
 
 // listenBacklog is how many connections may wait for Accept. More are
@@ -485,9 +485,7 @@ func (l *Listener) open(ctx context.Context, reg *registration, id string, leg *
 			leg.Fail(reason) // after "bound", a refusal is an err: (§12.7)
 			return
 		}
-		h := c.header(id)
-		h.Set(tunnel.HeaderError, reason)
-		_ = c.get(ctx, "accept", h)
+		_ = c.refuseOpen(ctx, reg, id, reason)
 		return
 	}
 	if leg != nil && reg.abandoned(id) {

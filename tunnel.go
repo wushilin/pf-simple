@@ -108,6 +108,8 @@ type tunnelHub struct {
 
 	slots idleSlots // idle legs per tenant and in all (relay_reuse.go)
 
+	quic *quicHub // the QUIC listener, protocol 3 (hub_quic.go); nil in some tests
+
 	mu sync.Mutex
 	// enabled is the hub's switch: off, its endpoints answer 404 as if it
 	// were not there. anonymous lets "pf-client serve" register without a
@@ -154,7 +156,8 @@ type relayTunnel struct {
 	proto     int
 	stats     *listenerStats // counters, and the "listener" its pipes belong to
 	started   time.Time
-	ctl       *wsConn // the serving side's control channel
+	ctl       *wsConn    // the serving side's control channel, over WebSocket
+	qs        *quicServe // or its registration over QUIC (hub_quic.go)
 	serveAddr string
 	// session is the registration's secret (protocol 2), which an accept
 	// must bring back to be offered reuse; nil before protocol 2.
@@ -489,6 +492,7 @@ func (h *tunnelHub) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+tunnel.Path+"/connect", h.guard(h.handleConnect))
 	mux.HandleFunc("GET "+tunnel.Path+"/accept", h.guard(h.handleAccept))
 	mux.HandleFunc("GET "+tunnel.Path+"/version", h.guard(h.handleVersion))
+	mux.HandleFunc("GET "+tunnel.Path+"/quic", h.guard(h.handleQUICDiscovery))
 }
 
 // guessLimiter counts refusals per source address.
@@ -595,7 +599,11 @@ func (h *tunnelHub) guard(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if !ok {
-			w.Header().Set(tunnel.HeaderProto, strconv.Itoa(tunnel.ProtoMax))
+			top := tunnel.ProtoMax
+			if maxProto > 0 {
+				top = maxProto
+			}
+			w.Header().Set(tunnel.HeaderProto, strconv.Itoa(top))
 			writeError(w, http.StatusUpgradeRequired, tunnel.ProtoMismatch(min, max))
 			return
 		}
@@ -744,7 +752,88 @@ func (h *tunnelHub) handleVersion(w http.ResponseWriter, r *http.Request) {
 // serving side leaves. Serving a word that is already being served, as the
 // tenant that owns it, takes it over and ends the old tunnel: that is how a
 // serving side that lost its link gets back in before the hub has noticed.
+// serveReg is a registration that passed its checks, before it is
+// installed.
+type serveReg struct {
+	owner, word, name, target string
+	anon                      bool
+	holder                    *tenant
+	clientHash                *secretHash
+	key                       secretHash
+	res                       *reservation
+}
+
+// allowedLocked reports, under h.mu, whether the registration's owner may
+// still serve.
+func (sr *serveReg) allowedLocked(h *tunnelHub) bool {
+	if sr.anon {
+		return h.anonymous
+	}
+	return h.tenantLocked(sr.owner) == sr.holder
+}
+
 func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
+	sr := h.checkServe(w, r)
+	if sr == nil {
+		return
+	}
+	// Protocol 2: the registration's secret goes out with the 101 only,
+	// never with a refusal (§12.3).
+	var session []byte
+	if chosenProto(w) >= 2 && isUpgrade(r) {
+		if session = newSession(); session != nil {
+			w.Header().Set(tunnel.HeaderSession, hex.EncodeToString(session))
+		}
+	}
+	ws, err := upgradeWebSocket(w, r)
+	if err != nil {
+		return
+	}
+	ws.SetTimeouts(tunnel.ControlSilence, tunnel.WriteTimeout)
+	t := h.newRelayTunnel(sr, r, chosenProto(w))
+	t.ctl, t.session = ws, session
+	if !h.install(t, sr, r) {
+		_ = ws.Close()
+		return
+	}
+	_ = ws.ReadLoop() // until the serving side leaves or falls silent
+	h.drop(t, "the serving side disconnected")
+}
+
+// newRelayTunnel makes the tunnel of a registration, before its serving
+// side's link is set.
+func (h *tunnelHub) newRelayTunnel(sr *serveReg, r *http.Request, proto int) *relayTunnel {
+	stats := newListenerStats(h.newID(), wordLabel(sr.word), sr.target)
+	stats.name = sr.name
+	return &relayTunnel{
+		key: sr.key, word: sr.word, name: sr.name, owner: sr.owner, clientHash: sr.clientHash, stats: stats, started: time.Now(),
+		peer: peerVersion(r), proto: proto, serveAddr: peerAddr(r), done: make(chan struct{}),
+		pending: make(map[string]*relayConn), connIDs: make(map[uint64]string), legOf: make(map[uint64]*relayLeg),
+	}
+}
+
+// install makes t the tunnel of its word, taking over from the one there,
+// unless something changed while the serving side's link was being made.
+func (h *tunnelHub) install(t *relayTunnel, sr *serveReg, r *http.Request) bool {
+	h.mu.Lock()
+	old := h.tunnels[sr.key]
+	if h.reserved[sr.key] != sr.res || !h.enabled || !sr.allowedLocked(h) || (sr.anon && old != nil) {
+		h.mu.Unlock()
+		return false
+	}
+	h.tunnels[sr.key] = t
+	h.mu.Unlock()
+	if old != nil {
+		h.drop(old, "served again from "+peerAddr(r))
+	}
+	changes.notify()
+	log.Printf("relay: %s (%s, %s, tunnel protocol %d%s) serves %q as %s -> %s", sr.owner, peerAddr(r), t.peer, t.proto, t.transportNote(), sr.name, wordLabel(sr.word), sr.target)
+	return true
+}
+
+// checkServe checks a registration. On a refusal it answers w and returns
+// nil.
+func (h *tunnelHub) checkServe(w http.ResponseWriter, r *http.Request) *serveReg {
 	// Without a serve token the registration is anonymous, if the hub
 	// allows that. A token that is given must be right either way.
 	serveToken := r.Header.Get(tunnel.HeaderServe)
@@ -757,25 +846,19 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 	if holder == nil && !anon {
 		h.deny(w, r)
-		return
+		return nil
 	}
 	owner := anonymousOwner
 	if holder != nil {
 		owner = holder.name
 	}
-	// allowed reports, under h.mu, whether owner may still serve.
-	allowed := func() bool {
-		if anon {
-			return h.anonymous
-		}
-		return h.tenantLocked(owner) == holder
-	}
+	sr := &serveReg{owner: owner, anon: anon, holder: holder}
 	var clientHash *secretHash
 	if hexHash := r.Header.Get(tunnel.HeaderClientHash); hexHash != "" {
 		raw, err := hex.DecodeString(hexHash)
 		if err != nil || len(raw) != sha256.Size {
 			writeError(w, http.StatusBadRequest, "the client token's hash must be 64 hex digits")
-			return
+			return nil
 		}
 		sum := secretHash(raw)
 		clientHash = &sum
@@ -783,12 +866,12 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	word, err := tunnel.NormalizeWord(r.Header.Get(tunnel.HeaderWord))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return nil
 	}
 	name, err := tunnelName(r.Header.Get(tunnel.HeaderName))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return nil
 	}
 	target := cleanHeader(r.Header.Get(tunnel.HeaderTarget))
 	key := sha256.Sum256([]byte(word))
@@ -797,7 +880,7 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	res := h.reserved[key]
 	refusal, status := "", 0
 	switch {
-	case !allowed(): // deleted, rotated or switched off a moment ago
+	case !sr.allowedLocked(h): // deleted, rotated or switched off a moment ago
 		refusal, status = "access denied", http.StatusForbidden
 	case res != nil && res.Owner != owner:
 		refusal, status = "this word belongs to another tenant; choose a different word", http.StatusConflict
@@ -816,7 +899,7 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 			h.guesses.failed(sourceKey(r))
 		}
 		writeError(w, status, refusal)
-		return
+		return nil
 	}
 	if res == nil {
 		h.nextRes++
@@ -826,45 +909,8 @@ func (h *tunnelHub) handleServe(w http.ResponseWriter, r *http.Request) {
 	res.LastServed, res.Name = time.Now().Unix(), name
 	h.saveLocked()
 	h.mu.Unlock()
-
-	// Protocol 2: the registration's secret goes out with the 101 only,
-	// never with a refusal (§12.3).
-	var session []byte
-	if chosenProto(w) >= 2 && isUpgrade(r) {
-		if session = newSession(); session != nil {
-			w.Header().Set(tunnel.HeaderSession, hex.EncodeToString(session))
-		}
-	}
-	ws, err := upgradeWebSocket(w, r)
-	if err != nil {
-		return
-	}
-	ws.SetTimeouts(tunnel.ControlSilence, tunnel.WriteTimeout)
-	stats := newListenerStats(h.newID(), wordLabel(word), target)
-	stats.name = name
-	t := &relayTunnel{
-		key: key, word: word, name: name, owner: owner, clientHash: clientHash, stats: stats, started: time.Now(),
-		peer: peerVersion(r), proto: chosenProto(w),
-		ctl: ws, serveAddr: peerAddr(r), session: session, done: make(chan struct{}),
-		pending: make(map[string]*relayConn), connIDs: make(map[uint64]string), legOf: make(map[uint64]*relayLeg),
-	}
-	h.mu.Lock()
-	old := h.tunnels[key]
-	if h.reserved[key] != res || !h.enabled || !allowed() || (anon && old != nil) { // changed while the handshake was under way
-		h.mu.Unlock()
-		_ = ws.Close()
-		return
-	}
-	h.tunnels[key] = t
-	h.mu.Unlock()
-	if old != nil {
-		h.drop(old, "served again from "+peerAddr(r))
-	}
-	changes.notify()
-	log.Printf("relay: %s (%s, %s, tunnel protocol %d) serves %q as %s -> %s", owner, peerAddr(r), t.peer, t.proto, name, wordLabel(word), target)
-
-	_ = ws.ReadLoop() // until the serving side leaves or falls silent
-	h.drop(t, "the serving side disconnected")
+	sr.clientHash, sr.word, sr.name, sr.target, sr.key, sr.res = clientHash, word, name, target, key, res
+	return sr
 }
 
 // makeRoomLocked makes sure owner may bind one more word, releasing the one
@@ -916,10 +962,15 @@ func (h *tunnelHub) drop(t *relayTunnel, why string) {
 	close(t.done)
 	t.mu.Unlock()
 	h.closePool(t)
-	// Bounded, also behind a write that is stuck: 1001, going away.
-	t.ctl.BeginClose()
-	_ = t.ctl.WriteFrame(wsOpClose, []byte{0x03, 0xE9})
-	_ = t.ctl.Close()
+	if t.ctl != nil {
+		// Bounded, also behind a write that is stuck: 1001, going away.
+		t.ctl.BeginClose()
+		_ = t.ctl.WriteFrame(wsOpClose, []byte{0x03, 0xE9})
+		_ = t.ctl.Close()
+	}
+	if t.qs != nil {
+		t.qs.end(why)
+	}
 	for _, c := range waiting {
 		c.fail("the tunnel closed")
 	}
@@ -1025,6 +1076,9 @@ func (h *tunnelHub) closeAll() {
 	for _, t := range all {
 		h.drop(t, "shutting down")
 	}
+	if h.quic != nil {
+		h.quic.stop()
+	}
 }
 
 func (h *tunnelHub) handleCheck(w http.ResponseWriter, r *http.Request) {
@@ -1055,6 +1109,9 @@ func newConnID() (string, error) {
 // and otherwise with an open message. It returns the leg, or why there is
 // none.
 func (h *tunnelHub) open(t *relayTunnel, id string) (servedLeg, string) {
+	if t.qs != nil {
+		return h.openQUIC(t, id)
+	}
 	deadline := time.Now().Add(h.openWait)
 	if s, leg := h.bind(t, id); s != nil {
 		return servedLeg{s, leg}, ""
@@ -1128,6 +1185,13 @@ func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	client := tunnel.NewStream(ws)
 	client.SetRemote(peerAddr(r))
+	h.relay(t, connID, client)
+}
+
+// relay carries one connection, whose connecting side's leg is client,
+// once it has its id: it asks the serving side for its leg and pipes the
+// two.
+func (h *tunnelHub) relay(t *relayTunnel, connID string, client *tunnel.Stream) {
 	id, start, l := connIDs.Add(1), time.Now(), t.stats
 	l.active.Add(1)
 	defer l.release()
@@ -1156,6 +1220,12 @@ func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
 	upstream.CloseReason = func() string {
 		return relayCloseReason(id, t, upstream, client, "pf-client serve", "pf-client connect", "the target", "the application")
 	}
+	// A failure of one leg after both half-closes on the other: that one
+	// would otherwise finish cleanly and never hear it (§8.3).
+	client.Failed = func() string { return remoteReason(upstream) }
+	if served.leg == nil { // a reused leg ends its generation instead (§12.5)
+		upstream.Failed = func() string { return remoteReason(client) }
+	}
 	defer func() {
 		t.mu.Lock()
 		delete(t.connIDs, id)
@@ -1169,6 +1239,16 @@ func (h *tunnelHub) handleConnect(w http.ResponseWriter, r *http.Request) {
 		up = &reusableUpstream{Stream: upstream, h: h, t: t, leg: served.leg, client: client, pipeID: id}
 	}
 	servePipe(id, start, client, up, l, h.idle)
+}
+
+// remoteReason is the reason the far end of s gave for failing it, if it
+// did.
+func remoteReason(s *tunnel.Stream) string {
+	var remote *tunnel.RemoteError
+	if errors.As(s.Failure(), &remote) {
+		return remote.Reason
+	}
+	return ""
 }
 
 // relayCloseReason is what the hub tells the pf-client on leg self when it
@@ -1270,6 +1350,8 @@ type relayState struct {
 	// (protocol 2); ReuseFixed says they cannot be changed here.
 	Reuse      reuseSettings         `json:"reuse"`
 	ReuseFixed bool                  `json:"reuseFixed"`
+	// QUIC is the QUIC listener (protocol 3): its settings and state.
+	QUIC *quicStatus `json:"quic,omitempty"`
 	Tenants    []relayTenantSnapshot `json:"tenants"`
 	Words      []relayWordSnapshot   `json:"words"`
 }
@@ -1296,6 +1378,8 @@ type relayWordSnapshot struct {
 	// ClientToken: whoever connects must also give the serving side's
 	// client token.
 	ClientToken bool `json:"clientToken,omitempty"`
+	// Transport is how the serving side reached the hub: "ws" or "quic".
+	Transport string `json:"transport,omitempty"`
 	// Client is the serving side's program and version, and Proto the
 	// tunnel protocol in use with it.
 	Client    string `json:"client,omitempty"`
@@ -1377,6 +1461,9 @@ func (h *tunnelHub) snapshot() relayState {
 	}
 	live := pipes.snapshot(stats)
 	out := relayState{Manage: h.persist != nil, Enabled: enabled, Anonymous: anonymous, Reuse: reuse, ReuseFixed: reuseFixed, Tenants: tenants, Words: make([]relayWordSnapshot, len(entries))}
+	if h.quic != nil {
+		out.QUIC = h.quic.status()
+	}
 	next := 0
 	for i, e := range entries {
 		ws := relayWordSnapshot{
@@ -1386,7 +1473,7 @@ func (h *tunnelHub) snapshot() relayState {
 		if t := e.t; t != nil {
 			ls := live[next]
 			next++
-			ws.Live, ws.ClientToken = true, t.clientHash != nil
+			ws.Live, ws.ClientToken, ws.Transport = true, t.clientHash != nil, t.transport()
 			ws.Client, ws.Proto = t.peer, t.proto
 			ws.ServeAddr, ws.Target, ws.Since = t.serveAddr, ls.Target, t.started.UnixMilli()
 			ws.Accepted, ws.Failed, ws.BytesUp, ws.BytesDown, ws.Conns = ls.Accepted, ls.Failed, ls.BytesUp, ls.BytesDown, ls.PipeCount
@@ -1403,10 +1490,14 @@ func (h *tunnelHub) snapshot() relayState {
 			}
 			limit := time.Duration(rs.IdleSec) * time.Second
 			for i, il := range t.pool {
-				ws.Idle = append(ws.Idle, idleSnapshot{
+				is := idleSnapshot{
 					Leg: il.leg.id, ServeAddr: il.leg.addr, Since: il.since.UnixMilli(), Carried: il.leg.carried,
-					Kept: time.Since(il.since) > limit && len(t.pool)-1-i < rs.MinIdle,
-				})
+					Kept: keptLocked(t, rs, i),
+				}
+				if !is.Kept {
+					is.ClosesAt = il.since.Add(limit).UnixMilli()
+				}
+				ws.Idle = append(ws.Idle, is)
 			}
 			t.mu.Unlock()
 		}
@@ -1443,6 +1534,7 @@ func (s *consoleServer) handleRelaySettings(w http.ResponseWriter, r *http.Reque
 		Enabled   *bool           `json:"enabled"`
 		Anonymous *bool           `json:"anonymous"`
 		Reuse     json.RawMessage `json:"reuse"`
+		QUIC      json.RawMessage `json:"quic"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "bad request body")
@@ -1470,6 +1562,27 @@ func (s *consoleServer) handleRelaySettings(w http.ResponseWriter, r *http.Reque
 		}
 		reuse = &rs
 	}
+	// quic, too, is whole or nothing.
+	var quic *quicSettings
+	if len(body.QUIC) > 0 && string(body.QUIC) != "null" {
+		var fields map[string]json.RawMessage
+		var qs quicSettings
+		if json.Unmarshal(body.QUIC, &fields) != nil || json.Unmarshal(body.QUIC, &qs) != nil {
+			writeError(w, http.StatusBadRequest, "quic: bad value")
+			return
+		}
+		for _, k := range []string{"enabled", "listen", "advertiseHost", "advertisePort", "maxConnections", "maxBufferedMiB"} {
+			if _, ok := fields[k]; !ok {
+				writeError(w, http.StatusBadRequest, "quic: "+k+" is missing; send all six fields")
+				return
+			}
+		}
+		if msg := qs.check(); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+		quic = &qs
+	}
 	if s.tunnels == nil {
 		writeError(w, http.StatusNotFound, "this server has no relay hub")
 		return
@@ -1477,6 +1590,13 @@ func (s *consoleServer) handleRelaySettings(w http.ResponseWriter, r *http.Reque
 	err := s.tunnels.setSettings(body.Enabled, body.Anonymous)
 	if err == nil && reuse != nil {
 		err = s.tunnels.setReuse(*reuse)
+	}
+	if err == nil && quic != nil {
+		if s.tunnels.quic == nil || s.tunnels.quic.persist == nil {
+			err = errSettingsFixed
+		} else {
+			err = s.tunnels.quic.apply(*quic)
+		}
 	}
 	var bad *badSetting
 	if errors.As(err, &bad) {

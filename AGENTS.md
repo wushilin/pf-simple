@@ -6,8 +6,10 @@
 protocol. Its short definition is the comment at the top of
 [`internal/tunnel/proto.go`](internal/tunnel/proto.go), and the full
 specification is [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Read both before
-touching anything under `internal/tunnel/`, `pfrelay/`, `sdk/`,
-`tunnel.go`, or `cmd/pf-client/`.
+touching anything under `internal/tunnel/`, `internal/quictun/`,
+`internal/relayhook/`, `internal/clientcli/`, `pfrelay/`, `pfrelayquic/`,
+`sdk/`, `tunnel.go`, `hub_quic.go`, `cmd/pf-client/` or
+`cmd/pf-client-quic/`.
 
 Where the code lives:
 
@@ -15,7 +17,13 @@ Where the code lives:
   the headers and protocol negotiation. The hub and the Go SDK share it.
 - `pfrelay/` is the Go SDK, which pf-client is built on. Its exported API
   is public, and changing it is a breaking change for its users.
-- `sdk/<language>/` holds the other SDKs.
+- `pfrelayquic/` is the Go SDK over QUIC (protocol 3). It returns the same
+  `*pfrelay.Client`, with its transport attached through
+  `internal/relayhook`; `internal/quictun/` holds what it shares with the
+  hub (`hub_quic.go`). `internal/clientcli/` is the command line of both
+  pf-client and pf-client-quic.
+- `sdk/<language>/` holds the other SDKs, and `sdk/<language>-quic/` their
+  QUIC versions.
 - `conformance/` and `conformance_test.go` are the conformance suite,
   which every SDK must pass.
 
@@ -42,6 +50,13 @@ on the negotiated protocol on both `serve` and `accept`, so peers of
 protocol 0 and 1 see exactly protocol 1. Treat protocol 2 as sealed once it
 is released, like protocol 1.
 
+**Protocol 3** (0.16.0) is the QUIC transport (`docs/PROTOCOL.md` §13).
+It exists only over QUIC, and is negotiated in each QUIC request; the
+WebSocket endpoints stay at protocols 0 to 2 and know nothing of it. A QUIC
+client and a WebSocket client work together through the hub's bridge.
+Treat it as sealed once released, like protocols 1 and 2: a change over
+QUIC is protocol 4, negotiated the same way.
+
 Rules:
 
 1. **Do not change protocol 1.** No header renamed, removed or given a new
@@ -51,7 +66,8 @@ Rules:
 2. **Anything new on the wire is a new protocol version.** Raise
    `ProtoMax`, describe the version in `proto.go`, add it to
    `protoRelease`, give each new feature an entry in `featureProto`, make
-   `Client.needs` (in `pfrelay/client.go`) and every SDK name it, describe
+   `Client.needs` (in `pfrelay/client.go`) and every SDK that speaks the
+   transport name it, describe
    the version in `docs/PROTOCOL.md`, and make the server honor it only when the
    negotiated version allows. The steps are at the end of the comment in
    `proto.go`.

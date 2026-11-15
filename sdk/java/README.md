@@ -180,7 +180,7 @@ unaffected in every combination.
 
 | Type | What it is |
 |---|---|
-| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.2.0`), `logger`, `events`, `maxProto`, `noReuse`, `maxIdleLegs`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
+| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.3.0`), `logger`, `events`, `maxProto`, `noReuse`, `maxIdleLegs`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
 | `Client.listen()`, `listen(Duration)` | Register, and return a `Listener`. |
 | `Client.serve(target)`, `serve(target, Duration)` | Register, and forward each connection to a TCP `host:port`; returns a `Forwarder`. |
 | `Client.dial()` | Open one connection; a `Conn`. |
@@ -188,6 +188,7 @@ unaffected in every combination.
 | `Client.watch()` | Check the tunnel until closed (every 30 s while it is up, from 1 s doubling to 30 s while it is down); a `Watcher` with `isUp()`, `lastError()`, `close()`. |
 | `Client.check()` | Returns if someone serves the word; throws `AccessDeniedException` otherwise. |
 | `Client.probe()` | The hub's `ServerInfo` (version, protoMin, protoMax, token); needs a serve token. |
+| `Client.close()` | Let go of what the client keeps between requests: nothing over WebSocket, the QUIC connection with pfrelay-quic. |
 | `Client.drop(ConnId, reason)` | Drop an open connection, telling its far end why; false if no such connection is open. |
 | `Client.stats()`, `conns()` | Local bookkeeping: `Stats` (opened, active, failed, sent, received) and the open connections as `ConnInfo` (id, side, opened, sent, received, wroteEof, readEof), every connection included, forwarded or not. |
 | `Listener` | `accept()`, `isUp()`, `close()`. At most 128 connections wait for `accept()`; more are refused at once, their connecting side is told why, and `onRefuse` hears of it. |
@@ -224,6 +225,15 @@ unaffected in every combination.
 - **Threads.** Each `Conn` has a reader thread, each `Listener`, forwarder
   and watcher a thread of its own; all are daemons. A `Conn` takes one
   reader and one writer at a time.
+
+## QUIC
+
+[pfrelay-quic](../java-quic) reaches the hub over QUIC (tunnel protocol 3,
+PROTOCOL.md §13) with this same `Client`: its `QuicClient.builder()` returns
+a `Client.Builder` with a QUIC transport plugged in through the `Transport`
+interface, and everything else (listeners, forwarders, retries, events,
+stats, `drop`, `watch`) is this SDK's. `Transport` is a service-provider
+interface for such SDKs, not for applications.
 
 ## Conformance
 

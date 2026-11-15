@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  For publishing. build.sh builds and tests the SDK with the JDK alone
+  (pfrelay from ../java, kwik fetched from Maven Central and checked against
+  its hashes), and is what CI runs. Keep the versions here and in build.sh
+  the same.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.wushilin</groupId>
+  <artifactId>pfrelay-quic</artifactId>
+  <version>0.3.0</version>
+  <packaging>jar</packaging>
+
+  <name>pfrelay-quic</name>
+  <description>Java SDK for the pf-simple relay hub over QUIC (tunnel protocol 3): serve a tunnel or connect through one.</description>
+  <url>https://github.com/wushilin/pf-simple</url>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>wushilin</id>
+      <name>Wu Shilin</name>
+      <url>https://github.com/wushilin</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <url>https://github.com/wushilin/pf-simple</url>
+    <connection>scm:git:https://github.com/wushilin/pf-simple.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/wushilin/pf-simple.git</developerConnection>
+  </scm>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <!-- The WebSocket SDK: its Client, listeners, forwarders and events, with QUIC plugged in. -->
+    <dependency>
+      <groupId>io.github.wushilin</groupId>
+      <artifactId>pfrelay</artifactId>
+      <version>0.3.0</version>
+    </dependency>
+    <!-- QUIC, in pure Java. It brings agent15 (TLS 1.3), hkdf and siphash. -->
+    <dependency>
+      <groupId>tech.kwik</groupId>
+      <artifactId>kwik</artifactId>
+      <version>0.12.3</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <!-- Ship the license inside the jar (and so the sources jar), as META-INF/LICENSE. -->
+    <resources>
+      <resource>
+        <directory>${project.basedir}</directory>
+        <includes>
+          <include>LICENSE</include>
+        </includes>
+        <targetPath>META-INF</targetPath>
+      </resource>
+    </resources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <release>17</release>
+        </configuration>
+      </plugin>
+      <!-- The tests are a plain main class (no test framework): run it in the test phase. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <executions>
+          <execution>
+            <id>tests</id>
+            <phase>test</phase>
+            <goals>
+              <goal>java</goal>
+            </goals>
+            <configuration>
+              <mainClass>io.github.wushilin.pfrelayquic.TestMain</mainClass>
+              <classpathScope>test</classpathScope>
+              <skip>${skipTests}</skip>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- mvn -Prelease deploy: what Maven Central needs on top of the jar
+         (sources, javadoc, GPG signatures), uploaded through the Central
+         Portal. Used by .github/workflows/sdk-release.yml. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <!-- the passphrase comes from MAVEN_GPG_PASSPHRASE -->
+                  <bestPractices>true</bestPractices>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.12.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

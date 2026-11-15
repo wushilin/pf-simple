@@ -129,33 +129,176 @@ pub(crate) struct FrameReader<R> {
     rd: R,
     buf: Vec<u8>,
     limits: Limits,
-    silence: Duration,
+    /// None: no silence limit (a QUIC stream, kept alive by its connection).
+    silence: Option<Duration>,
     last: Instant,
+    /// Protocol 3's framing (PROTOCOL.md §13.5) instead of WebSocket frames.
+    framed: bool,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// `leftover` is what was read past the handshake's response.
     pub(crate) fn new(rd: R, leftover: Vec<u8>, limits: Limits, silence: Duration) -> Self {
-        FrameReader { rd, buf: leftover, limits, silence, last: Instant::now() }
+        FrameReader { rd, buf: leftover, limits, silence: Some(silence), last: Instant::now(), framed: false }
+    }
+
+    /// A reader of protocol 3 frames on a QUIC stream, after its request
+    /// and answer. Each frame comes back as the WebSocket frame it stands
+    /// for: data as binary, `eof` and `err` as text, and the stream's FIN
+    /// at a frame boundary as a close. There is no silence limit: QUIC
+    /// keeps the connection alive, not the stream.
+    pub(crate) fn framed(rd: R) -> Self {
+        FrameReader { rd, buf: Vec::new(), limits: STREAM_LIMITS, silence: None, last: Instant::now(), framed: true }
+    }
+
+    pub(crate) fn is_framed(&self) -> bool {
+        self.framed
     }
 
     /// The next frame. A link that stays silent for the reader's silence
     /// limit is an error of kind `TimedOut`; one that ends is `UnexpectedEof`.
     pub(crate) async fn next(&mut self) -> io::Result<Frame> {
         loop {
-            if let Some((frame, used)) = parse_frame(&self.buf, self.limits)? {
+            let parsed = if self.framed { parse_framed(&self.buf)? } else { parse_frame(&self.buf, self.limits)?.map(|(f, n)| (Some(f), n)) };
+            if let Some((frame, used)) = parsed {
                 self.buf.drain(..used);
-                return Ok(frame);
+                match frame {
+                    Some(f) => return Ok(f),
+                    None => continue, // an unknown framed type, skipped
+                }
             }
             self.buf.reserve(16 << 10);
-            let deadline = self.last + self.silence;
-            match tokio::time::timeout_at(deadline, self.rd.read_buf(&mut self.buf)).await {
-                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "silent link")),
-                Ok(Ok(0)) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(Ok(_)) => self.last = Instant::now(),
-                Ok(Err(e)) => return Err(e),
+            let read = match self.silence {
+                Some(silence) => {
+                    match tokio::time::timeout_at(self.last + silence, self.rd.read_buf(&mut self.buf)).await {
+                        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "silent link")),
+                        Ok(r) => r,
+                    }
+                }
+                None => self.rd.read_buf(&mut self.buf).await,
+            };
+            match read {
+                Ok(0) if self.framed && self.buf.is_empty() => {
+                    // FIN at a frame boundary: the stream's close.
+                    return Ok(Frame { fin: true, op: OP_CLOSE, payload: Vec::new() });
+                }
+                Ok(0) if self.framed => return Err(violation("the stream ended inside a frame")),
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(_) => self.last = Instant::now(),
+                Err(e) => return Err(e),
             }
         }
+    }
+}
+
+// ---------- protocol 3's framing (PROTOCOL.md §13.5) ----------
+//
+//   type (1 byte)  length (2 bytes, big-endian)  payload
+//   0x00 data      0 to 65535                    the next bytes
+//   0x01 eof       0                             the sender's half-close
+//   0x02 err       1 to 1024                     why the stream is dropped
+//
+// A framed stream maps one to one onto a WebSocket stream: data, "eof",
+// "err:why", and the stream's FIN in place of the close frame.
+
+pub(crate) const FRAME_DATA: u8 = 0x00;
+pub(crate) const FRAME_EOF: u8 = 0x01;
+pub(crate) const FRAME_ERR: u8 = 0x02;
+/// The most data one framed data frame carries.
+pub(crate) const MAX_FRAMED_DATA: usize = 0xFFFF;
+/// The longest reason of a framed err.
+pub(crate) const MAX_FRAMED_ERR: usize = 1024;
+/// What an empty reason becomes: a framed err is never empty.
+pub(crate) const NO_REASON: &str = "the peer gave no reason";
+
+/// Parses one framed frame from the front of `buf`: `Ok(None)` when more
+/// bytes are needed; `Some((None, n))` for an unknown type, skipped by its
+/// length.
+pub(crate) fn parse_framed(buf: &[u8]) -> io::Result<Option<(Option<Frame>, usize)>> {
+    if buf.len() < 3 {
+        return Ok(None);
+    }
+    let (typ, len) = (buf[0], usize::from(u16::from_be_bytes([buf[1], buf[2]])));
+    match typ {
+        FRAME_EOF if len != 0 => return Err(violation("an eof frame with a payload")),
+        FRAME_ERR if len == 0 || len > MAX_FRAMED_ERR => return Err(violation("an err frame of a bad length")),
+        _ => {}
+    }
+    if buf.len() < 3 + len {
+        return Ok(None);
+    }
+    let payload = &buf[3..3 + len];
+    let frame = match typ {
+        FRAME_DATA => Some(Frame { fin: true, op: OP_BINARY, payload: payload.to_vec() }),
+        FRAME_EOF => Some(Frame { fin: true, op: OP_TEXT, payload: b"eof".to_vec() }),
+        FRAME_ERR => {
+            let mut text = b"err:".to_vec();
+            text.extend_from_slice(payload);
+            Some(Frame { fin: true, op: OP_TEXT, payload: text })
+        }
+        _ => None,
+    };
+    Ok(Some((frame, 3 + len)))
+}
+
+/// Encodes one framed frame.
+pub(crate) fn encode_framed(typ: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(3 + payload.len());
+    buf.push(typ);
+    buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// The reason of an `err:` text, never empty, cut at a UTF-8 boundary to
+/// fit a framed err.
+pub(crate) fn framed_reason(text: &[u8]) -> Option<String> {
+    let reason = text.strip_prefix(b"err:")?;
+    let mut reason = String::from_utf8_lossy(reason).into_owned();
+    if reason.is_empty() {
+        reason = NO_REASON.to_string();
+    }
+    if reason.len() > MAX_FRAMED_ERR {
+        let mut cut = MAX_FRAMED_ERR;
+        while !reason.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        reason.truncate(cut);
+    }
+    Some(reason)
+}
+
+/// Writes what a WebSocket frame `op` says, in protocol 3's framing: data
+/// in frames of at most 65535 bytes, `eof` and `err:` as their frames, a
+/// close as the stream's FIN. Pings, pongs and other text are not said on a
+/// framed stream: QUIC keeps the connection alive.
+pub(crate) async fn write_framed<W: AsyncWrite + Unpin>(w: &mut W, op: u8, payload: &[u8]) -> io::Result<()> {
+    match op {
+        OP_BINARY | OP_CONT => {
+            let mut buf = Vec::with_capacity(payload.len() + 3 * (payload.len() / MAX_FRAMED_DATA + 1));
+            let mut chunks = payload.chunks(MAX_FRAMED_DATA).peekable();
+            if chunks.peek().is_none() {
+                return Ok(()); // an empty data frame carries nothing
+            }
+            for c in chunks {
+                buf.extend_from_slice(&encode_framed(FRAME_DATA, c));
+            }
+            w.write_all(&buf).await?;
+            w.flush().await
+        }
+        OP_TEXT if payload == b"eof" => {
+            w.write_all(&encode_framed(FRAME_EOF, &[])).await?;
+            w.flush().await
+        }
+        OP_TEXT => match framed_reason(payload) {
+            Some(reason) => {
+                w.write_all(&encode_framed(FRAME_ERR, reason.as_bytes())).await?;
+                w.flush().await
+            }
+            None => Ok(()),
+        },
+        OP_CLOSE => w.shutdown().await,
+        _ => Ok(()),
     }
 }
 
@@ -278,6 +421,72 @@ mod tests {
         assert_eq!(f.payload, b"hello");
         drop(server);
         assert_eq!(r.next().await.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn framed_frames() {
+        assert_eq!(encode_framed(FRAME_DATA, b"hi"), vec![0, 0, 2, b'h', b'i']);
+        assert_eq!(encode_framed(FRAME_EOF, b""), vec![1, 0, 0]);
+        let mut wire = encode_framed(FRAME_DATA, &[7; 300]);
+        wire.extend(encode_framed(0x7F, b"unknown, skipped"));
+        wire.extend(encode_framed(FRAME_EOF, b""));
+        wire.extend(encode_framed(FRAME_ERR, b"why"));
+        let (f, used) = parse_framed(&wire).unwrap().unwrap();
+        let f = f.unwrap();
+        assert_eq!((f.op, f.payload.len()), (OP_BINARY, 300));
+        let rest = &wire[used..];
+        let (f, used2) = parse_framed(rest).unwrap().unwrap();
+        assert!(f.is_none(), "unknown types are skipped");
+        let rest = &rest[used2..];
+        let (f, used3) = parse_framed(rest).unwrap().unwrap();
+        assert_eq!(f.unwrap().payload, b"eof");
+        let (f, _) = parse_framed(&rest[used3..]).unwrap().unwrap();
+        assert_eq!(f.unwrap().payload, b"err:why");
+        for cut in [0, 1, 2, 3, 302] {
+            assert!(parse_framed(&wire[..cut]).unwrap().is_none(), "{cut}");
+        }
+        assert!(parse_framed(&[1, 0, 1, 0]).is_err(), "eof with a payload");
+        assert!(parse_framed(&[2, 0, 0]).is_err(), "empty err");
+        assert!(parse_framed(&[2, 4, 1]).is_err(), "err over 1024");
+        assert!(parse_framed(&encode_framed(FRAME_DATA, &[0; 65535])).unwrap().is_some());
+    }
+
+    #[test]
+    fn framed_reasons() {
+        assert_eq!(framed_reason(b"err:"), Some(NO_REASON.to_string()));
+        assert_eq!(framed_reason(b"eof"), None);
+        let long = format!("err:{}", "é".repeat(600));
+        let r = framed_reason(long.as_bytes()).unwrap();
+        assert!(r.len() <= MAX_FRAMED_ERR && r.len() >= MAX_FRAMED_ERR - 1);
+    }
+
+    #[tokio::test]
+    async fn framed_writer_and_reader() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (mut w, r) = (a, b);
+        let big = vec![9u8; 70_000];
+        write_framed(&mut w, OP_BINARY, &big).await.unwrap();
+        write_framed(&mut w, OP_PING, b"").await.unwrap();
+        write_framed(&mut w, OP_TEXT, b"something else").await.unwrap();
+        write_framed(&mut w, OP_TEXT, b"eof").await.unwrap();
+        write_framed(&mut w, OP_TEXT, b"err:gone").await.unwrap();
+        write_framed(&mut w, OP_CLOSE, b"").await.unwrap();
+        let mut fr = FrameReader::framed(r);
+        let a = fr.next().await.unwrap();
+        let b = fr.next().await.unwrap();
+        assert_eq!((a.op, a.payload.len(), b.op, b.payload.len()), (OP_BINARY, 65535, OP_BINARY, 70_000 - 65535));
+        assert_eq!(fr.next().await.unwrap().payload, b"eof");
+        assert_eq!(fr.next().await.unwrap().payload, b"err:gone");
+        assert_eq!(fr.next().await.unwrap().op, OP_CLOSE, "FIN at a boundary is the close");
+    }
+
+    #[tokio::test]
+    async fn framed_fin_inside_a_frame() {
+        let (mut w, r) = tokio::io::duplex(64);
+        w.write_all(&[0, 0, 5, b'a']).await.unwrap();
+        drop(w);
+        let mut fr = FrameReader::framed(r);
+        assert_eq!(fr.next().await.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

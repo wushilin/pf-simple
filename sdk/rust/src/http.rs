@@ -24,9 +24,7 @@ const MAX_BODY: usize = 4096;
 pub(crate) type Tls = TlsStream<TcpStream>;
 
 /// What a WebSocket runs over: TLS to the hub, or a pipe in tests.
-pub(crate) trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Io for T {}
-pub(crate) type Stream = Box<dyn Io>;
+pub(crate) use crate::transport::Stream;
 
 /// Opens a stream to the hub: TLS over TCP, or a pipe to a fake hub in
 /// tests.

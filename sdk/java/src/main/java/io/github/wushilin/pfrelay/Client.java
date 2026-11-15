@@ -29,7 +29,7 @@ import javax.net.ssl.SSLContext;
  */
 public final class Client {
     /** This SDK's version. */
-    public static final String VERSION = "0.2.0";
+    public static final String VERSION = "0.3.0";
     /** What a Client calls itself in the hub's log and console unless told otherwise. */
     public static final String DEFAULT_AGENT = "pfrelay-java " + VERSION;
     /** The target a serving side names when it offers stdin/stdout. */
@@ -66,6 +66,8 @@ public final class Client {
     private final int maxProto; // -1: announce none; otherwise 0 to Proto.MAX
     private final boolean noReuse;
     private final int maxIdleLegs;
+    /** Another way to the hub than WebSocket (pfrelay-quic); null for WebSocket. */
+    private final Transport transport;
     final Registry registry = new Registry();
 
     private Client(Builder b) {
@@ -99,6 +101,7 @@ public final class Client {
             throw new IllegalArgumentException("maxIdleLegs must not be negative; use noReuse() to keep none");
         }
         this.maxIdleLegs = b.maxIdleLegs == 0 ? DEFAULT_MAX_IDLE_LEGS : b.maxIdleLegs;
+        this.transport = b.transport;
         if (b.sslContext != null) {
             this.ssl = b.sslContext;
         } else if (b.caFile != null) {
@@ -138,8 +141,19 @@ public final class Client {
         private int maxProto;
         private boolean noReuse;
         private int maxIdleLegs = DEFAULT_MAX_IDLE_LEGS;
+        private Transport transport;
 
         private Builder() {}
+
+        /**
+         * Reaches the hub over another transport than WebSocket, for SDKs
+         * built on this one, such as pfrelay-quic, whose own builder sets
+         * it. Applications do not call this; see {@link Transport}.
+         */
+        public Builder transport(Transport transport) {
+            this.transport = transport;
+            return this;
+        }
 
         /**
          * The newest tunnel protocol to offer, to behave like an older
@@ -503,6 +517,16 @@ public final class Client {
      * @throws ProtoException        the hub is too old for the client token
      */
     public Conn dial() throws IOException {
+        if (transport != null) {
+            Transport.Dialed d = transport.connect(params());
+            Framed link = new Framed(d.stream());
+            try {
+                return new Conn(link, this, new ConnId(d.id() == null ? "" : d.id()), Side.CONNECT);
+            } catch (IOException | RuntimeException e) {
+                link.abort();
+                throw e;
+            }
+        }
         WebSocket ws = openWs(Endpoint.CONNECT, connectHeader());
         ConnId id = new ConnId(ws.header.getOrDefault(H_CONN, ""));
         try {
@@ -521,7 +545,56 @@ public final class Client {
      * @throws ProtoException        the hub is too old for the client token
      */
     public void check() throws IOException {
+        if (transport != null) {
+            requireWord();
+            transport.check(params());
+            return;
+        }
         get(Endpoint.CHECK, connectHeader());
+    }
+
+    /**
+     * Lets go of what the client keeps between requests: over QUIC, its
+     * connection to the hub. Over WebSocket there is nothing to let go
+     * of. Listeners, forwarders and connections are closed on their own.
+     * The client may still be used afterwards; it then connects again.
+     */
+    public void close() {
+        if (transport != null) {
+            transport.close();
+        }
+    }
+
+    // ---------- another transport (Transport) ----------
+
+    /** The transport this client uses instead of WebSocket; null for WebSocket. */
+    Transport transport() {
+        return transport;
+    }
+
+    /** What the transport needs of this client, for a request made on this thread. */
+    Transport.Params params() {
+        return new Transport.Params(this, Canceller.current());
+    }
+
+    /** A plain GET of the hub, with no protocol negotiation; any answer comes back. */
+    Http.Response httpGet(String path, Map<String, String> h) throws IOException {
+        if (!agent.isEmpty()) {
+            h.putIfAbsent(H_VERSION, agent);
+        }
+        return Http.request(target, path, h, ssl, false);
+    }
+
+    String serveToken() {
+        return serveToken;
+    }
+
+    String clientToken() {
+        return clientToken;
+    }
+
+    String agent() {
+        return agent;
     }
 
     /**

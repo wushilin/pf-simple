@@ -46,14 +46,17 @@ jobs:
           mkdir -p dist
           name="pf-simple-${GOOS}-${GOARCH}"
           client="pf-client-${GOOS}-${GOARCH}"
+          quic="pf-client-quic-${GOOS}-${GOARCH}"
           if [ "$GOOS" = "windows" ]; then
             go build -trimpath -ldflags="-s -w" -o "dist/${name}.exe" .
             go build -trimpath -ldflags="-s -w" -o "dist/${client}.exe" ./cmd/pf-client
-            (cd dist && zip -q "${name}.zip" "${name}.exe" "${client}.exe")
+            go build -trimpath -ldflags="-s -w" -o "dist/${quic}.exe" ./cmd/pf-client-quic
+            (cd dist && zip -q "${name}.zip" "${name}.exe" "${client}.exe" "${quic}.exe")
           else
             go build -trimpath -ldflags="-s -w" -o "dist/${name}" .
             go build -trimpath -ldflags="-s -w" -o "dist/${client}" ./cmd/pf-client
-            tar -C dist -czf "dist/${name}.tar.gz" "${name}" "${client}"
+            go build -trimpath -ldflags="-s -w" -o "dist/${quic}" ./cmd/pf-client-quic
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}" "${client}" "${quic}"
           fi
       - uses: actions/upload-artifact@v4
         with:

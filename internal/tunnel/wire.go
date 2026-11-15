@@ -26,6 +26,9 @@ const (
 	// registers the token's SHA-256, and the connecting side sends the token.
 	HeaderClientHash  = "X-PF-Client-Token-SHA256"
 	HeaderClientToken = "X-PF-Client-Token"
+	// HeaderOp says what a QUIC discovery is for: "serve" or "connect"
+	// (protocol 3; only that endpoint has it).
+	HeaderOp = "X-PF-Tunnel-Op"
 
 	MinSecret = 32
 	MaxSecret = 128
@@ -145,4 +148,11 @@ func Fingerprint(cert *x509.Certificate) string {
 		b.WriteString(text[i : i+2])
 	}
 	return b.String()
+}
+
+// HashClientToken is what a serving side registers for its client token:
+// the SHA-256 of the token, in hex.
+func HashClientToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }

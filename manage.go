@@ -577,6 +577,11 @@ func (m *manager) saveTunnelReuse(r reuseSettings) error {
 	return m.saveTunnel(func(t *tunnelTable) { t.Reuse = reuseTableOf(r) })
 }
 
+// saveTunnelQUIC writes [tunnel.quic].
+func (m *manager) saveTunnelQUIC(q quicSettings) error {
+	return m.saveTunnel(func(t *tunnelTable) { t.QUIC = quicTableOf(q) })
+}
+
 // saveConsoleTLS writes the console's TLS settings into [console]. On
 // failure nothing has changed.
 func (m *manager) saveConsoleTLS(mode, dir string, names []string) error {

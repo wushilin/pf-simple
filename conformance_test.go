@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wushilin/pf-simple/internal/quictun"
 	"github.com/wushilin/pf-simple/internal/tunnel"
 	"github.com/wushilin/pf-simple/pfrelay"
 )
@@ -53,13 +54,18 @@ type driver struct {
 	// 0 announces none. hub is the hub's newest: 2, 1 (like 0.14) or 0
 	// (like a hub from before 0.14).
 	protoMax, hub int
+	// quic is a driver of protocol 3, the QUIC transport. It speaks only
+	// that, so the protocol knobs do not apply; the hub has its QUIC
+	// listener on, and the Go SDK on the other side of each case stays on
+	// WebSocket, so every case also crosses the hub's bridge.
+	quic bool
 }
 
 // common is the protocol the two sides end up with.
 func (d driver) common() int { return min(d.hub, d.protoMax) }
 
 // reuse says whether legs are reused in this configuration.
-func (d driver) reuse() bool { return d.common() >= 2 }
+func (d driver) reuse() bool { return !d.quic && d.common() >= 2 }
 
 // The driver's commands, modes and queries (conformance/README.md).
 type (
@@ -95,12 +101,19 @@ const (
 
 func conformanceDriver(t *testing.T) driver {
 	t.Helper()
+	return conformanceDriverOf(t, os.Getenv("PF_CONFORMANCE_DRIVER"), "")
+}
+
+// conformanceDriverOf is the driver of command line cmd, or with cmd empty
+// the Go driver, built for transport ("" or "quic").
+func conformanceDriverOf(t *testing.T, cmd, transport string) driver {
+	t.Helper()
 	var argv []string
-	if d := os.Getenv("PF_CONFORMANCE_DRIVER"); d != "" {
-		argv = strings.Fields(d)
+	if cmd != "" {
+		argv = strings.Fields(cmd)
 	} else {
 		bin := filepath.Join(t.TempDir(), "go-driver")
-		out, err := exec.Command("go", "build", "-o", bin, "./conformance/go-driver").CombinedOutput()
+		out, err := exec.Command("go", "build", "-ldflags=-X main.transport="+transport, "-o", bin, "./conformance/go-driver").CombinedOutput()
 		if err != nil {
 			t.Fatalf("building the Go driver: %v\n%s", err, out)
 		}
@@ -110,8 +123,8 @@ func conformanceDriver(t *testing.T) driver {
 	// A driver from before the protocols command speaks 0-1.
 	out, err := exec.Command(argv[0], append(append([]string{}, argv[1:]...), string(cmdProtocols))...).Output()
 	if err == nil {
-		if _, max, perr := tunnel.ParseProtoRange(strings.TrimSpace(string(out))); perr == nil {
-			d.speaks = max
+		if min, max, perr := tunnel.ParseProtoRange(strings.TrimSpace(string(out))); perr == nil {
+			d.speaks, d.quic = max, min >= quictun.Proto
 		}
 	}
 	d.protoMax, d.hub = d.speaks, tunnel.ProtoMax
@@ -170,12 +183,17 @@ func newConformanceHub(t *testing.T, d driver) *conformanceHub {
 	if err := os.WriteFile(ca, caPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if d.quic {
+		f.withQUIC(t)
+	}
 	f.hub.mu.Lock()
 	switch d.hub {
 	case 0:
 		f.hub.silent = true
-	case 1:
-		f.hub.maxProto = 1
+	default:
+		if d.hub < tunnel.ProtoMax {
+			f.hub.maxProto = d.hub // speak no newer than that hub
+		}
 	}
 	f.hub.mu.Unlock()
 	return &conformanceHub{relayFixture: f, ca: ca, d: d, server: f.srv.URL, leaf: leaf, roots: pool}
@@ -530,6 +548,10 @@ func parallel(n int, f func(i int) error) error {
 // and an SDK that behaves like an old client works with a new hub.
 func TestConformance(t *testing.T) {
 	base := conformanceDriver(t)
+	if base.quic {
+		conformanceQUIC(t, base)
+		return
+	}
 	seen := map[[2]int]bool{}
 	for _, cfg := range []struct{ hub, client int }{
 		{2, 2}, {2, 1}, {2, 0}, {1, 2}, {0, 2},
@@ -741,7 +763,7 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 		}
 	})
 
-	only(d.hub == 2 && d.protoMax >= 1, "protocol 0 hub", func(t *testing.T) {
+	only(!d.quic && d.hub == tunnel.ProtoMax && d.protoMax >= 1, "protocol 0 hub", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.hub.mu.Lock()
 		h.hub.silent = true
@@ -1297,7 +1319,9 @@ func (h *conformanceHub) refuseServes(t *testing.T, n int) func() []time.Time {
 	var mu sync.Mutex
 	var times []time.Time
 	front := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/serve") {
+		// A registration's first request: serve over WebSocket, the
+		// discovery for serving over QUIC.
+		if strings.HasSuffix(r.URL.Path, "/serve") || (strings.HasSuffix(r.URL.Path, "/quic") && r.Header.Get(tunnel.HeaderOp) == "serve") {
 			mu.Lock()
 			times = append(times, time.Now())
 			refuse := len(times) <= n
@@ -1359,4 +1383,26 @@ func checkNoLeak(t *testing.T, p *proc, warm, load func()) {
 	if after > before+8 {
 		t.Errorf("the driver held %d file descriptors before and %d after: about %d leaked over the connections", before, after, after-before)
 	}
+}
+
+// conformanceQUIC runs every case with a driver of protocol 3, against a
+// hub with its QUIC listener on: the driver on QUIC, the Go SDK on the
+// other side of each case on WebSocket.
+func conformanceQUIC(t *testing.T, d driver) {
+	d.hub, d.protoMax = tunnel.ProtoMax, d.speaks
+	t.Run("quic", func(t *testing.T) { conformanceCases(t, d, true) })
+}
+
+// TestConformanceQUIC runs the Go SDK's QUIC driver (pfrelayquic) through
+// the suite. Another SDK's QUIC driver runs in TestConformance, which
+// tells it by the protocols it speaks.
+func TestConformanceQUIC(t *testing.T) {
+	if os.Getenv("PF_CONFORMANCE_DRIVER") != "" {
+		t.Skip("PF_CONFORMANCE_DRIVER is set: TestConformance runs that driver")
+	}
+	d := conformanceDriverOf(t, "", "quic")
+	if !d.quic {
+		t.Fatal("the Go driver's QUIC build does not speak protocol 3")
+	}
+	conformanceQUIC(t, d)
 }

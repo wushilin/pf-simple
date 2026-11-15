@@ -81,6 +81,10 @@ const (
 	HeaderSession   = "X-PF-Tunnel-Session"
 	HeaderKeepAlive = "X-PF-Tunnel-Keep-Alive"
 
+	// The WebSocket endpoints speak protocols ProtoMin to ProtoMax.
+	// Protocol 3 is the QUIC transport (docs/PROTOCOL.md): it is
+	// spoken only over QUIC, and negotiated there (internal/quictun), so
+	// it is not in this range.
 	ProtoMin = 0
 	ProtoMax = 2
 )

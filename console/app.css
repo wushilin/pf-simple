@@ -542,6 +542,7 @@ dialog#editor::backdrop { background: rgba(10, 14, 20, .45); }
 .r-reused { margin-left: 6px; color: var(--fg-3); font-weight: 600; }
 .r-cols.idle-leg > :not(.r-state):not(:last-child) { color: var(--fg-3); }
 .relay-chip.reuse { background: var(--bg); color: var(--fg-2); border: 1px solid var(--line); }
+.relay-quic-state { display: block; margin-top: 6px; color: var(--fg-1); }
 .reuse-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 10px; color: var(--fg-2); font-size: var(--t-small); }
 .reuse-form label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .reuse-form input[type=number] { width: 76px; height: 30px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--fg); font: inherit; font-size: var(--t-body); }

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/wushilin/pf-simple/internal/relayhook"
 	"github.com/wushilin/pf-simple/internal/tunnel"
 	"io"
 	"net"
@@ -66,6 +67,10 @@ type Client struct {
 	MaxProto int
 
 	reg registry // connections and totals
+
+	// alt is a transport other than WebSocket, attached by pfrelayquic
+	// (alt.go); nil for WebSocket.
+	alt relayhook.Transport
 }
 
 // Close releases what the client keeps between requests: its idle HTTP
@@ -73,6 +78,9 @@ type Client struct {
 // their own Close, or end with their context.
 func (c *Client) Close() error {
 	c.http.CloseIdleConnections()
+	if c.alt != nil {
+		return c.alt.Close()
+	}
 	return nil
 }
 
@@ -305,6 +313,9 @@ func (c *Client) Probe(ctx context.Context) (*ServerInfo, error) {
 
 // Check asks the relay whether someone is serving this word.
 func (c *Client) Check(ctx context.Context) error {
+	if c.alt != nil {
+		return explain(c.alt.Check(ctx, c.params()))
+	}
 	return explain(c.get(ctx, "check", c.connectHeader()))
 }
 
@@ -364,17 +375,15 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 	defer cancel()
 	var taken atomic.Bool
 	done := make(chan error, 1)
-	open := func(_ *registration, id string, _ *tunnel.Stream) {
-		h := c.header(id)
+	open := func(reg *registration, id string, _ *tunnel.Stream) {
 		if !taken.CompareAndSwap(false, true) {
 			c.logf("connection %s refused: this side carries one connection, and has one", short(id))
 			const reason = "the serving side carries a single connection and already has one"
 			c.refused(id, reason)
-			h.Set(tunnel.HeaderError, reason)
-			_ = c.get(ctx, "accept", h)
+			_ = c.refuseOpen(ctx, reg, id, reason)
 			return
 		}
-		ws, err := c.dial(ctx, "accept", h)
+		stream, err := c.accept(ctx, reg, id, false)
 		if err != nil {
 			// Nothing was read from local yet, so the next one may have it.
 			c.logf("connection %s failed: cannot bring it to the server: %v", short(id), explain(err))
@@ -383,7 +392,6 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 		}
 		c.logf("connection %s open: tunnel -> stdin/stdout", short(id))
 		started := time.Now()
-		stream := tunnel.NewStream(ws)
 		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 		defer stop()
 		rec := c.reg.add(id, SideServe, stream)
@@ -413,6 +421,9 @@ func (c *Client) ServeOne(ctx context.Context, local HalfCloser) error {
 // called each time a registration succeeds (true) or its control channel is
 // lost (false).
 func (c *Client) serve(ctx context.Context, target string, open func(reg *registration, id string, leg *tunnel.Stream), up func(bool)) error {
+	if c.alt != nil {
+		return c.serveAlt(ctx, target, open, up)
+	}
 	h := c.header("")
 	h.Set(tunnel.HeaderTarget, target)
 	if c.ServeToken != "" {
@@ -577,9 +588,7 @@ func (c *Client) serveConn(ctx context.Context, reg *registration, id, target st
 			leg.Fail(reason) // after "bound", a refusal is an err: (§12.7)
 			return
 		}
-		h := c.header(id)
-		h.Set(tunnel.HeaderError, reason)
-		if err := c.get(ctx, "accept", h); err != nil {
+		if err := c.refuseOpen(ctx, reg, id, reason); err != nil {
 			c.logf("connection %s: could not tell the server: %v", short(id), explain(err))
 		}
 		return
@@ -878,17 +887,15 @@ func (e *endError) Error() string { return e.reason }
 func (e *endError) Unwrap() error { return e.err }
 
 func (c *Client) carry(ctx context.Context, local HalfCloser, from string) error {
-	ws, err := c.dial(ctx, "connect", c.connectHeader())
+	stream, fullID, err := c.connectStream(ctx)
 	if err != nil {
 		_ = local.Close()
 		err = explain(err)
 		c.logf("connection from %s refused: %v", from, err)
 		return err
 	}
-	fullID := ws.Header.Get(tunnel.HeaderConn)
 	id, started := short(fullID), time.Now()
 	c.logf("connection %s open: %s -> tunnel %s", id, from, c.wordLabel())
-	stream := tunnel.NewStream(ws)
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
 	rec := c.reg.add(fullID, SideConnect, stream)

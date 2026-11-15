@@ -44,6 +44,14 @@ driver protocols
 `protocols` prints the range of tunnel protocols the driver speaks, such
 as `0-2`, and exits. A driver without it is taken to speak `0-1`.
 
+A driver of a QUIC SDK (pfrelay-quic, protocol 3) prints `3-3`. The suite
+then runs every case with the hub's QUIC listener on: the driver reaches
+the hub over QUIC, and the Go SDK on the other side of each case stays on
+WebSockets, so each case also goes through the hub's bridge between the
+two. The cases about protocol 2 (reuse) and older hubs do not apply, and
+`--proto-max` is never passed. `go test -run TestConformanceQUIC .` runs
+the Go SDK's own QUIC driver.
+
 A driver that speaks protocol 2 also takes `--proto-max N` on every
 command: the SDK then offers no protocol newer than N, to behave like an
 older client. `1` behaves like pf-client 0.14, and `0` like one from before

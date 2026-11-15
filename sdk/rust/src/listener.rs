@@ -30,10 +30,10 @@ type Pending = (Conn, OwnedSemaphorePermit);
 
 pub(crate) struct Shared {
     pub(crate) cancel: CancellationToken,
-    up: AtomicBool,
-    slots: Arc<Semaphore>,
+    pub(crate) up: AtomicBool,
+    pub(crate) slots: Arc<Semaphore>,
     /// Why serving stopped on its own, if it did.
-    end: Mutex<Option<Error>>,
+    pub(crate) end: Mutex<Option<Error>>,
     /// The connections waiting for `Listener::accept`, for a listener.
     queue: tokio::sync::Mutex<Option<mpsc::Receiver<Pending>>>,
 }
@@ -176,8 +176,8 @@ impl Drop for Listener {
     }
 }
 
-const STOPPED_LISTENING: &str = "the serving side stopped listening";
-const BACKLOG_FULL: &str = "the serving side is not accepting connections fast enough";
+pub(crate) const STOPPED_LISTENING: &str = "the serving side stopped listening";
+pub(crate) const BACKLOG_FULL: &str = "the serving side is not accepting connections fast enough";
 
 fn drop_pending(conn: Conn) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -185,7 +185,7 @@ fn drop_pending(conn: Conn) {
     }
 }
 
-async fn sleep(cancel: &CancellationToken, d: Duration) -> bool {
+pub(crate) async fn sleep(cancel: &CancellationToken, d: Duration) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => false,
         _ = tokio::time::sleep(d) => true,
@@ -203,6 +203,9 @@ pub(crate) async fn serve_loop(
     target: String,
     registered: Option<oneshot::Sender<Result<()>>>,
 ) -> Result<()> {
+    if let Some(t) = c.inner.transport.clone() {
+        return crate::alt::serve_loop(c, t, sh, handler, target, registered).await;
+    }
     let timing = c.inner.timing;
     let mut registered = registered;
     let mut backoff = timing.retry_min;

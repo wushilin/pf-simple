@@ -206,7 +206,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "pfrelay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "hex",

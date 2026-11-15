@@ -31,6 +31,7 @@ public final class Listener implements Closeable {
     private volatile IOException finalError;
     private volatile boolean up;
     private volatile WebSocket control;
+    private volatile Transport.Registration altReg; // the registration over another transport
     private volatile boolean closed;
     private final Canceller canceller = new Canceller(); // requests in flight, cut by close()
     /** For a serve forwarder: the target, and the forwarder; null for a listener. */
@@ -134,6 +135,10 @@ public final class Listener implements Closeable {
         stopped.countDown();
         registered.countDown();
         canceller.cancel();
+        Transport.Registration ar = altReg;
+        if (ar != null) {
+            Sched.go(ar::close);
+        }
         WebSocket ws = control;
         if (ws != null) {
             Sched.go(() -> {
@@ -163,6 +168,10 @@ public final class Listener implements Closeable {
     // ---------- the registration loop (docs/PROTOCOL.md §9) ----------
 
     private void serve() {
+        if (client.transport() != null) {
+            serveAlt(client.transport());
+            return;
+        }
         Map<String, String> h = client.serveHeader(target);
         Timing timing = client.timing();
         long backoff = timing.retryMinMs();
@@ -233,6 +242,156 @@ public final class Listener implements Closeable {
             }
             backoff = timing.next(backoff);
         }
+    }
+
+    /**
+     * The registration loop over another transport (Transport): the same
+     * retries and reports as over WebSocket, with the transport's
+     * registration in place of the control channel.
+     */
+    private void serveAlt(Transport t) {
+        Timing timing = client.timing();
+        long backoff = timing.retryMinMs();
+        boolean served = false;
+        String base = client.server();
+        String tgt = target == null ? client.target() : target;
+        for (int attempt = 1;; attempt++) {
+            if (closed) {
+                return;
+            }
+            Transport.Registration reg = null;
+            IOException err = null;
+            Canceller.Scope scope = canceller.enter();
+            try {
+                reg = t.register(client.params(), tgt);
+            } catch (IOException e) {
+                err = e;
+            } catch (RuntimeException e) {
+                err = new IOException(e.getMessage(), e);
+            } finally {
+                scope.close();
+            }
+            if (closed) {
+                if (reg != null) {
+                    reg.close();
+                }
+                return;
+            }
+            if (err != null) {
+                if (err instanceof ProtoException) {
+                    giveUp(err);
+                    return;
+                }
+                if (!served && err instanceof StatusException && ((StatusException) err).isFinal()) {
+                    giveUp(err);
+                    return;
+                }
+                client.log("cannot register with " + base + " (" + err.getMessage() + "); attempt " + attempt
+                        + ", trying again in " + backoff / 1000.0 + "s");
+            } else {
+                client.log((served ? "registered again with " : "registered with ") + base + " over " + t.name()
+                        + ": serving \"" + client.name() + "\", tunnel " + client.wordLabel() + " -> " + tgt);
+                served = true;
+                attempt = 0;
+                long started = System.nanoTime();
+                altReg = reg;
+                up = true;
+                registered.countDown();
+                if (closed) { // close() may have missed it
+                    reg.close();
+                }
+                client.serving(true);
+                IOException lost;
+                while (true) {
+                    Transport.Open o;
+                    try {
+                        o = reg.next();
+                    } catch (IOException e) {
+                        lost = e;
+                        break;
+                    }
+                    Sched.go(() -> openAlt(o));
+                }
+                reg.close();
+                up = false;
+                altReg = null;
+                client.serving(false);
+                if (closed) {
+                    return;
+                }
+                long lasted = (System.nanoTime() - started) / 1_000_000L;
+                if (lasted >= timing.settledMs()) {
+                    backoff = timing.retryMinMs();
+                }
+                client.log("lost the server after " + lasted / 1000.0 + "s (" + lost.getMessage()
+                        + "); its connections are closed; registering again in " + backoff / 1000.0 + "s");
+            }
+            if (!sleep(backoff)) {
+                return;
+            }
+            backoff = timing.next(backoff);
+        }
+    }
+
+    /** Answers one request for a connection over another transport. */
+    private void openAlt(Transport.Open o) {
+        String id = o.id();
+        Acceptor a = new Acceptor() {
+            @Override
+            public Conn accept() throws IOException {
+                Framed link = new Framed(o.accept());
+                try {
+                    return new Conn(link, client, new ConnId(id), Side.SERVE);
+                } catch (IOException | RuntimeException e) {
+                    link.abort();
+                    throw e;
+                }
+            }
+
+            @Override
+            public void refuse(String reason) {
+                client.refused(new ConnId(id), reason);
+                o.refuse(reason);
+            }
+
+            @Override
+            public void abort() {
+                o.refuse(REASON_STOPPED);
+            }
+        };
+        open(null, id, null, a);
+    }
+
+    /** How one connection the hub asked for is taken or refused. */
+    private interface Acceptor {
+        Conn accept() throws IOException;
+
+        void refuse(String reason);
+
+        /** Lets go of it after a failure of this side's own. */
+        void abort();
+    }
+
+    /** The Acceptor of a connection over WebSocket: an accept leg, or the reused leg it came on. */
+    private Acceptor wsAcceptor(Registration reg, String id, WebSocket leg) {
+        return new Acceptor() {
+            @Override
+            public Conn accept() throws IOException {
+                return leg != null ? new Conn(leg, client, new ConnId(id), Side.SERVE, reg) : client.accept(reg, id);
+            }
+
+            @Override
+            public void refuse(String reason) {
+                Listener.this.refuse(id, leg, reason);
+            }
+
+            @Override
+            public void abort() {
+                if (leg != null) {
+                    leg.abort();
+                }
+            }
+        };
     }
 
     /**
@@ -327,14 +486,18 @@ public final class Listener implements Closeable {
      * a leg to accept.
      */
     private void open(Registration reg, String id, WebSocket leg) {
+        open(reg, id, leg, wsAcceptor(reg, id, leg));
+    }
+
+    private void open(Registration reg, String id, WebSocket leg, Acceptor a) {
         if (target != null) {
-            forward(reg, id, leg);
+            forward(reg, id, leg, a);
             return;
         }
         if (!slots.tryAcquire()) {
             client.log("connection " + Client.shortId(id) + " refused: " + BACKLOG
                     + " connections are waiting to be accepted");
-            refuse(id, leg, REASON_BACKLOG);
+            a.refuse(REASON_BACKLOG);
             return;
         }
         if (leg != null && reg.abandoned(id)) {
@@ -344,7 +507,7 @@ public final class Listener implements Closeable {
         }
         Conn c;
         try {
-            c = leg != null ? new Conn(leg, client, new ConnId(id), Side.SERVE, reg) : client.accept(reg, id);
+            c = a.accept();
         } catch (IOException e) {
             slots.release();
             client.log("connection " + Client.shortId(id) + " failed: cannot bring it to the server: "
@@ -381,19 +544,19 @@ public final class Listener implements Closeable {
      * connecting side hears at once (docs/PROTOCOL.md §9). On a reused leg,
      * "bound" has gone out already, and a refusal is err: (§12.7).
      */
-    private void forward(Registration reg, String id, WebSocket leg) {
+    private void forward(Registration reg, String id, WebSocket leg, Acceptor a) {
         java.net.Socket[] local = new java.net.Socket[1];
         Conn[] conn = new Conn[1];
         boolean done = false;
         try {
-            forward(reg, id, leg, local, conn);
+            forward(reg, id, leg, a, local, conn);
             done = true;
         } finally {
             if (!done) { // a RuntimeException: let go of whatever it held
                 if (conn[0] != null) {
                     conn[0].fail(Bridge.SERVE.self + " failed");
-                } else if (leg != null) {
-                    leg.abort();
+                } else {
+                    a.abort();
                 }
                 if (local[0] != null) {
                     Bridge.closeQuietly(local[0]);
@@ -402,7 +565,8 @@ public final class Listener implements Closeable {
         }
     }
 
-    private void forward(Registration reg, String id, WebSocket leg, java.net.Socket[] held, Conn[] heldConn) {
+    private void forward(Registration reg, String id, WebSocket leg, Acceptor a, java.net.Socket[] held,
+            Conn[] heldConn) {
         String shortId = Client.shortId(id);
         java.net.Socket local;
         try {
@@ -411,7 +575,7 @@ public final class Listener implements Closeable {
         } catch (IOException | IllegalArgumentException e) {
             client.log("connection " + shortId + " failed: cannot reach the target " + target + ": "
                     + e.getMessage());
-            refuse(id, leg, REASON_UNREACHABLE);
+            a.refuse(REASON_UNREACHABLE);
             return;
         }
         if (leg != null && reg.abandoned(id)) {
@@ -423,7 +587,7 @@ public final class Listener implements Closeable {
         }
         Conn c;
         try {
-            c = leg != null ? new Conn(leg, client, new ConnId(id), Side.SERVE, reg) : client.accept(reg, id);
+            c = a.accept();
         } catch (IOException e) {
             client.log("connection " + shortId + " failed: cannot bring it to the server: " + e.getMessage());
             Bridge.closeQuietly(local);

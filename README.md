@@ -469,6 +469,48 @@ connections, marks each connection that runs on a reused one with ↻, and
 counts how many were reused. The protocol is in
 [docs/PROTOCOL.md](docs/PROTOCOL.md) §12.
 
+### QUIC: pf-client-quic
+
+`pf-client-quic` is `pf-client` over QUIC (tunnel protocol 3): the same
+commands, flags and config file, with the hub reached on a UDP port instead
+of over WebSockets. Connections open faster, because QUIC does the
+transport and TLS handshake in one round trip, and a serving side keeps one
+QUIC connection on which each new connection is just a new stream; a lost
+packet holds up only its own stream.
+
+```sh
+# machine B
+pf-client-quic serve https://relay.example.com/ localhost:22 --name "Office SSH"
+# machine A, or in ~/.ssh/config as the ProxyCommand
+pf-client-quic connect https://relay.example.com/ k3f9-x2mq-7hpa stdio
+```
+
+The two kinds of client work with each other: a `pf-client-quic` serving
+side takes connections from `pf-client`, and the other way round; the hub
+joins them. There is no fallback: where UDP is blocked on the way,
+`pf-client-quic` cannot connect, and `pf-client` is the one to use.
+
+The hub turns its QUIC listener on in `[tunnel.quic]`, or in the console's
+Relay hub tab:
+
+```toml
+[tunnel.quic]
+enabled = true
+listen = ":12354"                       # a UDP port; open it in the firewall
+advertise_host = "relay.example.com"    # what clients are told to reach
+# advertise_port = 12354                # if a NAT in front changes the port
+# max_connections = 10000
+# max_buffered_mib = 1024
+```
+
+A client asks the hub's https address where the QUIC listener is, and
+which certificate it uses, and then trusts exactly that certificate. So the
+QUIC listener needs no certificate of its own from a CA: the hub makes one,
+keeps it beside the config file, and replaces it every 45 days (it is valid
+for 60). Clients pick up a new one at their next connection; connections
+already open are not affected. The protocol is in
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) §13.
+
 ### HTTPS without a proxy
 
 The console's listener can serve https itself. It is off unless you turn it
@@ -721,7 +763,13 @@ go func() {
 }()
 ```
 
-SDKs for other languages are under [`sdk/`](sdk). All of them speak the
+Over QUIC, use [`pfrelayquic`](pfrelayquic): `pfrelayquic.NewClient`
+returns the same `*pfrelay.Client`, so everything above works unchanged,
+with the hub reached over QUIC (see [QUIC](#quic-pf-client-quic)).
+
+SDKs for other languages are under [`sdk/`](sdk): `pfrelay` over WebSockets
+and `pfrelay-quic` over QUIC, for Python (WebSockets only for now), Rust
+and Java. All of them speak the
 same protocol, which is specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 Every SDK has to pass the conformance suite in
 [`conformance/`](conformance/README.md), which runs it against a real hub
