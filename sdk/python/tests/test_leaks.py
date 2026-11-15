@@ -222,11 +222,13 @@ class Leaks(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(30)
 
         c = new_client(serve_token="s" * 40, events=pfrelay.Events(on_serving=on_serving))
-        t = asyncio.ensure_future(c.listen())
+        # listen() returns once registered; on_serving runs after that, so
+        # cancelling listen() itself would race its return. The registration
+        # is cut short by closing the listener while the handler still runs.
+        lst = await asyncio.wait_for(c.listen(), 5)
         ctl = await hub.next_ctl()
         await asyncio.wait_for(entered.wait(), 5)
-        t.cancel()
-        await asyncio.gather(t, return_exceptions=True)
+        await asyncio.wait_for(lst.close(), 5)
         self.assertTrue(await hub_sees_end(ctl), "the control channel was left open")
 
     # P4
