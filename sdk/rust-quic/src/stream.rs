@@ -12,6 +12,7 @@ use quinn::{RecvStream, SendStream, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::AbortHandle;
 
+use crate::transport::Hold;
 use crate::wire::code;
 
 /// How long an end keeps a stream after its FIN (after an err, an end, or
@@ -29,11 +30,14 @@ type Send = Arc<Mutex<Option<SendStream>>>;
 /// - A STOP_SENDING from the peer is answered with RESET_STREAM at once,
 ///   echoing its code, whether or not this end is writing: quinn only
 ///   records it (§13.5).
+/// - It holds its QUIC connection open until it has ended, after its FIN
+///   wait too: a Conn outlives its Client, as over WebSocket.
 pub(crate) struct QStream {
     send: Send,
     recv: Option<RecvStream>,
     finished: bool,
     watcher: Option<AbortHandle>,
+    hold: Option<Hold>,
 }
 
 fn varint(c: u32) -> VarInt {
@@ -52,11 +56,11 @@ async fn answer_stop(stopped: impl std::future::Future<Output = Result<Option<Va
 }
 
 impl QStream {
-    pub(crate) fn new(send: SendStream, recv: RecvStream) -> QStream {
+    pub(crate) fn new(send: SendStream, recv: RecvStream, hold: Hold) -> QStream {
         let stopped = send.stopped();
         let send = Arc::new(Mutex::new(Some(send)));
         let watcher = tokio::spawn(answer_stop(stopped, Arc::downgrade(&send))).abort_handle();
-        QStream { send, recv: Some(recv), finished: false, watcher: Some(watcher) }
+        QStream { send, recv: Some(recv), finished: false, watcher: Some(watcher), hold: Some(hold) }
     }
 
     /// Resets the stream: RESET_STREAM for this direction and STOP_SENDING
@@ -108,6 +112,7 @@ impl Drop for QStream {
         // what was sent last is not dropped, and still answer its
         // STOP_SENDING. Then stop reading.
         let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let hold = self.hold.take();
         rt.spawn(async move {
             let stopped = send.stopped();
             tokio::pin!(stopped);
@@ -131,6 +136,7 @@ impl Drop for QStream {
                 }
             }
             let _ = recv.stop(varint(code::CANCELLED));
+            drop(hold); // the connection may close now, if it is retired
         });
     }
 }

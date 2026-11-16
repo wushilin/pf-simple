@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use pfrelay::transport::{self, BoxFuture, Params, Stream};
@@ -30,6 +30,8 @@ const HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
 const WRITE_WAIT: Duration = Duration::from_secs(10);
 /// Opens queued for a registration, beyond the listener's backlog.
 const OPEN_QUEUE: usize = 128;
+/// What a full open queue is refused with: pfrelay's backlog reason (§9).
+const BACKLOG_FULL: &str = "the serving side is not accepting connections fast enough";
 
 const PATH: &str = "/pf/api/tunnel/quic";
 const H_VERSION: &str = "X-PF-Version";
@@ -63,12 +65,31 @@ impl Op {
 /// Reaches the hub over one QUIC connection, made again when it is lost.
 #[derive(Default)]
 pub(crate) struct Quic {
-    conn: tokio::sync::Mutex<Option<Arc<QConn>>>,
+    /// Held while a connection is made, so that one discovery and one
+    /// handshake run at a time. `close` never waits for it.
+    dialing: tokio::sync::Mutex<()>,
+    slot: Mutex<Slot>,
+}
+
+#[derive(Default)]
+struct Slot {
+    /// The connection new requests go on.
+    conn: Option<Arc<QConn>>,
+    /// Connections no new request goes on, each closed (none) once it holds
+    /// nothing (§13.8); `close` closes them at once.
+    retired: Vec<Weak<QConn>>,
+    /// Counts `close` calls: a connection made across one is not kept.
+    closes: u64,
 }
 
 impl Drop for Quic {
+    /// The last client is gone. Its connection is closed (none) once it
+    /// holds nothing: a Conn outlives its Client, as over WebSocket.
     fn drop(&mut self) {
-        self.close();
+        let slot = self.slot.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(qc) = slot.conn.take() {
+            qc.retire();
+        }
     }
 }
 
@@ -102,21 +123,37 @@ impl Quic {
         Ok(d)
     }
 
-    /// The QUIC connection to the hub, made if there is none: discovery,
-    /// then a handshake that pins the certificate, with one more discovery
-    /// after a mismatch (§13.3).
-    async fn get(&self, p: &Params, op: Op) -> Result<Arc<QConn>> {
-        let mut slot = self.conn.lock().await;
-        if let Some(qc) = slot.as_ref().filter(|qc| qc.conn.close_reason().is_none()) {
-            return Ok(qc.clone());
+    /// The QUIC connection to the hub, held for a request, made if there
+    /// is none: discovery, then a handshake that pins the certificate, with
+    /// one more discovery after a mismatch (§13.3).
+    async fn get(&self, p: &Params, op: Op) -> Result<Hold> {
+        if let Some(h) = self.current() {
+            return Ok(h);
         }
-        *slot = None;
+        let _dialing = self.dialing.lock().await;
+        if let Some(h) = self.current() {
+            return Ok(h); // made meanwhile by another request
+        }
+        let closes = self.slot.lock().unwrap().closes;
+        let closed = || self.slot.lock().unwrap().closes != closes;
         for _ in 0..2 {
             let d = self.discover(p, op).await?;
+            if closed() {
+                return Err(Error::Closed);
+            }
             match dial(&d).await {
                 Ok(qc) => {
-                    *slot = Some(qc.clone());
-                    return Ok(qc);
+                    let mut slot = self.slot.lock().unwrap();
+                    if slot.closes != closes {
+                        // `close` was called while it was made: it ends
+                        // what the client carries, this request included.
+                        drop(slot);
+                        qc.close();
+                        return Err(Error::Closed);
+                    }
+                    let hold = qc.hold();
+                    slot.conn = Some(qc);
+                    return Ok(hold);
                 }
                 Err(Dial::Mismatch) => continue,
                 Err(Dial::Failed(e)) => return Err(e),
@@ -125,29 +162,50 @@ impl Quic {
         Err(Error::Tls(PIN_MISMATCH.into()))
     }
 
-    /// Forgets `qc` as the connection to use, if it still is.
-    async fn forget(&self, qc: &Arc<QConn>) {
-        let mut slot = self.conn.lock().await;
-        if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, qc)) {
-            *slot = None;
+    /// The live connection new requests go on, if there is one, held.
+    fn current(&self) -> Option<Hold> {
+        let mut slot = self.slot.lock().unwrap();
+        match &slot.conn {
+            Some(qc) if qc.conn.close_reason().is_none() => Some(qc.hold()),
+            Some(_) => {
+                slot.conn = None; // lost
+                None
+            }
+            None => None,
         }
     }
 
-    /// Opens a stream, sends `req`, and reads the hub's answer. A refusal
-    /// comes back as an error, after this direction is ended.
-    async fn request(&self, p: &Params, op: Op, mut req: Request) -> Result<(Arc<QConn>, QStream, Answer)> {
-        let qc = self.get(p, op).await?;
+    /// No new request goes on `qc`; it is closed (none) once it holds
+    /// nothing (§13.8).
+    fn retire(&self, qc: &Arc<QConn>) {
+        {
+            let mut slot = self.slot.lock().unwrap();
+            if slot.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, qc)) {
+                slot.conn = None;
+            }
+            slot.retired.retain(|w| w.upgrade().is_some_and(|c| c.conn.close_reason().is_none() && !Arc::ptr_eq(&c, qc)));
+            slot.retired.push(Arc::downgrade(qc));
+        }
+        qc.retire();
+    }
+
+    /// Opens a stream on the held connection, sends `req`, and reads the
+    /// hub's answer. A refusal comes back as an error, after this direction
+    /// is ended.
+    async fn request(&self, p: &Params, hold: Hold, mut req: Request) -> Result<(QStream, Answer)> {
+        let qc = hold.conn().clone();
         req.proto = PROTO.to_string();
         req.version = p.agent().to_string();
         req.word = p.word().to_string();
         let (send, recv) = match qc.conn.open_bi().await {
             Ok(s) => s,
             Err(e) => {
-                self.forget(&qc).await;
+                drop(hold);
+                self.retire(&qc);
                 return Err(Error::Link(format!("the QUIC connection to the hub was lost ({e})")));
             }
         };
-        let mut s = QStream::new(send, recv);
+        let mut s = QStream::new(send, recv, hold);
         let answered = tokio::time::timeout(ANSWER_WAIT, async {
             wire::write_message(&mut s, &req).await.map_err(|e| e.to_string())?;
             wire::read_message::<_, Answer>(&mut s).await.map_err(|e| e.to_string())
@@ -164,30 +222,44 @@ impl Quic {
                 return Err(Error::Link("the hub did not answer in time".into()));
             }
         };
-        if a.proto != 0 && a.proto != PROTO {
-            s.reset(code::PROTOCOL);
-            return Err(Error::Protocol(format!(
-                "the hub answered in QUIC protocol {}; this client speaks {PROTO}",
-                a.proto
-            )));
-        }
+        // The status first: a refusal, a 426 included, carries the hub's
+        // own protocol in `proto` (§13.4).
         if a.status != 200 && a.status != 204 {
             // The hub sends FIN and STOP_SENDING; end this direction too.
             s.reset_write(code::REFUSED);
             drop(s);
             if a.status == 429 && a.scope == "connection" {
-                self.forget(&qc).await; // the next request opens a new connection (§13.8)
+                // The next request opens a new connection, and this one is
+                // closed once it holds nothing (§13.8).
+                self.retire(&qc);
             }
             return Err(transport::refused(a.status, &a.error));
         }
-        Ok((qc, s, a))
+        if a.proto != 0 && a.proto != PROTO {
+            s.reset(code::PROTOCOL);
+            return Err(Error::Status {
+                code: 426,
+                message: format!(
+                    "the hub answered in QUIC protocol {}; this client speaks {PROTO}: upgrade pfrelay-quic",
+                    a.proto
+                ),
+            });
+        }
+        Ok((s, a))
     }
 
+    /// Closes every connection at once (none), ending what they carry. A
+    /// request making a connection meanwhile fails as closed.
     fn close(&self) {
-        if let Ok(mut slot) = self.conn.try_lock() {
-            if let Some(qc) = slot.take() {
-                qc.conn.close(VarInt::from_u32(code::NONE), b"done");
-            }
+        let conns: Vec<Arc<QConn>> = {
+            let mut slot = self.slot.lock().unwrap();
+            slot.closes += 1;
+            let mut conns: Vec<_> = slot.retired.drain(..).filter_map(|w| w.upgrade()).collect();
+            conns.extend(slot.conn.take());
+            conns
+        };
+        for qc in conns {
+            qc.close();
         }
     }
 }
@@ -198,14 +270,28 @@ enum Dial {
     Failed(Error),
 }
 
-/// Opens a QUIC connection to the discovered listener.
+/// Opens a QUIC connection to the discovered listener: to each of its
+/// host's addresses in turn, until one answers.
 async fn dial(d: &Discovery) -> std::result::Result<Arc<QConn>, Dial> {
+    let addrs: Vec<SocketAddr> =
+        match tokio::time::timeout(HANDSHAKE_WAIT, tokio::net::lookup_host((d.host.as_str(), d.port as u16))).await {
+            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Err(e)) => return Err(Dial::Failed(unreachable(&e.to_string()))),
+            Err(_) => return Err(Dial::Failed(unreachable(&format!("looking up {} timed out", d.host)))),
+        };
+    let mut last = unreachable(&format!("{} has no address", d.host));
+    for addr in addrs {
+        match dial_addr(d, addr).await {
+            Err(Dial::Failed(e)) => last = e,
+            done => return done,
+        }
+    }
+    Err(Dial::Failed(last))
+}
+
+/// Opens a QUIC connection to one address of the discovered listener.
+async fn dial_addr(d: &Discovery, addr: SocketAddr) -> std::result::Result<Arc<QConn>, Dial> {
     let fail = |e: Error| Dial::Failed(e);
-    let addr: SocketAddr = tokio::net::lookup_host((d.host.as_str(), d.port as u16))
-        .await
-        .map_err(|e| fail(unreachable(&e.to_string())))?
-        .next()
-        .ok_or_else(|| fail(unreachable(&format!("{} has no address", d.host))))?;
     let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
     let endpoint = quinn::Endpoint::client(bind).map_err(|e| fail(unreachable(&e.to_string())))?;
     let pin = Arc::new(Pin::new(d.pins()));
@@ -269,9 +355,59 @@ struct ConnState {
     regs: HashMap<String, mpsc::Sender<QOpen>>,
     /// Serve requests not yet answered.
     serves: usize,
+    /// Holds: requests under way, and streams until they have ended. A
+    /// registration holds its serve stream; a Conn holds its stream.
+    held: usize,
+    /// No new request goes on this connection: it is closed once nothing
+    /// holds it.
+    retired: bool,
+}
+
+/// Keeps a QUIC connection open while it lives, for a request or a stream.
+pub(crate) struct Hold(Arc<QConn>);
+
+impl Hold {
+    fn conn(&self) -> &Arc<QConn> {
+        &self.0
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let idle = {
+            let mut st = self.0.state.lock().unwrap();
+            st.held -= 1;
+            st.retired && st.held == 0
+        };
+        if idle {
+            self.0.close();
+        }
+    }
 }
 
 impl QConn {
+    fn hold(self: &Arc<Self>) -> Hold {
+        self.state.lock().unwrap().held += 1;
+        Hold(self.clone())
+    }
+
+    /// Closes the connection once nothing holds it (§13.8).
+    fn retire(&self) {
+        let idle = {
+            let mut st = self.state.lock().unwrap();
+            st.retired = true;
+            st.held == 0
+        };
+        if idle {
+            self.close();
+        }
+    }
+
+    /// Closes the connection now: it is no longer needed (none).
+    fn close(&self) {
+        self.conn.close(VarInt::from_u32(code::NONE), b"done");
+    }
+
     fn change(&self, f: impl FnOnce(&mut ConnState)) {
         f(&mut self.state.lock().unwrap());
         self.changed.notify_waiters();
@@ -324,7 +460,8 @@ impl Drop for Serving {
 async fn accept_opens(qc: Arc<QConn>) {
     loop {
         let Ok((send, recv)) = qc.conn.accept_bi().await else { return };
-        tokio::spawn(take_open(qc.clone(), QStream::new(send, recv)));
+        let hold = qc.hold();
+        tokio::spawn(take_open(qc.clone(), QStream::new(send, recv, hold)));
     }
 }
 
@@ -335,14 +472,16 @@ async fn take_open(qc: Arc<QConn>, mut s: QStream) {
         Err(_) => return s.reset(code::REQUEST_TIMEOUT),
     };
     let open = QOpen { s, id: o.open };
-    let refused = match qc.find(&o.reg).await {
+    let (refused, status, why) = match qc.find(&o.reg).await {
         Some(tx) => match tx.try_send(open) {
             Ok(()) => return,
-            Err(e) => e.into_inner(),
+            // The registration does not take its opens fast enough (§9).
+            Err(mpsc::error::TrySendError::Full(open)) => (open, 502, BACKLOG_FULL),
+            Err(mpsc::error::TrySendError::Closed(open)) => (open, 410, "no such registration"),
         },
-        None => open,
+        None => (open, 410, "no such registration"),
     };
-    refused.answer_and_finish(410, "no such registration").await;
+    refused.answer_and_finish(status, why).await;
 }
 
 // ---------- registrations ----------
@@ -499,9 +638,12 @@ impl transport::Transport for Quic {
                 client_token_sha256: p.client_token().map(|t| hex::encode(Sha256::digest(t.as_bytes()))),
                 ..Request::default()
             };
-            let qc = self.get(&p, Op::Serve).await?;
-            let serving = Serving::new(qc); // an open may arrive before the answer (§13.4)
-            let (qc, s, a) = self.request(&p, Op::Serve, req).await?;
+            // The serve is outstanding on the connection its request goes
+            // on: an open may arrive there before the answer (§13.4).
+            let hold = self.get(&p, Op::Serve).await?;
+            let qc = hold.conn().clone();
+            let serving = Serving::new(qc.clone());
+            let (s, a) = self.request(&p, hold, req).await?;
             let (tx, rx) = mpsc::channel(OPEN_QUEUE);
             qc.change(|st| {
                 st.regs.insert(a.reg.clone(), tx);
@@ -517,7 +659,8 @@ impl transport::Transport for Quic {
     fn connect(&self, p: Params) -> BoxFuture<'_, Result<(Stream, String)>> {
         Box::pin(async move {
             let req = Request { op: "connect", client_token: p.client_token().map(str::to_string), ..Request::default() };
-            let (_, s, a) = self.request(&p, Op::Connect, req).await?;
+            let hold = self.get(&p, Op::Connect).await?;
+            let (s, a) = self.request(&p, hold, req).await?;
             Ok((Box::new(s) as Stream, a.conn))
         })
     }
@@ -525,7 +668,8 @@ impl transport::Transport for Quic {
     fn check(&self, p: Params) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let req = Request { op: "check", client_token: p.client_token().map(str::to_string), ..Request::default() };
-            let (_, mut s, _) = self.request(&p, Op::Connect, req).await?;
+            let hold = self.get(&p, Op::Connect).await?;
+            let (mut s, _) = self.request(&p, hold, req).await?;
             s.finish(); // the hub sends FIN after its answer
             Ok(())
         })
