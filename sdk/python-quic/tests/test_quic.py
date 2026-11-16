@@ -458,7 +458,7 @@ class PublicClient(unittest.TestCase):
     def test_is_a_pfrelay_client(self):
         c = pfrelay_quic.Client("https://hub.example", "k3f9-x2mq-7hpa", name="x")
         self.assertIsInstance(c, pfrelay.Client)
-        self.assertTrue(c.agent.startswith("pfrelay-quic-py 0.3.0"))
+        self.assertTrue(c.agent.startswith("pfrelay-quic-py 0.16.0"))
         self.assertEqual(c.transport.name, "QUIC")
 
 

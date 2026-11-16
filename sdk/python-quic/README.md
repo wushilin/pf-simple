@@ -11,7 +11,7 @@ pfrelay's, and behave the same. A QUIC side works with a WebSocket side
 through the same hub, in either role.
 
 - Python 3.11 or later (aioquic 1.8 needs it).
-- Depends on `pfrelay` 0.3 and `aioquic` 1.8 or later.
+- Depends on `pfrelay` 0.16 and `aioquic` 1.8 or later.
 
 ```sh
 pip install pfrelay-quic

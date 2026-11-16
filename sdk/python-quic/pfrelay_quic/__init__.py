@@ -53,7 +53,7 @@ from pfrelay import (
 from ._quic import IDLE_TIMEOUT, KEEP_ALIVE, fingerprint
 from ._transport import ANSWER_WAIT, NO_QUIC, PIN_MISMATCH, PROTO, REQUEST_WAIT, Quic
 
-__version__ = "0.3.0"
+__version__ = "0.16.0"
 DEFAULT_AGENT = f"pfrelay-quic-py {__version__}"
 
 

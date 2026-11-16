@@ -309,7 +309,7 @@ class Client(unittest.IsolatedAsyncioTestCase):
         p = t.params
         self.assertEqual((p.word, p.serve_token, p.client_token, p.name), (WORD, "s" * 40, "c" * 20, "Mon service é"))
         self.assertEqual(len(p.client_token_sha256), 64)
-        self.assertTrue(p.agent.startswith("pfrelay-py 0.3.0"))
+        self.assertTrue(p.agent.startswith("pfrelay-py 0.16.0"))
         await lst.close()
 
     async def test_dial_and_check(self):

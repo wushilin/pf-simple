@@ -6,7 +6,7 @@ tunnel from your own program, or connect through one, over UDP instead of
 WebSockets. It passes the [conformance suite](../../conformance/README.md).
 
 - Java 17 or later.
-- Maven: `io.github.wushilin:pfrelay-quic:0.3.0`. It depends on
+- Maven: `io.github.wushilin:pfrelay-quic:0.16.0`. It depends on
   [pfrelay](../java) (the WebSocket SDK, same version) and on
   [kwik](https://github.com/ptrd/kwik) (`tech.kwik:kwik`), a QUIC
   implementation in pure Java.

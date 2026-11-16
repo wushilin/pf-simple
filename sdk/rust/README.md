@@ -3,12 +3,12 @@
 The Rust SDK for the [pf-simple](../../README.md) relay hub. With it, your
 program can serve a tunnel or connect through one, with no `pf-client` in
 between. It is async and runs on tokio, uses rustls for TLS, and speaks
-tunnel protocols 0 and 1 as defined in
+tunnel protocols 0 to 2 as defined in
 [`docs/PROTOCOL.md`](../../docs/PROTOCOL.md).
 
 ```toml
 [dependencies]
-pfrelay = { path = "sdk/rust" }   # not on crates.io yet
+pfrelay = "0.16"
 tokio = { version = "1", features = ["full"] }
 ```
 

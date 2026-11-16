@@ -2,16 +2,20 @@ name: Release SDKs
 
 # One tag per SDK, carrying that SDK's own version:
 #
-#   python-v0.1.0   ->  PyPI           (pfrelay)
-#   rust-v0.1.0     ->  crates.io      (pfrelay)
-#   java-v0.1.0     ->  Maven Central  (io.github.wushilin:pfrelay)
-#   rust-quic-v0.3.0 -> crates.io      (pfrelay-quic)
-#   java-quic-v0.3.0 -> Maven Central  (io.github.wushilin:pfrelay-quic)
-#   python-quic-v0.3.0 -> PyPI         (pfrelay-quic)
+#   python-v0.16.0       ->  PyPI           (pfrelay)
+#   rust-v0.16.0         ->  crates.io      (pfrelay)
+#   java-v0.16.0         ->  Maven Central  (io.github.wushilin:pfrelay)
+#   python-quic-v0.16.0  ->  PyPI           (pfrelay-quic)
+#   rust-quic-v0.16.0    ->  crates.io      (pfrelay-quic)
+#   java-quic-v0.16.0    ->  Maven Central  (io.github.wushilin:pfrelay-quic)
+#
+# SDK versions follow pf-simple's minor version: the SDKs of pf-simple 0.16
+# are 0.16.x. Each SDK raises its own patch number when it changes, so a
+# pf-simple release needs no SDK release unless an SDK changed. The version
+# is a label only: behavior follows the negotiated protocol (AGENTS.md).
 #
 # The QUIC SDKs build on their language's pfrelay of the same version, so
-# release that first: rust-v0.3.0 before rust-quic-v0.3.0, java-v0.3.0
-# before java-quic-v0.3.0, python-v0.3.0 before python-quic-v0.3.0.
+# release that first: python-v0.16.0 before python-quic-v0.16.0, and so on.
 #
 # The Go SDK needs none of this: it is the package
 # github.com/wushilin/pf-simple/pfrelay, released with pf-simple's own v* tags

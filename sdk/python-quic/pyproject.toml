@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pfrelay-quic"
-version = "0.3.0"
+version = "0.16.0"
 description = "Python SDK for the pf-simple relay hub over QUIC (tunnel protocol 3): serve a tunnel or connect through one"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["pfrelay>=0.3.0,<0.4", "aioquic>=1.8,<2"]
+dependencies = ["pfrelay>=0.16.0,<0.17", "aioquic>=1.8,<2"]
 keywords = ["tunnel", "relay", "quic", "port-forwarding", "asyncio"]
 classifiers = [
     "Programming Language :: Python :: 3",
