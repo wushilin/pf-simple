@@ -104,8 +104,16 @@ impl Client {
         &self.inner
     }
 
-    /// Closes the QUIC connection to the hub (code `none`), ending what it
-    /// carries. The next request opens a new one.
+    /// Closes the QUIC connections to the hub at once (code `none`), ending
+    /// what they carry; a request that is making a connection meanwhile
+    /// fails with [`Error::Closed`]. The next request opens a new one.
+    ///
+    /// To let what was sent arrive, end the connections first:
+    /// [`Conn::close`] and [`Conn::fail`] wait (up to 3 s) for the hub to
+    /// end its side of the stream, which tells that it has what was sent.
+    /// Dropping the last clone of a client does not close: its connection
+    /// stays open while a [`Conn`] or a registration still uses it, and is
+    /// closed once nothing does.
     pub fn close(&self) {
         pfrelay::transport::Transport::close(&*self.quic);
     }

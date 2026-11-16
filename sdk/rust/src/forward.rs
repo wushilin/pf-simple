@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
-use crate::conn::{Conn, Side, LINK_SILENCE};
+use crate::conn::{Conn, Side, CLOSE_TIMEOUT, LINK_SILENCE};
 use crate::error::{Error, Result};
 use crate::events::ConnId;
 use crate::listener::{refuse, serve_loop, short, Handler, Shared};
@@ -267,6 +267,21 @@ pub(crate) async fn bridge(c: &Client, conn: Conn, tcp: TcpStream, p: &Party, ca
                     _ = cancel.cancelled() => Err(Broke::Stopping),
                 }
             }
+        };
+        let result = match result {
+            Err(Broke::TunnelWrite(e)) if conn.framed() => {
+                // A write on a protocol 3 stream can fail before the reason
+                // is read: a STOP_SENDING may overtake the err sent before
+                // it. The reader keeps reading for it; report the far end's
+                // reason if it comes, the write error only if none does
+                // (PROTOCOL.md §13.5).
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.finished()).await;
+                match conn.err() {
+                    Some(Error::Remote(_)) => Err(Broke::Gone),
+                    _ => Err(Broke::TunnelWrite(e)),
+                }
+            }
+            r => r,
         };
         match result {
             Ok(()) => {

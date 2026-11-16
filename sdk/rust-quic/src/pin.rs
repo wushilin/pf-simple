@@ -23,10 +23,30 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// The bidirectional streams this end allows the hub (§13.3).
 pub const MAX_STREAMS: u32 = 1000;
-/// Each stream's receive window, and the connection's (§13.3): the
-/// connection's is 16 times the stream's.
-pub const STREAM_WINDOW: u32 = 1 << 20;
-pub const CONN_WINDOW: u32 = 16 << 20;
+/// Each stream's receive window (§13.3: at least 64 KiB).
+///
+/// quinn grants a stream its whole window at once, and gives credit back,
+/// to the stream and to the connection, only as the stream is read. A
+/// connection whose application stops reading (a stalled target, a Conn
+/// nobody reads) keeps up to this much of the connection window until it
+/// is read or ended. So the connection window must hold every stream full
+/// at once (below), and this window is what each stalled stream may cost
+/// in memory.
+///
+/// 256 KiB is a balance: a stream carries at most one window per round
+/// trip, so 64 KiB would cap a connection at about 5 Mbit/s at 100 ms,
+/// where 256 KiB allows about 20 Mbit/s (100 Mbit/s at 20 ms), while a
+/// thousand stalled streams hold at most 250 MiB, less than as many TCP
+/// connections may hold in kernel buffers over WebSocket.
+pub const STREAM_WINDOW: u32 = 256 << 10;
+/// The connection's receive window: room for every stream the connection
+/// can hold to sit full and unread at once, so stalled streams can never
+/// use it up, and a stalled stream holds up only itself (§13.3). Those are
+/// the MAX_STREAMS streams this end allows the hub, and as many again that
+/// this end opens (the hub allows a client 1000). It adds no exposure of
+/// its own: what stalled streams hold is already bounded by their stream
+/// windows. It is far over §13.3's "16 times the stream window".
+pub const CONN_WINDOW: u64 = 2 * MAX_STREAMS as u64 * STREAM_WINDOW as u64;
 
 /// The lowercase hex SHA-256 of a certificate's DER encoding.
 pub fn fingerprint(der: &[u8]) -> String {
@@ -120,7 +140,7 @@ pub(crate) fn quic_config(pin: Arc<Pin>) -> Result<quinn::ClientConfig, String> 
         .max_concurrent_bidi_streams(MAX_STREAMS.into())
         .max_concurrent_uni_streams(0u32.into())
         .stream_receive_window(STREAM_WINDOW.into())
-        .receive_window(CONN_WINDOW.into())
+        .receive_window(quinn::VarInt::from_u64(CONN_WINDOW).expect("the connection window is a valid varint"))
         .datagram_receive_buffer_size(None);
     let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
     cfg.transport_config(Arc::new(transport));
@@ -150,6 +170,15 @@ mod tests {
         assert!(!pin.mismatch.load(Ordering::Acquire));
         assert!(pin.verify_server_cert(&other, std::slice::from_ref(&leaf), &name, &[], UnixTime::now()).is_err());
         assert!(pin.mismatch.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stalled_streams_cannot_use_up_the_connection_window() {
+        assert!(STREAM_WINDOW >= 64 << 10, "§13.3's least stream window");
+        // Every stream the hub may open, and every one this end may open
+        // (the hub allows 1000), full and unread at once.
+        assert!(CONN_WINDOW >= (MAX_STREAMS as u64 + 1000) * STREAM_WINDOW as u64);
+        assert!(CONN_WINDOW >= 16 * STREAM_WINDOW as u64);
     }
 
     #[test]

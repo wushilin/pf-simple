@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "pfrelay"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "base64",
  "hex",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "pfrelay-quic"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "hex",
  "pfrelay",
@@ -341,6 +341,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

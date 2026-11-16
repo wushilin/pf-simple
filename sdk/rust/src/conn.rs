@@ -28,7 +28,7 @@ pub const PING_EVERY: Duration = Duration::from_secs(10);
 pub const LINK_SILENCE: Duration = Duration::from_secs(30);
 /// How long a close waits for the far end's close, and bounds each write
 /// once closing has begun.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Frames queued for the writer.
 const WRITE_QUEUE: usize = 8;
 /// Frames read ahead of the application.
@@ -36,6 +36,9 @@ const READ_QUEUE: usize = 4;
 const CLOSE_NORMAL: [u8; 2] = [0x03, 0xE8];
 /// Bounds the write of this side's `idle`.
 const IDLE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The reason a protocol 3 stream is failed with when it is closed after
+/// this side's half-close but before the far end's (PROTOCOL.md §13.5).
+pub(crate) const CLOSED_EARLY: &str = "the connection was closed before the far end finished";
 
 /// Which end of the tunnel a connection belongs to. It prints, parses and
 /// serializes as `connect` or `serve`.
@@ -234,7 +237,7 @@ impl Registry {
         let reason = clean_local(reason);
         sh.rec.dropped.lock().unwrap().get_or_insert(reason.clone());
         sh.set_failure(Failure::Dropped(reason.clone()));
-        sh.closing.send_replace(true);
+        sh.begin_closing();
         let _ = sh.ctl.send(Ctl::Fail(reason));
         true
     }
@@ -324,6 +327,14 @@ struct Shared {
     gone: watch::Sender<bool>,
     /// Closing has begun: bound every write from now on.
     closing: watch::Sender<bool>,
+    /// On a protocol 3 stream: writing broke, or closing has begun, so the
+    /// reader must reach the far end's err or end even if nobody reads the
+    /// data ahead of it (PROTOCOL.md §13.5). It stops waiting for the
+    /// application, and drops data it cannot queue.
+    discard: watch::Sender<bool>,
+    /// On a protocol 3 stream: this end has sent its err. What arrives
+    /// after it is the far end ending its direction, not a failure.
+    sent_err: AtomicBool,
     /// The far end sent a close frame, which must be answered.
     peer_close: Notify,
     /// This end failed: a broken read or write, or `fail`.
@@ -352,7 +363,17 @@ type Frames = FrameReader<ReadHalf<Tls>>;
 impl Shared {
     fn set_failure(&self, f: Failure) {
         self.failed.store(true, Ordering::Release);
+        if self.sent_err.load(Ordering::Acquire) {
+            return; // the far end ending its direction after this end's err
+        }
         self.failure.lock().unwrap().get_or_insert(f);
+    }
+
+    /// Closing has begun: writes are bounded, and a protocol 3 reader no
+    /// longer waits for the application.
+    fn begin_closing(&self) {
+        self.closing.send_replace(true);
+        self.discard.send_replace(true);
     }
 
     /// Why the connection failed, as `Conn::err` says it.
@@ -479,6 +500,8 @@ impl Conn {
             gone_reason: Mutex::new(None),
             gone: watch::channel(false).0,
             closing: watch::channel(false).0,
+            discard: watch::channel(false).0,
+            sent_err: AtomicBool::new(false),
             peer_close: Notify::new(),
             failed: AtomicBool::new(false),
             ctl: ctl_tx,
@@ -512,6 +535,11 @@ impl Conn {
     /// The hub's id for this connection, the same on both ends.
     pub fn id(&self) -> &ConnId {
         &self.shared.rec.id
+    }
+
+    /// Whether this is a protocol 3 stream over QUIC.
+    pub(crate) fn framed(&self) -> bool {
+        self.shared.framed
     }
 
     /// Which end of the tunnel this is.
@@ -591,7 +619,7 @@ impl Conn {
             self.shared.failed.store(true, Ordering::Release);
             *self.shared.end_hint.lock().unwrap() = Some(h);
         }
-        self.shared.closing.send_replace(true);
+        self.shared.begin_closing();
         let _ = self.shared.ctl.send(how);
         let writer = self.writer.lock().unwrap().take();
         if let Some(w) = writer {
@@ -708,7 +736,7 @@ impl Drop for Conn {
         if !self.closed.swap(true, Ordering::AcqRel) {
             // Closed in the background as `close` would; the writer reports
             // it once that is done: after the hub's verdict on a reusable leg.
-            self.shared.closing.send_replace(true);
+            self.shared.begin_closing();
             let _ = self.shared.ctl.send(Ctl::Close);
         }
     }
@@ -758,7 +786,9 @@ fn clean_local(reason: &str) -> String {
 // ---------- the reader ----------
 
 async fn read_loop(mut frames: Frames, tx: mpsc::Sender<Event>, sh: Arc<Shared>) {
-    if read_data(&mut frames, &tx, &sh).await && watch_after_eof(&mut frames, &sh).await {
+    let discard = sh.framed.then(|| sh.discard.subscribe());
+    let mut out = Out { tx, discard, dropping: false };
+    if read_data(&mut frames, &mut out, &sh).await && watch_after_eof(&mut frames, &sh).await {
         // The hub's valid "idle": the leg goes on, and its reader with it.
         *sh.leg_reader.lock().unwrap() = Some(frames);
         sh.idled.send_replace(true);
@@ -772,9 +802,85 @@ async fn read_loop(mut frames: Frames, tx: mpsc::Sender<Event>, sh: Arc<Shared>)
     sh.gone.send_replace(true);
 }
 
+/// Where the reader hands what it reads to the application.
+struct Out {
+    tx: mpsc::Sender<Event>,
+    /// On a protocol 3 stream, [`Shared::discard`].
+    discard: Option<watch::Receiver<bool>>,
+    /// Data was dropped: drop the rest too, so what the application reads
+    /// is a prefix of what was sent, never a stream with a hole in it.
+    dropping: bool,
+}
+
+impl Out {
+    /// Hands over data; false when nobody reads any more. On a protocol 3
+    /// stream it waits for the application only until writing breaks or
+    /// closing begins: the far end's err may sit behind the data, and must
+    /// still be read (PROTOCOL.md §13.5).
+    async fn data(&mut self, v: Vec<u8>) -> bool {
+        if self.dropping {
+            return true;
+        }
+        let Out { tx, discard, .. } = self;
+        let Some(discard) = discard else {
+            return tx.send(Event::Data(v)).await.is_ok();
+        };
+        if !*discard.borrow() {
+            tokio::select! {
+                biased;
+                p = tx.reserve() => return match p {
+                    Ok(p) => {
+                        p.send(Event::Data(v));
+                        true
+                    }
+                    Err(_) => false,
+                },
+                _ = discard.wait_for(|d| *d) => {}
+            }
+        }
+        match tx.try_send(Event::Data(v)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropping = true;
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Hands over the end of the data: the far end's half-close or a
+    /// failure. A protocol 3 reader that discards does not wait for it to
+    /// be taken: it is queued behind the data on a task of its own.
+    async fn end(&mut self, ev: Event) {
+        let Out { tx, discard, .. } = self;
+        let Some(discard) = discard else {
+            let _ = tx.send(ev).await;
+            return;
+        };
+        if !*discard.borrow() {
+            tokio::select! {
+                biased;
+                p = tx.reserve() => {
+                    if let Ok(p) = p {
+                        p.send(ev);
+                    }
+                    return;
+                }
+                _ = discard.wait_for(|d| *d) => {}
+            }
+        }
+        if let Err(mpsc::error::TrySendError::Full(ev)) = tx.try_send(ev) {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(ev).await;
+            });
+        }
+    }
+}
+
 /// Reads the stream up to the far end's half-close (true) or its failure
 /// (false).
-async fn read_data(frames: &mut Frames, tx: &mpsc::Sender<Event>, sh: &Shared) -> bool {
+async fn read_data(frames: &mut Frames, out: &mut Out, sh: &Shared) -> bool {
     let failed = |f: Failure| {
         sh.set_failure(f.clone());
         Event::Failed(f)
@@ -783,40 +889,40 @@ async fn read_data(frames: &mut Frames, tx: &mpsc::Sender<Event>, sh: &Shared) -
         let frame = match frames.next().await {
             Ok(f) => f,
             Err(e) => {
-                let _ = tx.send(failed(Failure::of(&e))).await;
+                out.end(failed(Failure::of(&e))).await;
                 return false;
             }
         };
         match frame.op {
             OP_BINARY | OP_CONT => {
-                if !frame.payload.is_empty() && tx.send(Event::Data(frame.payload)).await.is_err() {
+                if !frame.payload.is_empty() && !out.data(frame.payload).await {
                     return false; // nobody reads any more
                 }
             }
             OP_TEXT => {
                 if !frame.fin {
-                    let _ = tx.send(failed(Failure::Protocol("a fragmented text frame".into()))).await;
+                    out.end(failed(Failure::Protocol("a fragmented text frame".into()))).await;
                     return false;
                 }
                 if frame.payload == MSG_IDLE && sh.reuse.is_some() {
-                    let _ = tx.send(failed(idle_violation(sh))).await;
+                    out.end(failed(idle_violation(sh))).await;
                     return false;
                 }
                 if frame.payload == b"eof" {
                     sh.rec.read_eof.store(true, Ordering::Release);
-                    let _ = tx.send(Event::Eof).await;
+                    out.end(Event::Eof).await;
                     return true;
                 }
                 if let Some(reason) = frame.payload.strip_prefix(b"err:") {
                     let reason = clean_reason(&String::from_utf8_lossy(reason));
-                    let _ = tx.send(failed(Failure::Remote(reason))).await;
+                    out.end(failed(Failure::Remote(reason))).await;
                     return false;
                 }
                 // any other text frame is ignored
             }
             OP_CLOSE => {
                 sh.peer_close.notify_one();
-                let _ = tx.send(failed(Failure::PeerClosed)).await;
+                out.end(failed(Failure::PeerClosed)).await;
                 return false;
             }
             _ => {} // pings are not answered; pongs are ignored
@@ -829,7 +935,7 @@ async fn read_data(frames: &mut Frames, tx: &mpsc::Sender<Event>, sh: &Shared) -
 fn idle_violation(sh: &Shared) -> Failure {
     let f = Failure::Protocol("the server said idle before this side had half-closed".into());
     sh.set_failure(f.clone());
-    sh.closing.send_replace(true);
+    sh.begin_closing();
     let _ = sh.ctl.send(Ctl::Close);
     f
 }
@@ -952,6 +1058,8 @@ async fn write_loop(
     let broke = |sh: &Shared, e: io::Error| {
         sh.failed.store(true, Ordering::Release);
         sh.write_error.lock().unwrap().get_or_insert(Failure::of(&e));
+        // The far end's reason may be behind data nobody reads (§13.5).
+        sh.discard.send_replace(true);
     };
 
     let how = loop {
@@ -1009,7 +1117,9 @@ async fn write_loop(
                     }
                     text = &text[..cut];
                 }
-                if put(&mut w, &mut closing, sh.framed, OP_TEXT, text).await.is_ok() && !close_sent {
+                if sh.framed {
+                    fail_framed(&mut w, &mut closing, &sh, text).await;
+                } else if put(&mut w, &mut closing, sh.framed, OP_TEXT, text).await.is_ok() && !close_sent {
                     let _ = put(&mut w, &mut closing, sh.framed, OP_CLOSE, &CLOSE_NORMAL).await;
                 }
             }
@@ -1041,6 +1151,18 @@ async fn write_loop(
                 }
             }
             let clean = eof_written && sh.rec.read_eof.load(Ordering::Acquire);
+            if sh.framed && eof_written && !clean && !broken && !sh.failed.load(Ordering::Acquire) {
+                // Closed after this side's eof, before the far end's. On
+                // QUIC a reset discards what was written and not yet
+                // delivered, the data before the eof included; over
+                // WebSocket that data arrives before the cut. So fail the
+                // stream instead: err and FIN keep the data (§13.5). Not
+                // when the far end or the link failed it: the end that
+                // receives err ends its direction, it does not answer.
+                let msg = format!("err:{CLOSED_EARLY}");
+                fail_framed(&mut w, &mut closing, &sh, msg.as_bytes()).await;
+                return;
+            }
             if clean && !broken && !close_sent && !sh.failed.load(Ordering::Acquire) {
                 if let Some(reg) = &sh.reuse {
                     // A leg offered reuse: the hub's verdict decides
@@ -1099,6 +1221,22 @@ async fn write_loop(
         let mut gone = sh.gone.subscribe();
         let _ = tokio::time::timeout(CLOSE_TIMEOUT, gone.wait_for(|g| *g)).await;
     }
+}
+
+/// Fails a protocol 3 stream: err, then FIN, then keeps the stream until
+/// the far end has ended its direction, for at most CLOSE_TIMEOUT, so that
+/// `fail` returns once the reason is delivered (PROTOCOL.md §13.5). The
+/// reader keeps reading meanwhile, and discards what it reads.
+async fn fail_framed(w: &mut WriteHalf<Tls>, closing: &mut watch::Receiver<bool>, sh: &Shared, text: &[u8]) {
+    if put(w, closing, true, OP_TEXT, text).await.is_err() {
+        return;
+    }
+    sh.sent_err.store(true, Ordering::Release);
+    if put(w, closing, true, OP_CLOSE, &CLOSE_NORMAL).await.is_err() {
+        return;
+    }
+    let mut gone = sh.gone.subscribe();
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, gone.wait_for(|g| *g)).await;
 }
 
 #[cfg(test)]

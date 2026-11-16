@@ -57,8 +57,22 @@ are for the hub's HTTPS endpoint, where the QUIC listener is discovered.
 - **No fallback.** Where UDP is blocked this fails to connect; use
   `pfrelay` (WebSocket) there.
 
-`Client::close` closes the QUIC connection; dropping the last clone of a
-client does the same.
+- **Flow control.** Each stream may receive 256 KiB ahead of the
+  application, and the connection room for every stream it can hold
+  (1000 the hub opens, 1000 this side opens) to be full at once, so
+  connections nobody reads hold up only themselves (§13.3).
+
+`Client::close` closes the QUIC connection at once, ending what it
+carries. Dropping the last clone of a client does not: a `Conn` outlives
+its client, as over WebSocket, and the connection is closed once no
+`Conn` or registration uses it. After a 429 for the connection, the
+client moves to a new one and closes the old one the same way (§13.8).
+
+`Conn::close` after this side's half-close but before the far end's
+fails the connection with "the connection was closed before the far end
+finished" (err, then FIN), so what was written still arrives; QUIC would
+drop it on a reset. `Conn::close` and `Conn::fail` wait up to 3 s for the
+hub to end its side of the stream.
 
 ## Conformance
 
