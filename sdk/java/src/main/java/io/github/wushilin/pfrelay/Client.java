@@ -29,7 +29,7 @@ import javax.net.ssl.SSLContext;
  */
 public final class Client {
     /** This SDK's version. */
-    public static final String VERSION = "0.16.0";
+    public static final String VERSION = "0.16.1";
     /** What a Client calls itself in the hub's log and console unless told otherwise. */
     public static final String DEFAULT_AGENT = "pfrelay-java " + VERSION;
     /** The target a serving side names when it offers stdin/stdout. */

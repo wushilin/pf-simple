@@ -6,7 +6,7 @@ tunnel from your own program, or connect through one, over UDP instead of
 WebSockets. It passes the [conformance suite](../../conformance/README.md).
 
 - Java 17 or later.
-- Maven: `io.github.wushilin:pfrelay-quic:0.16.0`. It depends on
+- Maven: `io.github.wushilin:pfrelay-quic:0.16.1`. It depends on
   [pfrelay](../java) (the WebSocket SDK, same version) and on
   [kwik](https://github.com/ptrd/kwik) (`tech.kwik:kwik`), a QUIC
   implementation in pure Java.
@@ -55,7 +55,9 @@ for the whole API. What differs:
 - **One QUIC connection** per `Client` carries every request: each
   registration and each connection is a stream of it. It is made again
   when it is lost, and `Client.close()` closes it at the end of the run.
-  Build one `Client` per builder.
+  Streams that have just sent an err, a refusal or an unregister get up
+  to 3 seconds for the hub to take it first, so `close()` may wait that
+  long. Build one `Client` per builder.
 - **Keepalive.** The client sends a PING every 5 seconds, and the
   connection's idle timeout is 30 seconds. Streams send nothing of their
   own: an idle connection stays up as long as the QUIC connection does.
@@ -76,6 +78,12 @@ for the whole API. What differs:
   pings only every half idle timeout) is too slow for §13.6.
 - kwik sends the advertised host as SNI even when it is an IP address,
   where §13.3 asks for no SNI. The hub does not depend on it.
+- kwik wakes threads blocked on a stream with interrupts. A thread
+  blocked in a read of a kwik stream does not see its own interrupt (kwik
+  clears it): interrupting a thread that waits for the hub's answer in
+  `dial()` or `check()` does not stop it; the answer, or its 15-second
+  limit, does. A writer that kwik wakes because its stream was reset gets
+  a plain `IOException`, and the SDK clears the interrupt kwik left.
 
 ## Building
 

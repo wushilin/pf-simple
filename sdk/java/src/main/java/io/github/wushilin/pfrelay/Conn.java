@@ -39,6 +39,16 @@ public final class Conn implements Closeable {
     static final int MAX_TEXT_FRAME = 1024;
     private static final byte[] EOF_TEXT = "eof".getBytes(StandardCharsets.US_ASCII);
     private static final Object EOF_MARK = new Object();
+    /**
+     * The reason a framed stream (protocol 3) is failed with when it is
+     * closed after this side's half-close but before the far end's.
+     */
+    static final String CLOSED_EARLY = "the connection was closed before the far end finished";
+    /**
+     * After a failed write on a framed stream, how long to wait for the
+     * reason the far end sent (docs/PROTOCOL.md §13.5).
+     */
+    static final long REASON_WAIT_MS = 3000;
 
     private final Link ws; // a WebSocket, or a stream of another transport (Framed)
     private final Client client;
@@ -181,10 +191,48 @@ public final class Conn implements Closeable {
                 ws.writeFrame(WebSocket.OP_TEXT, EOF_TEXT);
             }
         } catch (IOException e) {
-            broke(e);
-            throw e;
+            IOException why = writeFailed(e);
+            broke(why);
+            throw why;
         } finally {
             wlock.unlock();
+        }
+    }
+
+    /**
+     * What a failed write reports. On a framed stream, a STOP_SENDING can
+     * overtake the err the far end sent before it, so the write can fail
+     * before the reason is read: wait a while for the reader's verdict, and
+     * report the far end's reason if it comes; the write error only if none
+     * does (docs/PROTOCOL.md §13.4, §13.5).
+     */
+    private IOException writeFailed(IOException e) {
+        if (!ws.framed()) {
+            return e;
+        }
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(REASON_WAIT_MS);
+        while (true) {
+            IOException f = failure.get();
+            if (f instanceof RemoteException) {
+                return new RemoteException(((RemoteException) f).reason());
+            }
+            String r = goneReason;
+            if (r != null) {
+                return new RemoteException(r);
+            }
+            if (f != null || closed || gone.getCount() == 0) {
+                return e;
+            }
+            long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+            if (left <= 0) {
+                return e;
+            }
+            try {
+                gone.await(Math.min(left, 20), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException x) {
+                Thread.currentThread().interrupt();
+                return e;
+            }
         }
     }
 
@@ -363,10 +411,39 @@ public final class Conn implements Closeable {
                     Thread.currentThread().interrupt();
                 }
             }
+        } else if (ws.framed() && wroteEOF.get() && !readEOF.get() && !failed.get() && failure.get() == null
+                && goneReason == null) {
+            // On QUIC a reset discards what was written and not yet
+            // delivered, the data before this side's eof included; over
+            // WebSocket that data arrives before the cut. So fail the stream
+            // instead: err, then FIN, which keep the data (§13.5). Not when
+            // the far end failed it, or the link did: the end that receives
+            // err ends its direction, it never answers with err.
+            if (sentClose.compareAndSet(false, true)) {
+                try {
+                    ws.writeFrame(WebSocket.OP_TEXT, ("err:" + CLOSED_EARLY).getBytes(StandardCharsets.UTF_8));
+                    ws.writeFrame(WebSocket.OP_CLOSE, new byte[0]);
+                } catch (IOException ignored) {
+                    // the link is gone already
+                }
+            }
         }
         ws.abort();
-        IOException err = broke.get();
-        client.closed(rec, err != null ? err : error());
+        client.closed(rec, closeError());
+    }
+
+    /**
+     * What close reports: the far end's reason, when it gave one, over what
+     * broke on this side, which may only be its consequence (a write that
+     * failed because the far end was gone, §13.5).
+     */
+    private IOException closeError() {
+        IOException e = error();
+        if (e instanceof RemoteException) {
+            return e;
+        }
+        IOException b = broke.get();
+        return b != null ? b : e;
     }
 
     /**
@@ -425,8 +502,7 @@ public final class Conn implements Closeable {
             }
         }
         ws.abort();
-        IOException err = broke.get();
-        client.closed(rec, err != null ? err : error());
+        client.closed(rec, closeError());
     }
 
     // ---------- the reader thread ----------
@@ -532,7 +608,13 @@ public final class Conn implements Closeable {
 
     private void lost(IOException e) {
         if (readEOF.get()) {
-            return; // after the far end's half-close, nothing more was due
+            // After the far end's half-close nothing more was due, but a
+            // framed stream that breaks the protocol, with a second eof or
+            // data after it, is a broken stream all the same (§13.4).
+            if (e instanceof Framed.BrokenException && !closed) {
+                failure.compareAndSet(null, e);
+            }
+            return;
         }
         if (e instanceof SocketTimeoutException) {
             failRead(e);
@@ -671,8 +753,9 @@ public final class Conn implements Closeable {
                 rec.sent.addAndGet(n);
             }
         } catch (IOException e) {
-            broke(e);
-            throw e;
+            IOException why = writeFailed(e);
+            broke(why);
+            throw why;
         } finally {
             wlock.unlock();
         }
