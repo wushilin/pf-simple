@@ -1,4 +1,5 @@
-"""Streams: one TCP connection's bytes over one WebSocket (PROTOCOL.md 8)."""
+"""Streams: one TCP connection's bytes over one WebSocket (PROTOCOL.md 8), or
+over a transport's stream in protocol 3's framing (PROTOCOL.md 13.5)."""
 
 from __future__ import annotations
 
@@ -169,6 +170,8 @@ class Conn:
         finisher: Optional[Callable[["Conn"], Any]] = None,
     ):
         self._ws = ws
+        # A transport's stream (QUIC) rather than a WebSocket (13.5).
+        self._framed = bool(getattr(ws, "framed", False))
         self._id = conn_id if isinstance(conn_id, ConnID) else ConnID(conn_id)
         self._side = Side(side)
         self._owner = owner
@@ -276,6 +279,8 @@ class Conn:
                         raise FrameError("bind or bound on a carrying leg")  # a violation (12.4)
                     elif payload.startswith(_ERR):
                         reason = clean_reason(payload[len(_ERR):].decode("utf-8", "replace"))
+                        if self._framed:
+                            ws.peer_failed()  # this side's direction ends at once (13.5)
                         if self._read_eof or inbox.ended:
                             if not self._gone_reason and self._failure is None:
                                 self._gone_reason = reason or "the far end dropped the connection"
@@ -372,6 +377,7 @@ class Conn:
                     self._sent += len(piece)
             except (ConnectionError, OSError) as e:
                 err = e if isinstance(e, LinkError) else LinkError(f"the connection to the server was lost ({e})")
+                err = await self._reason_for(err)
                 self._break(err)
                 raise err from None
 
@@ -386,8 +392,27 @@ class Conn:
                 await self._ws.send(OP_TEXT, _EOF)
             except (ConnectionError, OSError) as e:
                 err = e if isinstance(e, LinkError) else LinkError(f"the connection to the server was lost ({e})")
+                err = await self._reason_for(err)
                 self._break(err)
                 raise err from None
+
+    async def _reason_for(self, err: BaseException) -> BaseException:
+        """What a failed write reports. On a transport's stream the peer's
+        STOP_SENDING can overtake the err sent before it, so keep reading,
+        for a short while, and report the reason that arrives instead of the
+        write error (13.5)."""
+        if not self._framed:
+            return err
+        if not self._gone.is_set():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._gone.wait()), _ws.CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass
+        if isinstance(self._failure, RemoteError):
+            return self._failure
+        if self._gone_reason:
+            return RemoteError(self._gone_reason)
+        return err
 
     # ---------------------------------------------------------- the end
 

@@ -20,6 +20,7 @@ from ._conn import _EOF as _EOF_FRAME
 from ._conn import _ERR as _ERR_FRAME
 from ._conn import MSG_BIND, MSG_BOUND, MSG_IDLE, Conn, ConnInfo, Stats, _Registry, emit
 from ._forward import PARTY_CONNECT, PARTY_SERVE, bridge
+from ._framed import Framed
 from ._proto import (
     CONTROL_OPEN,
     HEADER_CLIENT_HASH,
@@ -59,8 +60,9 @@ from ._proto import (
     server_proto,
 )
 from ._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT, FrameError, WebSocket
+from .transport import Open, Params, Registration, Transport
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 DEFAULT_AGENT = f"pfrelay-py {__version__}"
 
 log = logging.getLogger("pfrelay")
@@ -175,6 +177,7 @@ class Client:
         max_proto: Optional[int] = None,
         no_reuse: bool = False,
         max_idle_legs: int = DEFAULT_MAX_IDLE_LEGS,
+        transport: Optional[Transport] = None,
     ):
         self.base, self._host, self._port, self._netloc = normalize_base(server)
         self.word = normalize_word(word)
@@ -197,6 +200,10 @@ class Client:
         # Protocol 2: keep the serving side's legs for reuse, at most this many.
         self.no_reuse = no_reuse
         self.max_idle_legs = max_idle_legs if max_idle_legs > 0 else DEFAULT_MAX_IDLE_LEGS
+        # Another way to the hub than WebSocket, for SDKs built on this one,
+        # such as pfrelay-quic (see pfrelay.transport). Reuse of accept legs,
+        # which is WebSocket only, is then off.
+        self.transport = transport
         if ssl_context is None:
             ssl_context = ssl.create_default_context(cafile=ca_file)
         elif ca_file:
@@ -298,6 +305,9 @@ class Client:
         """Ask the hub whether someone serves this word (and the client
         token, if one is needed, is right). Raises AccessDenied if not."""
         try:
+            if self.transport is not None:
+                await self.transport.check(Params(self))
+                return
             await self._get(Endpoint.CHECK, self._connect_extra())
         except StatusError as e:
             raise explain(e) from None
@@ -362,6 +372,12 @@ class Client:
         The hub answers before the serving side has: if the serving side
         cannot be reached, or cannot reach its target, the first read raises
         a RemoteError saying so."""
+        if self.transport is not None:
+            try:
+                stream, cid = await self.transport.connect(Params(self))
+            except StatusError as e:
+                raise explain(e) from None
+            return await self._new_conn(Framed(stream), ConnID(cid), Side.CONNECT)
         try:
             ws = await self._dial(Endpoint.CONNECT, self._connect_extra())
         except StatusError as e:
@@ -468,7 +484,7 @@ class Client:
                 if leg is not None:
                     await self._refuse_leg(leg, cid, REASON_UNREACHABLE)
                 else:
-                    await self._refuse(cid, REASON_UNREACHABLE)
+                    await self._refuse(cid, REASON_UNREACHABLE, sess)
                 return
             except BaseException:
                 if leg is not None:
@@ -541,7 +557,7 @@ class Client:
         reusable: bool = False,
         finisher: Optional[Callable[[Conn], Awaitable[Optional[BaseException]]]] = None,
     ) -> Conn:
-        conn = Conn(ws, cid, side, self, reusable=reusable, finisher=finisher if reusable else None)
+        conn = Conn(ws, cid, side, self, reusable=reusable, finisher=finisher if reusable else None)  # type: ignore[arg-type]
         self._reg.add(conn)
         try:
             await emit(self.events.on_open, conn.info())
@@ -554,6 +570,9 @@ class Client:
         """Bring this side's leg of connection cid to the hub. With the
         registration's session it may be offered reuse (12.3); returns the
         leg and whether it was."""
+        if isinstance(sess, _AltSession):
+            stream = await sess.take(cid).accept()
+            return Framed(stream), False  # type: ignore[return-value]
         extra = [(HEADER_CONN, str(cid))]
         if sess.secret:
             extra.append((HEADER_SESSION, sess.secret))
@@ -580,8 +599,14 @@ class Client:
         if self._reg.finish(conn, err is not None):
             await emit(self.events.on_close, conn.info(), err)
 
-    async def _refuse(self, cid: ConnID, reason: str) -> None:
+    async def _refuse(self, cid: ConnID, reason: str, sess: Optional["_Session"] = None) -> None:
         await emit(self.events.on_refuse, cid, reason)
+        if isinstance(sess, _AltSession):
+            try:
+                await sess.take(cid).refuse(_clean_header(reason, 128))
+            except Exception as e:
+                log.info("connection %s: could not tell the server: %s", cid.short, e)
+            return
         try:
             await self._get(Endpoint.ACCEPT, [(HEADER_CONN, str(cid)), (HEADER_ERROR, _clean_header(reason, 128))])
         except Exception as e:
@@ -608,7 +633,10 @@ class _Registration:
 
     async def run(self) -> None:
         try:
-            await self._loop()
+            if self._c.transport is not None:
+                await self._alt_loop(self._c.transport)
+            else:
+                await self._loop()
         finally:
             for t in list(self._opens):
                 t.cancel()
@@ -662,6 +690,64 @@ class _Registration:
                 log.warning("lost the server (%s); its connections are closed; registering again in %gs", err, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, c.retry_max)
+
+    async def _alt_loop(self, t: Transport) -> None:
+        """The same loop as _loop, over an attached transport: its
+        registrations and opens in place of the control channel and accept."""
+        c = self._c
+        backoff, served, attempt = c.retry_min, False, 0
+        while True:
+            attempt += 1
+            try:
+                reg = await t.register(Params(c), self._target)
+            except ProtoError:
+                raise
+            except StatusError as e:
+                if not served and e.final:
+                    raise explain(e) from None
+                log.warning(
+                    "cannot register with %s over %s (%s); attempt %d, trying again in %gs",
+                    c.base, t.name, explain(e), attempt, backoff,
+                )
+            except _TRANSIENT as e:
+                log.warning(
+                    "cannot register with %s over %s (%s); attempt %d, trying again in %gs",
+                    c.base, t.name, e, attempt, backoff,
+                )
+            else:
+                if served:
+                    log.info("registered again with %s over %s after %d attempt(s)", c.base, t.name, attempt)
+                else:
+                    log.info("registered with %s over %s: serving %r", c.base, t.name, c.name)
+                served, attempt = True, 0
+                started = time.monotonic()
+                sess = _AltSession()
+                self._on_up(True)
+                try:
+                    await emit(c.events.on_serving, True)
+                    err = await self._alt_opens(reg, sess)
+                finally:
+                    reg.close()  # also when cancelled in an async handler
+                    sess.end()
+                    self._on_up(False)
+                await emit(c.events.on_serving, False)
+                if time.monotonic() - started >= c.settled:
+                    backoff = c.retry_min
+                log.warning("lost the server (%s); its connections are closed; registering again in %gs", err, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, c.retry_max)
+
+    async def _alt_opens(self, reg: Registration, sess: "_AltSession") -> BaseException:
+        """Carry each connection a registration asks for, until it ends;
+        returns why it did."""
+        while True:
+            try:
+                o = await reg.next()
+            except (ConnectionError, OSError, LinkError) as e:
+                return e
+            cid = ConnID(clean_reason(o.id))
+            sess.put(cid, o)
+            self.spawn(self._open_one(cid, sess, None))  # type: ignore[arg-type]
 
     def spawn(self, coro) -> None:
         t = asyncio.ensure_future(coro)
@@ -892,6 +978,50 @@ class _Session:
         await self._reg._open_one(cid, self, ws)
 
 
+_tasks: set[asyncio.Future] = set()
+
+
+def _background(coro) -> None:
+    """Run coro in a task of its own, kept until it is done."""
+    t = asyncio.ensure_future(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+
+
+class _AltSession:
+    """One registration's life over an attached transport: the opens not
+    yet taken. There is no leg reuse."""
+
+    secret = ""
+    finisher = None
+
+    def __init__(self) -> None:
+        self._opens: dict[ConnID, Open] = {}
+        self.ended = False
+
+    def put(self, cid: ConnID, o: Open) -> None:
+        old = self._opens.pop(cid, None)
+        if old is not None:  # an id asked for twice: the old one is refused
+            _background(old.refuse(REASON_LEG_LOST))
+        self._opens[cid] = o
+
+    def take(self, cid: ConnID) -> Open:
+        o = self._opens.pop(cid, None)
+        if o is None:
+            raise LinkError("the registration ended before the connection was taken")
+        return o
+
+    def abandoned(self, cid: str) -> bool:
+        return False
+
+    def end(self) -> None:
+        """The registration ended: the opens not taken are refused."""
+        self.ended = True
+        opens, self._opens = list(self._opens.values()), {}
+        for o in opens:
+            _background(o.refuse(REASON_STOPPED))
+
+
 def _open_message(payload: bytes) -> Optional[ConnID]:
     """The connection an open message names; None for anything else, which
     is ignored (PROTOCOL.md 7)."""
@@ -974,7 +1104,7 @@ class Listener:
             if leg is not None:
                 await c._refuse_leg(leg, cid, REASON_BACKLOG)  # after "bound", an err: (12.7)
             else:
-                await c._refuse(cid, REASON_BACKLOG)
+                await c._refuse(cid, REASON_BACKLOG, sess)
             return
         self._slots += 1
         if leg is not None and sess.abandoned(str(cid)):

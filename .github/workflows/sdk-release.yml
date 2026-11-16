@@ -7,10 +7,11 @@ name: Release SDKs
 #   java-v0.1.0     ->  Maven Central  (io.github.wushilin:pfrelay)
 #   rust-quic-v0.3.0 -> crates.io      (pfrelay-quic)
 #   java-quic-v0.3.0 -> Maven Central  (io.github.wushilin:pfrelay-quic)
+#   python-quic-v0.3.0 -> PyPI         (pfrelay-quic)
 #
 # The QUIC SDKs build on their language's pfrelay of the same version, so
 # release that first: rust-v0.3.0 before rust-quic-v0.3.0, java-v0.3.0
-# before java-quic-v0.3.0.
+# before java-quic-v0.3.0, python-v0.3.0 before python-quic-v0.3.0.
 #
 # The Go SDK needs none of this: it is the package
 # github.com/wushilin/pf-simple/pfrelay, released with pf-simple's own v* tags
@@ -33,12 +34,13 @@ on:
       - "java-v*"
       - "rust-quic-v*"
       - "java-quic-v*"
+      - "python-quic-v*"
   workflow_dispatch:
     inputs:
       sdk:
         description: "SDK to build (dry run: tests and artifacts, nothing published)"
         type: choice
-        options: [python, rust, java, rust-quic, java-quic]
+        options: [python, rust, java, rust-quic, java-quic, python-quic]
         required: true
 
 permissions:
@@ -76,7 +78,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - if: env.SDK == 'python'
+      - if: env.SDK == 'python' || env.SDK == 'python-quic'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -96,6 +98,7 @@ jobs:
             java)   have=$(mvn -q -f sdk/java/pom.xml help:evaluate -Dexpression=project.version -DforceStdout) ;;
             rust-quic) have=$(cargo metadata --no-deps --format-version 1 --manifest-path sdk/rust-quic/Cargo.toml | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])') ;;
             java-quic) have=$(mvn -q -f sdk/java-quic/pom.xml help:evaluate -Dexpression=project.version -DforceStdout) ;;
+            python-quic) have=$(python3 -c 'import tomllib;print(tomllib.load(open("sdk/python-quic/pyproject.toml","rb"))["project"]["version"])') ;;
           esac
           if [ "$have" != "$VERSION" ]; then
             echo "::error::the tag says $VERSION, but the $SDK package is version $have"
@@ -112,6 +115,8 @@ jobs:
             rust-quic) cargo test --manifest-path sdk/rust-quic/Cargo.toml
                        cargo build --release --manifest-path sdk/rust-quic/Cargo.toml ;;
             java-quic) sdk/java-quic/build.sh ;;
+            python-quic) python3 -m pip install "aioquic>=1.8,<2"
+                         python3 -I -m unittest discover -s sdk/python-quic/tests ;;
           esac
 
       - name: Conformance suite, slow cases included
@@ -124,6 +129,7 @@ jobs:
             java)   export PF_CONFORMANCE_DRIVER="sdk/java/driver.sh" ;;
             rust-quic) export PF_CONFORMANCE_DRIVER="sdk/rust-quic/target/release/driver" ;;
             java-quic) export PF_CONFORMANCE_DRIVER="sdk/java-quic/driver.sh" ;;
+            python-quic) export PF_CONFORMANCE_DRIVER="python3 -I sdk/python-quic/driver.py" ;;
           esac
           go test -count=1 -run TestConformance -v .
 
@@ -154,6 +160,11 @@ jobs:
               mvn -B -f sdk/java-quic/pom.xml -DskipTests package
               cp sdk/java-quic/target/pfrelay-quic-*.jar dist/
               ;;
+            python-quic)
+              python3 -m pip install --upgrade build twine
+              python3 -m build --outdir dist sdk/python-quic
+              python3 -m twine check dist/*
+              ;;
           esac
           ls -l dist
 
@@ -181,7 +192,7 @@ jobs:
 
   publish-python:
     needs: [plan, build]
-    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.sdk == 'python'
+    if: needs.plan.outputs.publish == 'true' && (needs.plan.outputs.sdk == 'python' || needs.plan.outputs.sdk == 'python-quic')
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -189,7 +200,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: python-dist
+          name: ${{ needs.plan.outputs.sdk }}-dist
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
 
