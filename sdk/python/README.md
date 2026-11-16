@@ -164,6 +164,24 @@ back to protocol 1, and against a hub from before 0.14 to protocol 0. Each
 connection then gets its own leg, as before. Reuse is an optimization,
 never a requirement, so not getting it is never an error.
 
+## Other transports: QUIC
+
+[pfrelay-quic](../python-quic) reaches the hub over QUIC (tunnel protocol 3,
+PROTOCOL.md §13). Its `Client` is this package's `Client` with a QUIC
+transport attached through `pfrelay.transport`, so listeners, `dial`,
+forwarders, events, stats, `drop`, `watch` and the retry loop are the ones
+described here. Over an attached transport:
+
+- `listen`, `serve`, `dial`, `connect` and `check` go through the
+  transport; `probe` stays an HTTPS request.
+- Each connection's stream carries protocol 3's frames, which a `Conn`
+  reads and writes as it does a WebSocket's: data, `eof`, `err`, and the
+  stream's end in place of the close.
+- Leg reuse (protocol 2) is WebSocket only, so it is off.
+
+`pfrelay.transport` is a service-provider interface for SDKs built on this
+one; applications do not implement it.
+
 ## TLS
 
 The hub's certificate is verified normally. Pass `ca_file=` to trust a
@@ -180,7 +198,7 @@ instance may override (tests do): `retry_min = 1.0`, `retry_max = 30.0`,
 
 | | |
 |---|---|
-| `Client(server, word, *, ca_file, ssl_context, serve_token, client_token, name, target, agent, events, max_proto, no_reuse, max_idle_legs)` | one hub, one tunnel; checks the URL, word and tokens |
+| `Client(server, word, *, ca_file, ssl_context, serve_token, client_token, name, target, agent, events, max_proto, no_reuse, max_idle_legs, transport)` | one hub, one tunnel; checks the URL, word and tokens; `transport` is for SDKs such as pfrelay-quic |
 | `await client.listen()` → `Listener` | register and serve |
 | `await listener.accept()` → `Conn` | the next connection; `ClosedError` after `close()` |
 | `listener.up`, `listener.error`, `await listener.close()` | registered right now; why serving stopped for good |

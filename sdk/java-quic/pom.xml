@@ -12,7 +12,7 @@
 
   <groupId>io.github.wushilin</groupId>
   <artifactId>pfrelay-quic</artifactId>
-  <version>0.3.0</version>
+  <version>0.16.0</version>
   <packaging>jar</packaging>
 
   <name>pfrelay-quic</name>
@@ -51,7 +51,7 @@
     <dependency>
       <groupId>io.github.wushilin</groupId>
       <artifactId>pfrelay</artifactId>
-      <version>0.3.0</version>
+      <version>0.16.0</version>
     </dependency>
     <!-- QUIC, in pure Java. It brings agent15 (TLS 1.3), hkdf and siphash. -->
     <dependency>

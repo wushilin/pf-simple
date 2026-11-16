@@ -768,8 +768,8 @@ returns the same `*pfrelay.Client`, so everything above works unchanged,
 with the hub reached over QUIC (see [QUIC](#quic-pf-client-quic)).
 
 SDKs for other languages are under [`sdk/`](sdk): `pfrelay` over WebSockets
-and `pfrelay-quic` over QUIC, for Python (WebSockets only for now), Rust
-and Java. All of them speak the
+and `pfrelay-quic` over QUIC, for Python, Rust and Java. All of them speak
+the
 same protocol, which is specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 Every SDK has to pass the conformance suite in
 [`conformance/`](conformance/README.md), which runs it against a real hub

@@ -12,7 +12,7 @@ through the same hub, in either role.
 
 ```toml
 [dependencies]
-pfrelay-quic = "0.3"
+pfrelay-quic = "0.16"
 tokio = { version = "1", features = ["full"] }
 ```
 

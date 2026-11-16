@@ -1,7 +1,9 @@
 """pfrelay: the Python SDK for the pf-simple relay hub.
 
 Serve a tunnel or connect through one from your own asyncio program. The
-protocol is described in docs/PROTOCOL.md of the pf-simple repository.
+protocol is described in docs/PROTOCOL.md of the pf-simple repository. This
+package speaks tunnel protocols 0 to 2 over WebSocket; other transports,
+such as QUIC in the pfrelay-quic package, plug in through pfrelay.transport.
 
     client = pfrelay.Client("https://hub.example.com", "k3f9-x2mq-7hpa",
                             serve_token=TOKEN, name="Office SSH")
@@ -48,6 +50,8 @@ from ._proto import (
     proto_range,
 )
 
+from . import transport
+
 STDIO_TARGET = "stdio"
 
 import logging as _logging
@@ -92,4 +96,5 @@ __all__ = [
     "check_client_token",
     "proto_range",
     "parse_proto_range",
+    "transport",
 ]

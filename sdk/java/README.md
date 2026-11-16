@@ -180,7 +180,7 @@ unaffected in every combination.
 
 | Type | What it is |
 |---|---|
-| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.3.0`), `logger`, `events`, `maxProto`, `noReuse`, `maxIdleLegs`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
+| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.16.0`), `logger`, `events`, `maxProto`, `noReuse`, `maxIdleLegs`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
 | `Client.listen()`, `listen(Duration)` | Register, and return a `Listener`. |
 | `Client.serve(target)`, `serve(target, Duration)` | Register, and forward each connection to a TCP `host:port`; returns a `Forwarder`. |
 | `Client.dial()` | Open one connection; a `Conn`. |
