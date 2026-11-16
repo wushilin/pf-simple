@@ -410,6 +410,11 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Over QUIC this closes the connection to the hub on the way out,
+	// after what was sent last (an err, an unregister) has had its moment
+	// to arrive (§13.5); otherwise the hub holds a dead connection until
+	// its idle timeout, against its limit per address (§13.8).
+	defer client.Close()
 	client.Name, client.ClientToken, client.Agent = o.name, o.clientToken, prog.Name+" "+version
 	client.Logf = log.Printf
 	if o.command == "serve" {

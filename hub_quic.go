@@ -662,7 +662,7 @@ func (qc *quicConn) handle(s *quic.Stream) {
 		}
 		answer(quictun.Answer{Status: http.StatusOK, Proto: proto, Conn: connID})
 		unlock()
-		client := tunnel.NewStream(tunnel.NewFramed(quictun.NewStreamConn(s, qc.conn)))
+		client := tunnel.NewStream(tunnel.NewFramed(quictun.NewStreamConn(s, qc.conn, nil)))
 		client.SetRemote(qc.addr)
 		h.relay(t, connID, client)
 	case "serve":
@@ -840,7 +840,7 @@ func (h *tunnelHub) openQUIC(t *relayTunnel, id string) (servedLeg, string) {
 		return servedLeg{}, "the serving side did not answer"
 	}
 	if a.Status == http.StatusOK {
-		leg := tunnel.NewStream(tunnel.NewFramed(quictun.NewStreamConn(s, q.qc.conn)))
+		leg := tunnel.NewStream(tunnel.NewFramed(quictun.NewStreamConn(s, q.qc.conn, nil)))
 		leg.SetRemote(t.serveAddr)
 		return servedLeg{s: leg}, ""
 	}
