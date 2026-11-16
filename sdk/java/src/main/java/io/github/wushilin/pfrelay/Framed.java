@@ -231,12 +231,21 @@ final class Framed implements Link {
         }
     }
 
+    /** The peer broke the protocol: a broken stream, even after the peer's eof (§13.4). */
+    static final class BrokenException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        BrokenException(String what) {
+            super("the peer broke the protocol: " + what);
+        }
+    }
+
     /** The peer broke the protocol: reset the stream ("protocol"), and say so. */
     private IOException broken(String what) {
         if (ended.compareAndSet(false, true)) {
             stream.broken();
         }
-        return new IOException("the peer broke the protocol: " + what);
+        return new BrokenException(what);
     }
 
     // ---------- reading ----------

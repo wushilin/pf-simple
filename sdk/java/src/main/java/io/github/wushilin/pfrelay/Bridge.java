@@ -214,6 +214,13 @@ final class Bridge {
         Verdict v;
         try {
             v = describe(p, results.take());
+            if (v.err != null && !v.mine && !(v.err instanceof RemoteException)
+                    && conn.error() instanceof RemoteException) {
+                // The far end's reason over what it caused here: a write
+                // that failed because the far end had gone (§13.5).
+                RemoteException r = (RemoteException) conn.error();
+                v = new Verdict(r.reason(), false, r);
+            }
             if (v.err == null) {
                 // One direction finished cleanly. If that was the far end's
                 // half-close, nothing reads the stream any more, so watch for
@@ -232,9 +239,12 @@ final class Bridge {
                     }
                 } else {
                     String why = conn.goneReason();
+                    IOException broken = conn.error(); // such as a framed stream broken after the far end's eof
                     IOException err = why != null ? new RemoteException(why)
-                            : new IOException("the server closed the connection");
-                    v = new Verdict(why != null ? why : "the server closed the connection", false, err);
+                            : broken != null ? broken : new IOException("the server closed the connection");
+                    String reason = why != null ? why
+                            : broken != null ? linkReason(p, broken) : "the server closed the connection";
+                    v = new Verdict(reason, false, err);
                 }
             }
         } catch (InterruptedException e) {
