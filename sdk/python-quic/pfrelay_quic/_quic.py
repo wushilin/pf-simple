@@ -258,14 +258,18 @@ class QConn:
                 if len(self._let_go) > 256:  # what aioquic has discarded, it ignores itself
                     self._let_go = {i for i in self._let_go if i in self.quic._streams}
         self.held.pop(s.id, None)
-        if self._retired and not self.streams and not self.regs:
-            self.close(Code.NONE)
+        self.close_if_idle()
 
     def retire(self) -> None:
         """No new requests go here (a 429 for this connection, 13.8): close it
         once it holds nothing."""
         self._retired = True
-        if not self.streams and not self.regs:
+        self.close_if_idle()
+
+    def close_if_idle(self) -> None:
+        """Close a retired connection that holds no stream and no
+        registration any more."""
+        if self._retired and not self.streams and not self.regs:
             self.close(Code.NONE)
 
     def close(self, code: int = Code.NONE, reason: str = "") -> None:
@@ -470,6 +474,7 @@ class QStream:
         self._held = 0
         self.qc.held.pop(self.id, None)
         self._stopped = True  # discard what still comes
+        self._readable.set()  # a reader waiting in read() ends: "the stream was reset"
         self.qc.transmit_soon()
         if self._peer_done.is_set():
             self._forget()
@@ -492,6 +497,8 @@ class QStream:
 
     def _forget(self) -> None:
         self._let_go = True
+        self._stopped = True
+        self._readable.set()  # nothing reaches a forgotten stream: no reader may wait on it
         self.qc.forget(self)
 
 
@@ -552,6 +559,12 @@ async def dial(host: str, port: int, pins: set[bytes]) -> QConn:
         ok = True
     finally:
         if not ok:
+            # aioquic's own waiter outlives a timed-out or cancelled wait,
+            # and gets ConnectionError when the connection closes: read it,
+            # so asyncio does not report it as never retrieved.
+            waiter = getattr(proto, "_connected_waiter", None)
+            if waiter is not None:
+                waiter.add_done_callback(lambda f: f.cancelled() or f.exception())
             qc.close(Code.NONE)
             transport.close()
     qc.start_keepalive()
