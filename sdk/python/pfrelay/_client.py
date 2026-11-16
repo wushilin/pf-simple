@@ -613,6 +613,16 @@ class Client:
             log.info("connection %s: could not tell the server: %s", cid.short, explain(e))
 
 
+def _cancel_pending() -> bool:
+    """Whether this task has been asked to stop. On Python 3.10 and 3.11,
+    asyncio.wait_for returns a result that arrives together with the
+    cancellation, and the cancellation is lost; a registration that comes
+    back then must not be kept. (3.10 cannot tell: it has no cancelling.)"""
+    t = asyncio.current_task()
+    cancelling = getattr(t, "cancelling", None)
+    return bool(cancelling and cancelling())
+
+
 class _Registration:
     """Keeps a tunnel registered and calls open_one, in a task of its own,
     for each connection the hub asks for."""
@@ -669,6 +679,9 @@ class _Registration:
                     "cannot register with %s (%s); attempt %d, trying again in %gs", c.base, e, attempt, backoff
                 )
             else:
+                if _cancel_pending():
+                    ws.abort()
+                    raise asyncio.CancelledError()
                 if served:
                     log.info("registered again with %s after %d attempt(s)", c.base, attempt)
                 else:
@@ -715,6 +728,9 @@ class _Registration:
                     c.base, t.name, e, attempt, backoff,
                 )
             else:
+                if _cancel_pending():
+                    reg.close()
+                    raise asyncio.CancelledError()
                 if served:
                     log.info("registered again with %s over %s after %d attempt(s)", c.base, t.name, attempt)
                 else:

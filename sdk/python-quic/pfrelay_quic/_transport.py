@@ -163,7 +163,8 @@ class Quic:
                 await s.write(encode_message(req))
                 return await read_message(s)
 
-            m = await asyncio.wait_for(exchange(), ANSWER_WAIT)
+            async with asyncio.timeout(ANSWER_WAIT):  # not wait_for: on 3.11 it can lose a cancellation
+                m = await exchange()
         except asyncio.TimeoutError:
             s.reset(Code.REQUEST_TIMEOUT)
             raise LinkError("the hub did not answer in time") from None
@@ -231,7 +232,8 @@ class Quic:
         """Read the open on a stream the hub opened, and hand it to its
         registration."""
         try:
-            m = await asyncio.wait_for(read_message(s), REQUEST_WAIT)
+            async with asyncio.timeout(REQUEST_WAIT):  # not wait_for: on 3.11 it can lose a cancellation
+                m = await read_message(s)
         except asyncio.TimeoutError:
             s.reset(Code.REQUEST_TIMEOUT)
             return
@@ -363,7 +365,8 @@ class QOpen:
         msg: dict = {"status": status}
         if error:
             msg["error"] = error
-        await asyncio.wait_for(self.s.write(encode_message(msg)), WRITE_WAIT)
+        async with asyncio.timeout(WRITE_WAIT):  # not wait_for: on 3.11 it can lose a cancellation
+            await self.s.write(encode_message(msg))
 
     async def accept(self) -> QStream:
         try:

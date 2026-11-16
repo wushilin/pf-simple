@@ -227,7 +227,8 @@ class QConn:
             if self.serves == 0 or left <= 0 or self.closed:
                 return None
             try:
-                await asyncio.wait_for(self._changed.wait(), left)
+                async with asyncio.timeout(left):  # not wait_for: on 3.11 it can lose a cancellation
+                    await self._changed.wait()
             except asyncio.TimeoutError:
                 return None
 
@@ -477,7 +478,8 @@ class QStream:
 
     async def _linger(self) -> None:
         try:
-            await asyncio.wait_for(self._peer_done.wait(), DELIVER_WAIT)
+            async with asyncio.timeout(DELIVER_WAIT):  # not wait_for: on 3.11 it can lose a cancellation
+                await self._peer_done.wait()
         except asyncio.TimeoutError:
             if not self.qc.closed:
                 try:
@@ -538,7 +540,8 @@ async def dial(host: str, port: int, pins: set[bytes]) -> QConn:
     try:
         proto.connect(addr)
         try:
-            await asyncio.wait_for(proto.wait_connected(), HANDSHAKE_WAIT)
+            async with asyncio.timeout(HANDSHAKE_WAIT):  # not wait_for: on 3.11 it can lose a cancellation
+                await proto.wait_connected()
         except asyncio.TimeoutError:
             raise unreachable("the handshake timed out") from None
         except ConnectionError:
