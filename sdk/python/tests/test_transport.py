@@ -309,7 +309,7 @@ class Client(unittest.IsolatedAsyncioTestCase):
         p = t.params
         self.assertEqual((p.word, p.serve_token, p.client_token, p.name), (WORD, "s" * 40, "c" * 20, "Mon service é"))
         self.assertEqual(len(p.client_token_sha256), 64)
-        self.assertTrue(p.agent.startswith("pfrelay-py 0.16.0"))
+        self.assertTrue(p.agent.startswith("pfrelay-py 0.16.1"))
         await lst.close()
 
     async def test_dial_and_check(self):
@@ -353,6 +353,29 @@ class Client(unittest.IsolatedAsyncioTestCase):
         c = new_client(transport=t)
         with self.assertRaises(pfrelay.AccessDenied):
             await asyncio.wait_for(c.listen(), 5)
+
+    @unittest.skipUnless(hasattr(asyncio, "timeout"), "Python 3.11 or later")
+    async def test_serve_in_a_task_that_once_caught_a_cancellation(self):
+        # A task keeps its cancellation count once it caught one; serving in
+        # it must still keep its registration.
+        t = FakeTransport()
+        c = new_client(transport=t)
+
+        async def body():
+            me = asyncio.current_task()
+            me.cancel()
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass  # caught, and not uncancelled
+            try:
+                async with asyncio.timeout(0.5):
+                    await c.serve("127.0.0.1:1")
+            except TimeoutError:
+                return "still serving"
+
+        self.assertEqual(await asyncio.ensure_future(body()), "still serving")
+        self.assertEqual(len(t.regs), 1)
 
     async def test_serve_refuses_an_unreachable_target(self):
         t = FakeTransport()

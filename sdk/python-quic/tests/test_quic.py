@@ -454,11 +454,136 @@ class Keepalive(WithHub):
             _quic.KEEP_ALIVE = old
 
 
+class Review(WithHub):
+    """Regression tests for the findings of a code review."""
+
+    async def test_a_reader_is_not_left_waiting_after_close(self):
+        # The hub never ends its direction: after the 3 s linger the stream
+        # is let go of, and the Conn's reader must end with it.
+        async def never_ends(hub, qc, s, req):
+            await answer(s, status=200, conn="8f14e45fceea167a")
+            await asyncio.sleep(30)
+
+        self.hub.handlers["connect"] = never_ends
+        _quic.DELIVER_WAIT, old = 0.3, _quic.DELIVER_WAIT
+        try:
+            c, _ = client(self.hub)
+            conn = await c.dial()
+            await asyncio.sleep(0.2)  # the reader is waiting on the stream
+            await conn.fail("dropped here")
+            for _ in range(50):
+                if conn._reader.done():
+                    break
+                await asyncio.sleep(0.05)
+            self.assertTrue(conn._reader.done(), "the reader ended with the stream")
+        finally:
+            _quic.DELIVER_WAIT = old
+
+    async def test_426_is_a_refusal_with_the_hubs_message(self):
+        async def upgrade(hub, qc, s, req):
+            await refuse(s, 426, "this hub speaks QUIC protocol 4: upgrade pf-client-quic", proto=4)
+
+        self.hub.handlers["connect"] = upgrade
+        self.hub.handlers["serve"] = upgrade
+        c, _ = client(self.hub)
+        with self.assertRaises(pfrelay.StatusError) as ctx:
+            await c.dial()
+        self.assertEqual(ctx.exception.code, 426)
+        self.assertTrue(ctx.exception.final)
+        self.assertIn("upgrade pf-client-quic", str(ctx.exception))
+        with self.assertRaises(pfrelay.StatusError):
+            await asyncio.wait_for(c.listen(), 5)  # final: not retried
+
+    async def test_an_accepted_request_in_another_protocol_is_final(self):
+        async def newer(hub, qc, s, req):
+            await answer(s, status=200, proto=4, reg="5b2d4e8f1a6c9b0d")
+
+        self.hub.handlers["serve"] = newer
+        c, _ = client(self.hub)
+        with self.assertRaises(_transport.QuicProtoError):
+            await asyncio.wait_for(c.listen(), 5)
+
+    async def test_a_cancelled_next_loses_no_open(self):
+        reg = _transport.QReg(None, "5b2d4e8f1a6c9b0d", None)
+
+        class Open:
+            s = None
+
+        o = Open()
+        waiting = asyncio.ensure_future(reg.next())
+        await asyncio.sleep(0)
+        self.assertTrue(reg.offer(o))
+        waiting.cancel()  # in the same turn as the open's arrival
+        got = (await asyncio.gather(waiting, return_exceptions=True))[0]
+        if got is not o:
+            self.assertIsInstance(got, asyncio.CancelledError)
+            self.assertIs(reg.opens.get_nowait(), o, "the open is still there for the next call")
+
+    async def test_a_failed_handshake_leaves_no_unread_exception(self):
+        import gc
+        import socket
+
+        seen = []
+        asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: seen.append(ctx))
+        quiet = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # a port that never answers
+        quiet.bind(("127.0.0.1", 0))
+        _quic.HANDSHAKE_WAIT, old = 0.3, _quic.HANDSHAKE_WAIT
+        try:
+            with self.assertRaises(pfrelay.LinkError):
+                await _quic.dial("127.0.0.1", quiet.getsockname()[1], {b"\0" * 32})
+            await asyncio.sleep(3)  # aioquic ends the closed connection after its closing period
+            gc.collect()
+            await asyncio.sleep(0.1)
+            self.assertEqual([c.get("message") for c in seen], [])
+        finally:
+            _quic.HANDSHAKE_WAIT = old
+            quiet.close()
+
+    async def test_a_retired_connection_closes_once_it_holds_nothing(self):
+        # A 429 for the connection retires it while it still holds a
+        # registration; once the registration ends, the connection closes.
+        c, t = client(self.hub)
+        lst = await asyncio.wait_for(c.listen(), 5)
+        first, serve_stream, _ = self.hub.regs[0]
+
+        async def busy(hub, qc, s, req):
+            await refuse(s, 429, "slow down", scope="connection", retryAfter=1)
+
+        self.hub.handlers["check"] = busy
+        with self.assertRaises(pfrelay.StatusError):
+            await c.check()
+        self.assertFalse(first.closed, "it still holds the registration")
+        self.hub.registered.clear()
+        serve_stream.finish()  # a bare FIN: the client's end of it is let go of at once
+        await asyncio.wait_for(self.hub.registered.wait(), 5)
+        for _ in range(50):
+            if first.closed:
+                break
+            await asyncio.sleep(0.05)
+        self.assertTrue(first.closed, "the retired connection was closed")
+        await lst.close()
+
+    async def test_close_ends_retired_connections_too(self):
+        c, t = client(self.hub)
+        lst = await asyncio.wait_for(c.listen(), 5)
+        first = self.hub.regs[0][0]
+        self.hub.handlers["check"] = lambda hub, qc, s, req: refuse(s, 429, "slow down", scope="connection")
+        with self.assertRaises(pfrelay.StatusError):
+            await c.check()
+        t.close()
+        for _ in range(50):
+            if first.closed:
+                break
+            await asyncio.sleep(0.05)
+        self.assertTrue(first.closed)
+        await lst.close()
+
+
 class PublicClient(unittest.TestCase):
     def test_is_a_pfrelay_client(self):
         c = pfrelay_quic.Client("https://hub.example", "k3f9-x2mq-7hpa", name="x")
         self.assertIsInstance(c, pfrelay.Client)
-        self.assertTrue(c.agent.startswith("pfrelay-quic-py 0.16.0"))
+        self.assertTrue(c.agent.startswith("pfrelay-quic-py 0.16.1"))
         self.assertEqual(c.transport.name, "QUIC")
 
 

@@ -9,7 +9,7 @@ import logging
 import struct
 from typing import Optional
 
-from pfrelay import LinkError, StatusError
+from pfrelay import LinkError, PfRelayError, StatusError
 from pfrelay import transport as spi
 
 from ._quic import PinMismatch, QConn, QStream, background, dial
@@ -53,6 +53,15 @@ NO_QUIC = (
 PIN_MISMATCH = "the hub's QUIC certificate does not match what its HTTPS endpoint announced"
 
 
+class QuicProtoError(PfRelayError):
+    """The hub accepted a request in a QUIC protocol this client does not
+    speak. Retrying cannot help: one side must be upgraded."""
+
+    def __init__(self, proto: int):
+        self.proto = proto
+        super().__init__(f"the hub answered in QUIC protocol {proto}; this client speaks {PROTO}")
+
+
 async def _read_exactly(s: QStream, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
@@ -90,6 +99,10 @@ class Quic:
     def __init__(self) -> None:
         self._qc: Optional[QConn] = None
         self._lock: Optional[asyncio.Lock] = None
+        # Connections no request goes to any more (a 429 for the connection,
+        # 13.8), still holding streams or registrations: they close once
+        # they hold nothing, or at close().
+        self._retired: list[QConn] = []
 
     # ---------------------------------------------------------- the connection
 
@@ -144,15 +157,21 @@ class Quic:
 
     def close(self) -> None:
         qc, self._qc = self._qc, None
-        if qc is not None:
-            qc.close(Code.NONE)
+        retired, self._retired = self._retired, []
+        for c in [qc, *retired]:
+            if c is not None:
+                c.close(Code.NONE)
 
     # ---------------------------------------------------------- requests
 
-    async def _request(self, p: spi.Params, op: str, req: dict) -> tuple[QConn, QStream, Answer]:
-        """Open a stream, send req, and read the hub's answer. A refusal is
-        raised, after the stream is ended."""
-        qc = await self._get(p, op)
+    async def _request(
+        self, p: spi.Params, op: str, req: dict, qc: Optional[QConn] = None
+    ) -> tuple[QConn, QStream, Answer]:
+        """Open a stream, send req, and read the hub's answer: on qc, or on the
+        connection to the hub. A refusal is raised, after the stream is
+        ended."""
+        if qc is None:
+            qc = await self._get(p, op)
         try:
             s = qc.open_stream()
         except LinkError:
@@ -180,16 +199,19 @@ class Quic:
             s.cancel()
             raise
         a = Answer.of(m)
-        if a.proto not in (0, PROTO):
-            s.reset(Code.PROTOCOL)
-            raise LinkError(f"the hub answered in QUIC protocol {a.proto}; this client speaks {PROTO}")
         if a.status not in (200, 204):
-            # The hub sends FIN and STOP_SENDING; end this direction too.
+            # A refusal, a 426 included, whatever its proto says (13.4). The
+            # hub sends FIN and STOP_SENDING; end this direction too.
             s.reset(Code.REFUSED)
             if a.status == 429 and a.scope == "connection":
                 self._forget(qc)  # the next request opens a new connection (13.8)
+                self._retired = [c for c in self._retired if not c.closed]
+                self._retired.append(qc)
                 qc.retire()
             raise spi.refused(a.status, a.error)
+        if a.proto not in (0, PROTO):
+            s.reset(Code.PROTOCOL)
+            raise QuicProtoError(a.proto)
         return qc, s, a
 
     async def register(self, p: spi.Params, target: str) -> "QReg":
@@ -206,9 +228,9 @@ class Quic:
         qc = await self._get(p, OP_SERVE)
         qc.serves += 1  # an open may arrive before the answer (13.4)
         try:
-            qc2, s, a = await self._request(p, OP_SERVE, req)
-            reg = QReg(qc2, a.reg, s)
-            qc2.regs[a.reg] = reg
+            _, s, a = await self._request(p, OP_SERVE, req, qc)
+            reg = QReg(qc, a.reg, s)
+            qc.regs[a.reg] = reg
         finally:
             qc.serves -= 1
             qc.changed()
@@ -262,7 +284,9 @@ class QReg:
         self.s = s
         self.opens: asyncio.Queue[QOpen] = asyncio.Queue(OPEN_QUEUE)
         self.ended: Optional[str] = None
-        self._ended = asyncio.Event()
+        # Set by an open and by the end. next() takes an open only when it
+        # returns it, so a cancelled next() loses nothing.
+        self._wake = asyncio.Event()
         self._closing = False
         self._task: Optional[asyncio.Task] = None
 
@@ -276,6 +300,7 @@ class QReg:
             self.opens.put_nowait(o)
         except asyncio.QueueFull:
             return False
+        self._wake.set()
         return True
 
     async def next(self) -> "QOpen":
@@ -284,16 +309,8 @@ class QReg:
                 return self.opens.get_nowait()
             if self.ended is not None:
                 raise LinkError(self.ended)
-            getter = asyncio.ensure_future(self.opens.get())
-            ender = asyncio.ensure_future(self._ended.wait())
-            try:
-                await asyncio.wait({getter, ender}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                ender.cancel()
-                if not getter.done():
-                    getter.cancel()
-            if getter.done() and not getter.cancelled():
-                return getter.result()
+            self._wake.clear()
+            await self._wake.wait()
 
     def close(self) -> None:
         """Unregister: FIN on the serve stream; the hub answers with FIN."""
@@ -347,7 +364,8 @@ class QReg:
             while not self.opens.empty():
                 self.opens.get_nowait().s.cancel()
             self.ended = why
-            self._ended.set()
+            self._wake.set()
+            self.qc.close_if_idle()
 
 
 class QOpen:

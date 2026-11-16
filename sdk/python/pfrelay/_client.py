@@ -62,7 +62,7 @@ from ._proto import (
 from ._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT, FrameError, WebSocket
 from .transport import Open, Params, Registration, Transport
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 DEFAULT_AGENT = f"pfrelay-py {__version__}"
 
 log = logging.getLogger("pfrelay")
@@ -613,14 +613,18 @@ class Client:
             log.info("connection %s: could not tell the server: %s", cid.short, explain(e))
 
 
-def _cancel_pending() -> bool:
-    """Whether this task has been asked to stop. On Python 3.10 and 3.11,
-    asyncio.wait_for returns a result that arrives together with the
-    cancellation, and the cancellation is lost; a registration that comes
-    back then must not be kept. (3.10 cannot tell: it has no cancelling.)"""
+def _cancels() -> int:
+    """How many times this task has been asked to stop (0 where Python
+    cannot tell, before 3.11).
+
+    On Python 3.10 and 3.11, asyncio.wait_for returns a result that arrives
+    together with the cancellation, and the cancellation is lost. A
+    registration that comes back while the count went up must not be kept.
+    The count is compared, not tested for zero: a task that once caught a
+    cancellation keeps its count, and must still be able to serve."""
     t = asyncio.current_task()
     cancelling = getattr(t, "cancelling", None)
-    return bool(cancelling and cancelling())
+    return cancelling() if cancelling else 0
 
 
 class _Registration:
@@ -663,6 +667,7 @@ class _Registration:
         backoff, served, attempt = c.retry_min, False, 0
         while True:
             attempt += 1
+            cancels = _cancels()
             try:
                 ws = await c._dial(Endpoint.SERVE, extra)
             except ProtoError:
@@ -679,7 +684,7 @@ class _Registration:
                     "cannot register with %s (%s); attempt %d, trying again in %gs", c.base, e, attempt, backoff
                 )
             else:
-                if _cancel_pending():
+                if _cancels() > cancels:
                     ws.abort()
                     raise asyncio.CancelledError()
                 if served:
@@ -711,6 +716,7 @@ class _Registration:
         backoff, served, attempt = c.retry_min, False, 0
         while True:
             attempt += 1
+            cancels = _cancels()
             try:
                 reg = await t.register(Params(c), self._target)
             except ProtoError:
@@ -728,7 +734,7 @@ class _Registration:
                     c.base, t.name, e, attempt, backoff,
                 )
             else:
-                if _cancel_pending():
+                if _cancels() > cancels:
                     reg.close()
                     raise asyncio.CancelledError()
                 if served:
