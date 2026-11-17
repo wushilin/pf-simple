@@ -584,7 +584,7 @@ func TestRelaySwitches(t *testing.T) {
 		srv.CloseClientConnections()
 		srv.Close()
 	}()
-	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig}
+	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig, url: srv.URL}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -910,7 +910,7 @@ func TestRelayTenants(t *testing.T) {
 		srv.CloseClientConnections()
 		srv.Close()
 	}()
-	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig}
+	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig, url: srv.URL}
 
 	post := func(url, body string) (int, map[string]string) {
 		t.Helper()
