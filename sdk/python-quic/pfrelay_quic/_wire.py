@@ -96,7 +96,7 @@ class Answer:
 
 @dataclass
 class Discovery:
-    """The answer of GET /pf/api/tunnel/quic (13.2)."""
+    """The answer of GET <prefix>/api/tunnel/quic (13.2)."""
 
     host: str = ""
     port: int = 0

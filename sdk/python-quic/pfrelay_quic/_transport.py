@@ -36,7 +36,7 @@ WRITE_WAIT = 10.0  # bounds writing an answer to an open
 OPEN_QUEUE = 128  # opens queued for a registration, beyond the listener's backlog
 DELIVER_WAIT = 3.0
 
-PATH = "/pf/api/tunnel/quic"
+ENDPOINT = "quic"  # discovery, at <prefix>/api/tunnel/quic (13.2)
 H_VERSION = "X-PF-Version"
 H_OP = "X-PF-Tunnel-Op"
 H_SERVE = "X-PF-Serve-Token"
@@ -116,7 +116,7 @@ class Quic:
             h.append((H_WORD, p.word))
             if p.client_token:
                 h.append((H_CLIENT_TOKEN, p.client_token))
-        a = await p.get(PATH, h)
+        a = await p.get(p.path(ENDPOINT), h)
         if a.status == 404:  # a hub without QUIC does not know the endpoint
             raise StatusError(404, NO_QUIC, a.headers)
         if a.status != 200:

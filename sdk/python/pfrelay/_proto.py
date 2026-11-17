@@ -49,7 +49,8 @@ PROTO_MAX = 2
 # The first pf-simple release that speaks each protocol.
 _PROTO_RELEASE = {0: "0.11.0", 1: "0.14.0", 2: "0.15.0"}
 
-API_PATH = "/pf/api/tunnel"
+# The endpoints are under <prefix>/api/tunnel (PROTOCOL.md 2).
+API_PATH = "/api/tunnel"
 
 HEADER_PROTO = "X-PF-Tunnel-Proto"
 HEADER_VERSION = "X-PF-Version"
@@ -282,27 +283,81 @@ def check_name(name: str) -> str:
     return n
 
 
-def normalize_base(raw: str) -> tuple[str, str, int, str]:
-    """Check the hub's base URL. Returns (base, host, port, netloc)."""
+# The prefix a hub is at unless its admin chose another (PROTOCOL.md 2).
+DEFAULT_PREFIX = "/pf"
+PREFIX_MAX = 200  # characters, the whole prefix
+_SEGMENT = re.compile(r"[A-Za-z0-9._~-]{1,64}")
+_URL_FORM = (
+    "use https://host[:port], optionally followed by the hub's prefix, like "
+    "https://host/pf/ (the default) or https://host:8443/my-hub/; a prefix is "
+    "/-separated segments of 1 to 64 of A-Z a-z 0-9 . _ ~ -, none of them . or .., "
+    f"at most {PREFIX_MAX} characters"
+)
+
+
+@dataclass(frozen=True)
+class Base:
+    """The hub's base URL, checked (PROTOCOL.md 2): where it is and the
+    prefix it is mounted at."""
+
+    url: str  # https://netloc<prefix>, for logs
+    host: str
+    port: int
+    netloc: str  # host[:port] as given, for the Host header
+    prefix: str  # like /pf: a leading /, no trailing one
+
+    def path(self, endpoint: str) -> str:
+        """The request path of an endpoint: <prefix>/api/tunnel/<endpoint>."""
+        return f"{self.prefix}{API_PATH}/{endpoint}"
+
+
+def parse_base(raw: str) -> Base:
+    """Check the hub's base URL as PROTOCOL.md 2 has it: https, a host and
+    an optional port, and a path that is the hub's prefix (empty or / for
+    /pf; one trailing / ignored). No query, fragment or user information."""
+    s = raw.strip()
+
+    def bad(why: str) -> ValueError:
+        return ValueError(f"invalid server URL {raw!r}: {why}; {_URL_FORM}")
+
+    # urlsplit drops tabs and newlines silently; nothing outside printable
+    # ASCII belongs in the URL at all.
+    if any(not ("\x21" <= c <= "\x7e") for c in s):
+        raise bad("it may not contain spaces, control or non-ASCII characters")
     try:
-        u = urlsplit(raw.strip())
+        u = urlsplit(s)
         host = u.hostname
         port = u.port
     except ValueError:
-        raise ValueError(f"invalid server URL {raw!r}: use https://host[:port]/") from None
-    if not host or not u.netloc:
-        raise ValueError(f"invalid server URL {raw!r}: use https://host[:port]/")
+        raise bad("it is not a URL") from None
     if u.scheme.lower() != "https":
-        raise ValueError(f"invalid server URL {raw!r}: only https:// is supported")
-    if u.username is not None or u.password is not None:
-        raise ValueError(f"invalid server URL {raw!r}: give the server's address only")
+        raise bad("only https:// is supported")
+    if "@" in u.netloc:
+        raise bad("it may not carry user information")
+    if not host or not u.netloc:
+        raise bad("it names no host")
+    if "?" in s:
+        raise bad("it may not carry a query")
+    if "#" in s:
+        raise bad("it may not carry a fragment")
     path = u.path[:-1] if u.path.endswith("/") else u.path
-    if path not in ("", "/pf"):
-        raise ValueError(
-            f"invalid server URL {raw!r}: give the server's address only, like https://{u.netloc}/"
-        )
+    if not path:
+        prefix = DEFAULT_PREFIX
+    else:
+        if len(path) > PREFIX_MAX:
+            raise bad(f"the prefix is longer than {PREFIX_MAX} characters")
+        for seg in path[1:].split("/"):
+            if not seg:
+                raise bad("the prefix has an empty segment")
+            if seg in (".", ".."):
+                raise bad(f"the prefix has a segment {seg!r}")
+            if len(seg) > 64:
+                raise bad("a segment of the prefix is longer than 64 characters")
+            if not _SEGMENT.fullmatch(seg):
+                raise bad(f"the prefix segment {seg!r} has a character not allowed (no %-escapes)")
+        prefix = path
     netloc = u.netloc
-    return "https://" + netloc, host, port or 443, netloc
+    return Base("https://" + netloc + prefix, host, port or 443, netloc, prefix)
 
 
 # ---------------------------------------------------------------- negotiation
@@ -380,7 +435,7 @@ def clean_reason(s: str) -> str:
 
 
 class Endpoint(str, enum.Enum):
-    """The hub's endpoints, under API_PATH (PROTOCOL.md 6)."""
+    """The hub's endpoints, under <prefix>/api/tunnel (PROTOCOL.md 2, 6)."""
 
     SERVE = "serve"
     CONNECT = "connect"
@@ -393,7 +448,9 @@ class Endpoint(str, enum.Enum):
 
     @property
     def path(self) -> str:
-        return f"{API_PATH}/{self.value}"
+        """The request path at the default prefix, /pf. A Client asks its
+        own Base for the path at the prefix it was given."""
+        return f"{DEFAULT_PREFIX}{API_PATH}/{self.value}"
 
 
 # The control channel's message (PROTOCOL.md 7): {"open": "<id>"}.

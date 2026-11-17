@@ -182,6 +182,29 @@ described here. Over an attached transport:
 `pfrelay.transport` is a service-provider interface for SDKs built on this
 one; applications do not implement it.
 
+## The server URL
+
+`Client`'s first argument is the hub as `https://host[:port]`, optionally
+followed by the hub's **prefix**, the path it is mounted at
+([PROTOCOL.md §2](../../docs/PROTOCOL.md)):
+
+- No path, or `/`, means the default prefix `/pf`: `https://hub.example.com`
+  and `https://hub.example.com/pf/` are the same hub.
+- A hub its admin mounted elsewhere is given with its prefix, such as
+  `https://hub.example.com:8443/xzfe-aeeg-e2da/`. One trailing `/` is
+  ignored.
+- A prefix is one or more `/`-separated segments of 1 to 64 of
+  `A-Z a-z 0-9 . _ ~ -`, none of them `.` or `..`, at most 200 characters
+  in all. It is case-sensitive.
+- `Client` refuses (`ValueError`) anything else: `http://`, a query, a
+  fragment, user information, an empty segment (`//`), `%`-escapes, spaces
+  or other characters.
+
+Every request goes to `https://host[:port]<prefix>/api/tunnel/<endpoint>`.
+The prefix is not negotiated: a wrong one gets 404 from the hub.
+`client.base` is the URL as checked, with its prefix and without a
+trailing `/`.
+
 ## TLS
 
 The hub's certificate is verified normally. Pass `ca_file=` to trust a

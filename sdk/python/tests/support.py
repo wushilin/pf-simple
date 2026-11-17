@@ -13,9 +13,9 @@ WORD = "k3f9-x2mq-7hpa"
 SERVE_TOKEN = "s" * 40
 
 
-def new_client(**kw) -> pfrelay.Client:
+def new_client(server: str = "https://127.0.0.1:1", **kw) -> pfrelay.Client:
     kw.setdefault("name", "Test")
-    c = pfrelay.Client("https://127.0.0.1:1", WORD, **kw)
+    c = pfrelay.Client(server, WORD, **kw)
     c.retry_min, c.retry_max, c.recheck = 0.01, 0.02, 0.02
     return c
 
