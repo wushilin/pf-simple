@@ -73,11 +73,14 @@ class Wire(unittest.TestCase):
 class FakeParams:
     """Params whose HTTPS GET answers as the test says."""
 
-    def __init__(self, status, body=b"", serve_token="", client_token=""):
-        self.status, self.body = status, body
+    def __init__(self, status, body=b"", serve_token="", client_token="", prefix="/pf"):
+        self.status, self.body, self.prefix = status, body, prefix
         self.agent, self.word = "test", "k3f9-x2mq-7hpa"
         self.serve_token, self.client_token = serve_token, client_token
         self.asked = []
+
+    def path(self, endpoint):
+        return f"{self.prefix}/api/tunnel/{endpoint}"
 
     async def get(self, path, headers):
         self.asked.append((path, dict(headers)))
@@ -99,6 +102,21 @@ class Discovery(unittest.IsolatedAsyncioTestCase):
         h = p.asked[0][1]
         self.assertEqual((h["X-PF-Tunnel-Op"], h["X-PF-Tunnel-Word"], h["X-PF-Client-Token"]),
                          ("connect", "k3f9-x2mq-7hpa", "c" * 20))
+
+    async def test_custom_prefix(self):
+        fp = "ab" * 32
+        body = b'{"host":"h","port":1,"fingerprints":["%s"]}' % fp.encode()
+        p = FakeParams(200, body, client_token="c" * 20, prefix="/xzfe-aeeg-e2da")
+        await _transport.Quic()._discover(p, _transport.OP_CONNECT)
+        self.assertEqual(p.asked[0][0], "/xzfe-aeeg-e2da/api/tunnel/quic")
+        # The real Params: the path follows the Client's base URL.
+        c = pfrelay_quic.Client("https://hub.example:8443/xzfe-aeeg-e2da/", "k3f9-x2mq-7hpa", name="x")
+        self.assertEqual(c.base, "https://hub.example:8443/xzfe-aeeg-e2da")
+        self.assertEqual(spi.Params(c).path("quic"), "/xzfe-aeeg-e2da/api/tunnel/quic")
+        c = pfrelay_quic.Client("https://hub.example", "k3f9-x2mq-7hpa", name="x")
+        self.assertEqual(spi.Params(c).path("quic"), "/pf/api/tunnel/quic")
+        with self.assertRaises(ValueError):
+            pfrelay_quic.Client("https://hub.example/a//b", "k3f9-x2mq-7hpa", name="x")
 
     async def test_answers(self):
         q = _transport.Quic()
@@ -583,7 +601,7 @@ class PublicClient(unittest.TestCase):
     def test_is_a_pfrelay_client(self):
         c = pfrelay_quic.Client("https://hub.example", "k3f9-x2mq-7hpa", name="x")
         self.assertIsInstance(c, pfrelay.Client)
-        self.assertTrue(c.agent.startswith("pfrelay-quic-py 0.16.1"))
+        self.assertTrue(c.agent.startswith("pfrelay-quic-py 0.16.2"))
         self.assertEqual(c.transport.name, "QUIC")
 
 

@@ -54,7 +54,7 @@ from ._proto import (
     check_name,
     check_serve_token,
     error_text,
-    normalize_base,
+    parse_base,
     normalize_word,
     proto_range,
     server_proto,
@@ -62,7 +62,7 @@ from ._proto import (
 from ._ws import OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT, FrameError, WebSocket
 from .transport import Open, Params, Registration, Transport
 
-__version__ = "0.16.1"
+__version__ = "0.16.2"
 DEFAULT_AGENT = f"pfrelay-py {__version__}"
 
 log = logging.getLogger("pfrelay")
@@ -179,7 +179,9 @@ class Client:
         max_idle_legs: int = DEFAULT_MAX_IDLE_LEGS,
         transport: Optional[Transport] = None,
     ):
-        self.base, self._host, self._port, self._netloc = normalize_base(server)
+        self._base = parse_base(server)
+        self.base = self._base.url  # https://host[:port]<prefix>
+        self._host, self._port, self._netloc = self._base.host, self._base.port, self._base.netloc
         self.word = normalize_word(word)
         if serve_token:
             check_serve_token(serve_token)
@@ -278,7 +280,7 @@ class Client:
 
     async def _dial(self, endpoint: Endpoint, extra: list[tuple[str, str]]) -> WebSocket:
         resp, ws = await _ws.ws_dial(
-            self._host, self._port, self._netloc, self._ssl, endpoint.path, self._headers(endpoint, extra)
+            self._host, self._port, self._netloc, self._ssl, self._base.path(endpoint.value), self._headers(endpoint, extra)
         )
         if ws is not None:
             try:
@@ -293,7 +295,7 @@ class Client:
 
     async def _get(self, endpoint: Endpoint, extra: list[tuple[str, str]]) -> _ws.Response:
         resp = await _ws.http_get(
-            self._host, self._port, self._netloc, self._ssl, endpoint.path, self._headers(endpoint, extra)
+            self._host, self._port, self._netloc, self._ssl, self._base.path(endpoint.value), self._headers(endpoint, extra)
         )
         if resp.status != 404:
             self.answered(endpoint, resp.headers)
@@ -320,7 +322,7 @@ class Client:
             self._port,
             self._netloc,
             self._ssl,
-            Endpoint.VERSION.path,
+            self._base.path(Endpoint.VERSION.value),
             self._headers(Endpoint.VERSION, [(HEADER_SERVE, self.serve_token)]),
         )
         if resp.status == 404:

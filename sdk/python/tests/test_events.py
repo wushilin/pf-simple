@@ -208,8 +208,14 @@ class Bookkeeping(unittest.IsolatedAsyncioTestCase):
 
 class Forwarders(unittest.IsolatedAsyncioTestCase):
     async def test_serve_refuses_an_unreachable_target(self):
+        await self._serve_refuses_an_unreachable_target("https://127.0.0.1:1", "/pf")
+
+    async def test_serve_and_accept_at_a_custom_prefix(self):
+        await self._serve_refuses_an_unreachable_target("https://127.0.0.1:1/xzfe-aeeg-e2da/", "/xzfe-aeeg-e2da")
+
+    async def _serve_refuses_an_unreachable_target(self, server, prefix):
         rec = Recorder()
-        c = new_client(serve_token=SERVE_TOKEN, events=rec.events())
+        c = new_client(server, serve_token=SERVE_TOKEN, events=rec.events())
         gets = []
 
         async def fake_get(host, port, netloc, ctx, path, headers):
@@ -218,7 +224,7 @@ class Forwarders(unittest.IsolatedAsyncioTestCase):
 
         async with Pair() as p:
             async def fake_dial(host, port, netloc, ctx, path, headers):
-                self.assertEqual(path, pfrelay.Endpoint.SERVE.path)
+                self.assertEqual(path, prefix + "/api/tunnel/serve")
                 return resp(101, x_pf_tunnel_proto="1"), p.client
 
             with mock.patch.object(_ws, "ws_dial", fake_dial), mock.patch.object(_ws, "http_get", fake_get):
@@ -239,7 +245,7 @@ class Forwarders(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec.named("refuse"), [(ID, pfrelay.REASON_UNREACHABLE)])
         self.assertEqual(rec.named("open"), [])
         [(path, h)] = gets
-        self.assertEqual(path, pfrelay.Endpoint.ACCEPT.path)
+        self.assertEqual(path, prefix + "/api/tunnel/accept")
         self.assertEqual(h["X-PF-Tunnel-Conn"], str(ID))
         self.assertEqual(h["X-PF-Tunnel-Error"], pfrelay.REASON_UNREACHABLE)
 

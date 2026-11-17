@@ -41,16 +41,67 @@ class Values(unittest.TestCase):
                 _proto.check_name(bad)
 
     def test_base(self):
-        for ok in ["https://h", "https://h/", "https://h:8443/pf", "https://h:8443/pf/", " https://h "]:
-            base, host, port, _ = _proto.normalize_base(ok)
-            self.assertEqual(host, "h")
-            self.assertIn(port, (443, 8443))
-            self.assertTrue(base.startswith("https://h"))
-        for bad in ["http://h", "https://h/x", "https:///pf", "h:443", "https://u:p@h/"]:
-            with self.assertRaises(ValueError, msg=bad):
-                _proto.normalize_base(bad)
-        _, host, port, netloc = _proto.normalize_base("https://[::1]:9/")
-        self.assertEqual((host, port, netloc), ("::1", 9, "[::1]:9"))
+        for raw, prefix in [
+            ("https://h", "/pf"),
+            ("https://h/", "/pf"),
+            ("https://h/pf", "/pf"),
+            ("https://h/pf/", "/pf"),
+            (" https://h ", "/pf"),
+            ("https://h:8443/xzfe-aeeg-e2da/", "/xzfe-aeeg-e2da"),
+            ("https://h/a/b.c_d~e-f", "/a/b.c_d~e-f"),
+            ("https://h/Hub", "/Hub"),  # case-sensitive
+            ("https://h/" + "x" * 64, "/" + "x" * 64),
+            ("https://h" + "/abcd" * 40, "/abcd" * 40),  # exactly 200
+        ]:
+            with self.subTest(raw=raw):
+                b = _proto.parse_base(raw)
+                self.assertEqual(b.host, "h")
+                self.assertIn(b.port, (443, 8443))
+                self.assertEqual(b.prefix, prefix)
+                self.assertEqual(b.url, "https://" + b.netloc + prefix)
+        self.assertEqual(_proto.parse_base("https://h:8443/xzfe-aeeg-e2da/").port, 8443)
+        for bad in [
+            "http://h",
+            "http://h/pf",
+            "https://",
+            "https:///pf",
+            "h:443",
+            "https://h/pf?x=1",
+            "https://h/?",
+            "https://h/pf#top",
+            "https://h#",
+            "https://u:p@h/",
+            "https://u@h/pf",
+            "https://h//",
+            "https://h//pf",
+            "https://h/a//b",
+            "https://h/pf//",
+            "https://h/.",
+            "https://h/..",
+            "https://h/a/../b",
+            "https://h/a%2Fb",
+            "https://h/%70f",
+            "https://h/a b",
+            "https://h/a\tb",
+            "https://h/caf\u00e9",
+            "https://h/a+b",
+            "https://h/" + "x" * 65,
+            "https://h" + "/abcd" * 40 + "/x",  # 202 characters
+            "https://h:99999/",
+        ]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as cm:
+                _proto.parse_base(bad)
+            self.assertIn("https://host[:port]", str(cm.exception), bad)
+        b = _proto.parse_base("https://[::1]:9/")
+        self.assertEqual((b.host, b.port, b.netloc, b.prefix), ("::1", 9, "[::1]:9", "/pf"))
+
+    def test_base_paths(self):
+        self.assertEqual(_proto.parse_base("https://h").path("serve"), "/pf/api/tunnel/serve")
+        b = _proto.parse_base("https://h:8443/xzfe-aeeg-e2da/")
+        self.assertEqual(b.path("connect"), "/xzfe-aeeg-e2da/api/tunnel/connect")
+        self.assertEqual(b.path("quic"), "/xzfe-aeeg-e2da/api/tunnel/quic")
+        self.assertEqual(b.url, "https://h:8443/xzfe-aeeg-e2da")
+        self.assertEqual(_proto.Endpoint.ACCEPT.path, "/pf/api/tunnel/accept")
 
     def test_clean_reason(self):
         self.assertEqual(_proto.clean_reason("a\x00b\nc"), "abc")
