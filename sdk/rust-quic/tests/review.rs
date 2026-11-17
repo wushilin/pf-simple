@@ -3,7 +3,7 @@
 //! listener whose streams each test drives by hand (PROTOCOL.md §13).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pfrelay_quic::{Client, Error};
@@ -17,6 +17,8 @@ struct Hub {
     quic: quinn::Endpoint,
     /// Holds each discovery answer back this many milliseconds.
     delay: Arc<AtomicU64>,
+    /// The path of each discovery request, in order.
+    paths: Arc<Mutex<Vec<String>>>,
 }
 
 async fn hub() -> Hub {
@@ -55,10 +57,12 @@ async fn hub() -> Hub {
     let url = format!("https://127.0.0.1:{}", ln.local_addr().unwrap().port());
     let delay = Arc::new(AtomicU64::new(0));
     let held = delay.clone();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let seen = paths.clone();
     tokio::spawn(async move {
         loop {
             let (tcp, _) = ln.accept().await.unwrap();
-            let (acceptor, fp, held) = (acceptor.clone(), fp.clone(), held.clone());
+            let (acceptor, fp, held, seen) = (acceptor.clone(), fp.clone(), held.clone(), seen.clone());
             tokio::spawn(async move {
                 let Ok(mut s) = acceptor.accept(tcp).await else { return };
                 let mut buf = Vec::new();
@@ -70,6 +74,8 @@ async fn hub() -> Hub {
                     }
                     buf.extend_from_slice(&b[..n]);
                 }
+                let line = String::from_utf8_lossy(&buf).lines().next().unwrap_or_default().to_string();
+                seen.lock().unwrap().push(line.split(' ').nth(1).unwrap_or_default().to_string());
                 tokio::time::sleep(Duration::from_millis(held.load(Ordering::Relaxed))).await;
                 let body = json!({"host":"127.0.0.1","port":qport,"fingerprints":[fp]}).to_string();
                 let resp = format!(
@@ -82,7 +88,7 @@ async fn hub() -> Hub {
             });
         }
     });
-    Hub { url, ca, quic, delay }
+    Hub { url, ca, quic, delay, paths }
 }
 
 fn client(h: &Hub) -> Client {
@@ -314,6 +320,27 @@ async fn a_426_is_a_final_refusal() {
         other => panic!("426 is not reported as the hub's refusal: {other:?}"),
     }
     assert!(e.is_final());
+}
+
+/// Discovery goes under the prefix the server URL gave (PROTOCOL.md §2,
+/// §13.2), and `/pf` when it gave none.
+#[tokio::test]
+async fn discovery_uses_the_prefix() {
+    for (suffix, path) in [("/xzfe-aeeg-e2da/", "/xzfe-aeeg-e2da/api/tunnel/quic"), ("", "/pf/api/tunnel/quic")] {
+        let h = hub().await;
+        let ep = h.quic.clone();
+        tokio::spawn(async move {
+            let conn = ep.accept().await.unwrap().await.unwrap();
+            while let Ok((mut w, mut r)) = conn.accept_bi().await {
+                let _ = read_msg(&mut r).await;
+                write_msg(&mut w, json!({"status":403,"proto":3,"error":"refused by the test hub"})).await;
+                let _ = w.finish();
+            }
+        });
+        let c = Client::builder(format!("{}{suffix}", h.url), "k3f9-x2mq-7hpa").ca_pem(h.ca.clone()).build().unwrap();
+        assert!(c.dial().await.is_err());
+        assert_eq!(h.paths.lock().unwrap().clone(), [path]);
+    }
 }
 
 /// An accepted answer in another QUIC protocol is final too.

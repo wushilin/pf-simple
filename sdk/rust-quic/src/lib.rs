@@ -89,8 +89,10 @@ impl From<Client> for pfrelay::Client {
 }
 
 impl Client {
-    /// Starts building a client for the hub at `server` (`https://host[:port]`,
-    /// optionally followed by `/`, `/pf` or `/pf/`) and the tunnel `word`.
+    /// Starts building a client for the hub at `server` and the tunnel `word`.
+    /// `server` is `https://host[:port]`, optionally followed by the hub's
+    /// prefix (PROTOCOL.md §2): `/pf` when none is given, as in
+    /// `https://host/xzfe-aeeg-e2da/`. Discovery and every request use it.
     pub fn builder(server: impl Into<String>, word: impl Into<String>) -> ClientBuilder {
         let quic = Arc::new(transport::Quic::default());
         let inner = pfrelay::Client::builder(server, word)

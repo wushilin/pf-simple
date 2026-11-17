@@ -48,6 +48,16 @@ where
     counted_client(handler, configure, Arc::default())
 }
 
+/// `client`, for the hub at `server`.
+pub(crate) fn client_at<F, Fut>(server: &str, handler: F) -> Client
+where
+    F: Fn(Req, DuplexStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let builder = Client::builder(server, WORD).connector(connector(handler, Arc::default()));
+    builder.build().unwrap()
+}
+
 /// `client`, counting in `live` the client's ends of the streams it opened
 /// that are still open.
 pub(crate) fn counted_client<F, Fut>(
@@ -59,8 +69,20 @@ where
     F: Fn(Req, DuplexStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    configure(Client::builder("https://127.0.0.1:1/", WORD).connector(connector(handler, live)))
+        .build()
+        .unwrap()
+}
+
+/// A connector whose every stream reaches `handler`, counting in `live`
+/// the client's ends that are still open.
+fn connector<F, Fut>(handler: F, live: Arc<AtomicIsize>) -> Connector
+where
+    F: Fn(Req, DuplexStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let handler: Handler = Arc::new(move |r, s| Box::pin(handler(r, s)));
-    let connector: Connector = Arc::new(move || {
+    Arc::new(move || {
         let (handler, live) = (handler.clone(), live.clone());
         Box::pin(async move {
             let (ours, mut theirs) = tokio::io::duplex(1 << 20);
@@ -71,10 +93,7 @@ where
             });
             Ok(Box::new(Counted::new(ours, live)) as Stream)
         })
-    });
-    configure(Client::builder("https://127.0.0.1:1/", WORD).connector(connector))
-        .build()
-        .unwrap()
+    })
 }
 
 async fn read_request(s: &mut DuplexStream) -> Option<Req> {

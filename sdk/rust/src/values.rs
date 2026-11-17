@@ -92,8 +92,19 @@ pub fn query_escape(s: &str) -> String {
     out
 }
 
-/// A hub's address, from `https://host[:port]` with an optional `/`, `/pf`
-/// or `/pf/`.
+/// The prefix a hub is at unless its admin chose another (PROTOCOL.md §2).
+pub(crate) const DEFAULT_PREFIX: &str = "/pf";
+/// The longest prefix, and the longest segment of one (PROTOCOL.md §2).
+const MAX_PREFIX: usize = 200;
+const MAX_SEGMENT: usize = 64;
+/// What a base URL may be, for error messages.
+const ACCEPTED: &str = "use https://host[:port], optionally followed by the hub's prefix (like /pf, \
+the default): one or more segments, each / and 1 to 64 of A-Z a-z 0-9 . _ ~ -, \
+not . or .., at most 200 characters, with one trailing / allowed";
+
+/// A hub's address (PROTOCOL.md §2): `https://host[:port]` followed by the
+/// hub's prefix, `/pf` when none is given. Every request goes to
+/// `<prefix>/api/tunnel/<endpoint>` on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Base {
     /// What goes in the `Host` header: the authority as given.
@@ -101,27 +112,37 @@ pub(crate) struct Base {
     /// The host to connect to and verify, without brackets.
     pub host: String,
     pub port: u16,
+    /// Where the hub is mounted, like `/pf`: no trailing `/`.
+    pub prefix: String,
 }
 
 impl Base {
+    /// Parses and checks a base URL. This is the only place one is read.
     pub(crate) fn parse(raw: &str) -> Result<Base> {
         let raw = raw.trim();
-        let bad = |why: &str| Error::Config(format!("invalid server URL {raw:?}: {why}"));
+        let bad = |why: &str| Error::Config(format!("invalid server URL {raw:?}: {why}; {ACCEPTED}"));
         let rest = match raw.split_once("://") {
             Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => rest,
             Some(_) => return Err(bad("only https:// is supported")),
-            None => return Err(bad("use https://host[:port]/")),
+            None => return Err(bad("no https://")),
         };
+        if rest.contains('#') {
+            return Err(bad("a fragment (#) is not allowed"));
+        }
+        if rest.contains('?') {
+            return Err(bad("a query (?) is not allowed"));
+        }
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
         };
-        if !matches!(path, "" | "/" | "/pf" | "/pf/") {
-            return Err(bad("give the server's address only, like https://host[:port]/"));
+        if authority.contains('@') {
+            return Err(bad("user information (@) is not allowed"));
         }
-        if authority.is_empty() || authority.contains(['@', '?', '#']) {
-            return Err(bad("use https://host[:port]/"));
+        if authority.is_empty() {
+            return Err(bad("no host"));
         }
+        let prefix = parse_prefix(path).map_err(|why| bad(&why))?;
         let (host, port) = if let Some(after) = authority.strip_prefix('[') {
             let (h, tail) = after.split_once(']').ok_or_else(|| bad("unclosed ["))?;
             let port = match tail {
@@ -142,12 +163,51 @@ impl Base {
             None => 443,
             Some(p) => p.parse::<u16>().ok().filter(|&p| p != 0).ok_or_else(|| bad("bad port"))?,
         };
-        Ok(Base { authority: authority.to_string(), host, port })
+        Ok(Base { authority: authority.to_string(), host, port, prefix })
     }
 
+    /// The hub's base URL for messages: `https://host[:port]`, followed by
+    /// the prefix when it is not the default.
     pub(crate) fn url(&self) -> String {
-        format!("https://{}", self.authority)
+        if self.prefix == DEFAULT_PREFIX {
+            format!("https://{}", self.authority)
+        } else {
+            format!("https://{}{}", self.authority, self.prefix)
+        }
     }
+
+    /// The path of one of the hub's endpoints: `<prefix>/api/tunnel/<endpoint>`.
+    pub(crate) fn path(&self, endpoint: &str) -> String {
+        format!("{}/api/tunnel/{endpoint}", self.prefix)
+    }
+}
+
+/// Checks the path of a base URL and gives the prefix it names, without a
+/// trailing `/` (PROTOCOL.md §2).
+fn parse_prefix(path: &str) -> std::result::Result<String, String> {
+    if path.is_empty() || path == "/" {
+        return Ok(DEFAULT_PREFIX.to_string());
+    }
+    let prefix = path.strip_suffix('/').unwrap_or(path);
+    if prefix.len() > MAX_PREFIX {
+        return Err(format!("the prefix is longer than {MAX_PREFIX} characters"));
+    }
+    // The path starts with '/', so the first piece is empty.
+    for seg in prefix.split('/').skip(1) {
+        if seg.is_empty() {
+            return Err("the prefix has an empty segment (//)".into());
+        }
+        if seg.len() > MAX_SEGMENT {
+            return Err(format!("a segment of the prefix is longer than {MAX_SEGMENT} characters"));
+        }
+        if seg == "." || seg == ".." {
+            return Err(format!("a segment of the prefix is {seg:?}"));
+        }
+        if let Some(c) = seg.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))) {
+            return Err(format!("the prefix holds {c:?}"));
+        }
+    }
+    Ok(prefix.to_string())
 }
 
 /// Makes a reason that came over the wire safe to show: printable
@@ -197,8 +257,78 @@ mod tests {
         assert_eq!((b.host.as_str(), b.port), ("hub.example", 443));
         let b = Base::parse("https://[::1]:9/").unwrap();
         assert_eq!((b.host.as_str(), b.port), ("::1", 9));
-        for bad in ["http://h/", "https://h/x", "h:1", "https://", "https://h:0", "https://u@h/"] {
+        for bad in ["http://h/", "h:1", "https://", "https://h:0", "https://u@h/"] {
             assert!(Base::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn prefixes() {
+        for (raw, prefix) in [
+            ("https://h", "/pf"),
+            ("https://h/", "/pf"),
+            ("https://h/pf", "/pf"),
+            ("https://h/pf/", "/pf"),
+            ("https://h:8443/xzfe-aeeg-e2da/", "/xzfe-aeeg-e2da"),
+            ("https://h/a/b.c_d~e-f", "/a/b.c_d~e-f"),
+            ("https://h/PF", "/PF"),
+            ("https://h/x", "/x"),
+        ] {
+            let b = Base::parse(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(b.prefix, prefix, "{raw}");
+        }
+        let b = Base::parse("https://h:8443/xzfe-aeeg-e2da/").unwrap();
+        assert_eq!((b.host.as_str(), b.port), ("h", 8443));
+        let seg64 = format!("https://h/{}", "a".repeat(64));
+        assert!(Base::parse(&seg64).is_ok());
+        let long200 = format!("https://h{}", "/abcdefghi".repeat(20)); // 200 characters
+        assert!(Base::parse(&long200).is_ok());
+        assert!(Base::parse(&format!("{long200}/")).is_ok());
+
+        let seg65 = format!("https://h/{}", "a".repeat(65));
+        let long202 = format!("https://h{}/a", "/abcdefghi".repeat(20)); // 202 characters
+        for bad in [
+            "http://h/",
+            "http://h/pf",
+            "https://h/pf?x=1",
+            "https://h?x=1",
+            "https://h/pf#top",
+            "https://h#top",
+            "https://u@h/pf",
+            "https://u:p@h/",
+            "https://h//",
+            "https://h//pf",
+            "https://h/pf//",
+            "https://h/a//b",
+            "https://h/.",
+            "https://h/..",
+            "https://h/a/./b",
+            "https://h/a/../b",
+            "https://h/a%2Fb",
+            "https://h/%2F",
+            "https://h/a b",
+            "https://h/a+b",
+            "https://h/\u{e9}",
+            seg65.as_str(),
+            long202.as_str(),
+        ] {
+            let e = Base::parse(bad).err().unwrap_or_else(|| panic!("{bad} was accepted"));
+            assert!(e.to_string().contains("1 to 64 of A-Z a-z 0-9 . _ ~ -"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn request_paths() {
+        let b = Base::parse("https://h:8443/xzfe-aeeg-e2da/").unwrap();
+        assert_eq!(b.path("serve"), "/xzfe-aeeg-e2da/api/tunnel/serve");
+        assert_eq!(b.path("quic"), "/xzfe-aeeg-e2da/api/tunnel/quic");
+        assert_eq!(b.url(), "https://h:8443/xzfe-aeeg-e2da");
+        let b = Base::parse("https://h/a/b.c_d~e-f").unwrap();
+        assert_eq!(b.path("version"), "/a/b.c_d~e-f/api/tunnel/version");
+        for raw in ["https://h", "https://h/", "https://h/pf/"] {
+            let b = Base::parse(raw).unwrap();
+            assert_eq!(b.path("connect"), "/pf/api/tunnel/connect");
+            assert_eq!(b.url(), "https://h");
         }
     }
 

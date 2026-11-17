@@ -17,7 +17,7 @@
 //! Refusals come back as this crate's [`Error`]s, as over WebSocket: 403 as
 //! [`Error::AccessDenied`], others as [`Error::Status`]. A transport may use
 //! [`Params::get`] for requests to the hub's HTTPS endpoint, with the
-//! client's TLS settings.
+//! client's TLS settings, at the paths [`Params::endpoint_path`] gives.
 //!
 //! [`ClientBuilder::transport`]: crate::ClientBuilder::transport
 
@@ -49,7 +49,8 @@ impl Params {
         Params { client: client.clone() }
     }
 
-    /// The hub's base URL, `https://host[:port]`.
+    /// The hub's base URL, `https://host[:port]`, followed by the hub's
+    /// prefix when it is not the default `/pf`.
     pub fn server(&self) -> String {
         self.client.server()
     }
@@ -80,6 +81,13 @@ impl Params {
     /// Says something through the client's logger.
     pub fn log(&self, msg: &str) {
         self.client.log(msg)
+    }
+
+    /// The path of the hub's endpoint `endpoint`, as
+    /// `<prefix>/api/tunnel/<endpoint>` with the prefix the server URL
+    /// gave (PROTOCOL.md §2), like `/pf/api/tunnel/quic`.
+    pub fn endpoint_path(&self, endpoint: &str) -> String {
+        self.client.inner.base.path(endpoint)
     }
 
     /// A plain GET to `path` on the hub's HTTPS endpoint, with the client's

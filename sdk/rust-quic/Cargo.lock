@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "pfrelay"
-version = "0.16.1"
+version = "0.16.2"
 dependencies = [
  "base64",
  "hex",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "pfrelay-quic"
-version = "0.16.1"
+version = "0.16.2"
 dependencies = [
  "hex",
  "pfrelay",

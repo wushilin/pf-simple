@@ -12,6 +12,24 @@ pfrelay = "0.16"
 tokio = { version = "1", features = ["full"] }
 ```
 
+## The hub's address
+
+`Client::builder(server, word)` takes the hub as `https://host[:port]`,
+optionally followed by the hub's **prefix**, the path it is mounted at
+(PROTOCOL.md §2). With no path, or `/`, the prefix is `/pf`, where every
+hub is unless its admin chose another; one trailing `/` is ignored. So
+`https://hub.example` and `https://hub.example/pf/` are the same hub, and
+`https://hub.example/xzfe-aeeg-e2da/` is the hub mounted at
+`/xzfe-aeeg-e2da`. Every request goes to
+`https://host[:port]<prefix>/api/tunnel/<endpoint>`.
+
+A prefix is one or more segments, each `/` followed by 1 to 64 of
+`A-Z a-z 0-9 . _ ~ -` (not `.` or `..`), at most 200 characters in all;
+it is case-sensitive. `build()` refuses any other path, `http://`, and a
+URL with a query, a fragment or user information. A wrong prefix is not
+detected up front: the hub answers 404 to every request. Versions before
+0.16.2 of this crate accept only the default prefix.
+
 ## Serving a tunnel
 
 ```rust
