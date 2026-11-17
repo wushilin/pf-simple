@@ -58,12 +58,29 @@ connections.
 - A client MUST NOT send an `Origin` header naming a host other than the
   hub's. Non-browser clients normally send no `Origin` at all.
 - **Base URL.** The user gives the hub as `https://host[:port]`, optionally
-  followed by `/` or `/pf` or `/pf/`. Any other path is an error. The
-  endpoints are under:
+  followed by a path: the hub's **prefix**, where the hub is mounted. One
+  trailing `/` is ignored. An empty path, or `/`, means the prefix `/pf`,
+  which is where every hub is unless its admin chose another. So
+  `https://host` and `https://host/pf/` are the same hub, and
+  `https://host/xzfe-aeeg-e2da/` is the hub mounted at `/xzfe-aeeg-e2da`.
+  - A prefix is one or more segments, each `/` followed by 1 to 64 of
+    `A-Z a-z 0-9 . _ ~ -`, and no segment is `.` or `..`; at most 200
+    characters in all. It is case-sensitive. A client MUST refuse any
+    other path (an empty segment, `%`-escapes, other characters), and a
+    base URL with a query, a fragment or user information.
+  - The endpoints are under:
 
-  ```
-  https://host[:port]/pf/api/tunnel/<endpoint>
-  ```
+    ```
+    https://host[:port]<prefix>/api/tunnel/<endpoint>
+    ```
+
+    `https://host[:port]/pf/api/tunnel/<endpoint>` for a hub at the
+    default prefix.
+  - The prefix is not on the wire in any other way and is not negotiated:
+    a client given the wrong prefix gets 404 from every endpoint.
+    Clients from before 0.16.3 accept only the default prefix. A hub at
+    another prefix is hidden from whoever does not know it, and is closed
+    to those clients.
 
   where `<endpoint>` is `serve`, `connect`, `accept`, `check` or `version`,
   and `quic` for discovering the QUIC listener (§13.2).
@@ -973,7 +990,7 @@ what discovery answers is what the listener does.
 
 ### 13.2 Discovery: `quic`
 
-This is a plain `GET https://host[:port]/pf/api/tunnel/quic`, under §2
+This is a plain `GET https://host[:port]<prefix>/api/tunnel/quic`, under §2
 and §4. Its certificate is verified normally (§9). That is what makes the
 fingerprints it returns trustworthy.
 
@@ -1083,6 +1100,10 @@ the next TCP connection, as §9 says ("open each connection regardless").
   - Its subject alternative name is the advertised host: a dNSName for a
     DNS name, an iPAddress for an IP address. Nobody checks it, but some
     libraries refuse a certificate without one.
+  - Its subject is only a common name, the advertised host, so the
+    certificate says nothing about what serves it. A client MUST NOT check
+    the subject. (Hubs before 0.16.3 named it `pf-simple relay hub`; such a
+    certificate stays valid until it is replaced.)
   - Changing the advertised host does not replace the certificate, so the
     fingerprint stays. The name in the certificate follows at the next
     replacement (§13.10).
