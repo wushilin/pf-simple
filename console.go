@@ -22,6 +22,7 @@ import (
 	"time"
 
 	queue "github.com/wushilin/go-named-queue"
+	"github.com/wushilin/pf-simple/internal/tunnel"
 )
 
 //go:embed console
@@ -83,6 +84,9 @@ type consoleServer struct {
 	tunnels    *tunnelHub  // nil unless tunnels are on
 	tls        *tlsManager // the listener's own TLS; nil in tests that need none
 	cookieName string
+	// prefix is the path everything is served under, the console and the
+	// relay hub alike: consolePrefix, or the one in [console] path.
+	prefix string
 
 	ctx context.Context // canceled on shutdown; ends WebSocket sessions
 
@@ -99,6 +103,7 @@ func newConsoleServer(addr, password string, mgr *manager) *consoleServer {
 	host, _ := os.Hostname()
 	s := &consoleServer{
 		addr:      addr,
+		prefix:    consolePrefix,
 		host:      host,
 		password:  password,
 		started:   time.Now(),
@@ -115,29 +120,34 @@ func newConsoleServer(addr, password string, mgr *manager) *consoleServer {
 	return s
 }
 
-// consolePrefix is the path everything the console serves lives under, so a
-// reverse proxy can mount it next to other applications by prefix. The root
-// redirects there.
-const consolePrefix = "/pf"
+// consolePrefix is the default path everything the console and the relay
+// hub serve lives under, so a reverse proxy can mount it next to other
+// applications by prefix. [console] path chooses another one, which hides
+// the server from whoever does not know it: then nothing answers outside it.
+// At the default prefix, the root redirects there.
+const consolePrefix = tunnel.DefaultPrefix
 
 func (s *consoleServer) handler() http.Handler {
 	static, _ := fs.Sub(consoleFiles, "console")
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, consolePrefix+"/", http.StatusFound)
-	})
-	mux.Handle("GET "+consolePrefix+"/", http.StripPrefix(consolePrefix+"/", http.FileServerFS(static)))
-	mux.HandleFunc("GET "+consolePrefix+"/api/session", s.handleSession)
-	mux.HandleFunc("POST "+consolePrefix+"/api/login", s.requireCSRF(s.handleLogin))
-	mux.HandleFunc("POST "+consolePrefix+"/api/logout", s.requireCSRF(s.handleLogout))
-	mux.HandleFunc("GET "+consolePrefix+"/api/state", s.requireAuth(s.handleState))
-	mux.HandleFunc("GET "+consolePrefix+"/api/ws", s.requireAuth(s.handleWebSocket))
-	mux.HandleFunc("POST "+consolePrefix+"/api/listeners", s.requireCSRF(s.requireAuth(s.handleAddListener)))
-	mux.HandleFunc("POST "+consolePrefix+"/api/listeners/{id}/{action}", s.requireCSRF(s.requireAuth(s.handleListenerAction)))
-	mux.HandleFunc("POST "+consolePrefix+"/api/pipes/{id}/stop", s.requireCSRF(s.requireAuth(s.handleStop)))
+	p := s.prefix
+	if p == consolePrefix {
+		mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, consolePrefix+"/", http.StatusFound)
+		})
+	}
+	mux.Handle("GET "+p+"/", http.StripPrefix(p+"/", http.FileServerFS(static)))
+	mux.HandleFunc("GET "+p+"/api/session", s.handleSession)
+	mux.HandleFunc("POST "+p+"/api/login", s.requireCSRF(s.handleLogin))
+	mux.HandleFunc("POST "+p+"/api/logout", s.requireCSRF(s.handleLogout))
+	mux.HandleFunc("GET "+p+"/api/state", s.requireAuth(s.handleState))
+	mux.HandleFunc("GET "+p+"/api/ws", s.requireAuth(s.handleWebSocket))
+	mux.HandleFunc("POST "+p+"/api/listeners", s.requireCSRF(s.requireAuth(s.handleAddListener)))
+	mux.HandleFunc("POST "+p+"/api/listeners/{id}/{action}", s.requireCSRF(s.requireAuth(s.handleListenerAction)))
+	mux.HandleFunc("POST "+p+"/api/pipes/{id}/stop", s.requireCSRF(s.requireAuth(s.handleStop)))
 	s.apiRoutes(mux)
 	if s.tunnels != nil {
-		s.tunnels.routes(mux)
+		s.tunnels.routes(mux, s.prefix)
 	}
 	return securityHeaders(mux)
 }
@@ -312,7 +322,7 @@ func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.cookieName,
 		Value:    token,
-		Path:     consolePrefix,
+		Path:     s.prefix,
 		MaxAge:   int(sessionLifetime / time.Second),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
@@ -327,7 +337,7 @@ func (s *consoleServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 		s.revokeLocked(cookie.Value)
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: s.cookieName, Value: "", Path: consolePrefix, MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName, Value: "", Path: s.prefix, MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.WriteHeader(http.StatusNoContent)
 }
 

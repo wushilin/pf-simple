@@ -78,7 +78,8 @@ connections.
     default prefix.
   - The prefix is not on the wire in any other way and is not negotiated:
     a client given the wrong prefix gets 404 from every endpoint.
-    Clients from before 0.16.3 accept only the default prefix. A hub at
+    Clients from before pf-simple 0.16.3 (pf-client, the Go SDK) and SDK
+    packages from before 0.16.2 accept only the default prefix. A hub at
     another prefix is hidden from whoever does not know it, and is closed
     to those clients.
 

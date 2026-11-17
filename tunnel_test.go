@@ -44,6 +44,15 @@ type relayFixture struct {
 	hub *tunnelHub
 	srv *httptest.Server
 	tls *tls.Config
+	cs  *consoleServer
+	url string // what the Go clients are given: srv.URL, or with the hub's path
+}
+
+// mount serves the console and the hub under prefix instead of /pf.
+func (f *relayFixture) mount(prefix string) {
+	f.cs.prefix = prefix
+	f.srv.Config.Handler = f.cs.handler()
+	f.url = f.srv.URL + prefix + "/"
 }
 
 func newRelayFixture(t *testing.T, statePath string) *relayFixture {
@@ -75,12 +84,12 @@ func newRelayFixtureTLS(t *testing.T, statePath string, cert tls.Certificate, ro
 	if roots != nil {
 		clientTLS = &tls.Config{RootCAs: roots}
 	}
-	return &relayFixture{hub: hub, srv: srv, tls: clientTLS}
+	return &relayFixture{hub: hub, srv: srv, tls: clientTLS, cs: cs, url: srv.URL}
 }
 
 func (f *relayFixture) client(t *testing.T, word, serveToken string) *pfrelay.Client {
 	t.Helper()
-	c, err := pfrelay.NewClient(f.srv.URL, word, f.tls)
+	c, err := pfrelay.NewClient(f.url, word, f.tls)
 	if err != nil {
 		t.Fatal(err)
 	}

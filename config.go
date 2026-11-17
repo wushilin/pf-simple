@@ -143,6 +143,8 @@ type consoleSettings struct {
 	tlsMode  string
 	tlsDir   string
 	tlsNames []string
+	// prefix is the path the console and the relay hub are served under.
+	prefix string
 }
 
 // consoleTable is the [console] table. The tags keep a rewritten file free of
@@ -159,6 +161,11 @@ type consoleTable struct {
 	TLS      string   `toml:"tls,omitempty"`
 	TLSDir   string   `toml:"tls_dir,omitempty"`
 	TLSNames []string `toml:"tls_names,omitempty"`
+	// Path is where the console and the relay hub are served, "/pf" by
+	// default. Another path, such as "/xzfe-aeeg-e2da", hides the server
+	// from whoever does not know it; clients then give it in the server's
+	// URL: https://host/xzfe-aeeg-e2da/.
+	Path string `toml:"path,omitempty"`
 	// Optional fences for listeners added or edited in the console. An
 	// omitted one means no restriction.
 	AllowTargetHosts []string `toml:"allow_target_hosts,omitempty"`
@@ -307,7 +314,11 @@ func loadConfig(path, envPassword string) (settings, error) {
 		if err := checkTLSNames(c.TLSNames); err != nil {
 			return settings{}, fmt.Errorf("config %s: [console]: %w", path, err)
 		}
-		s.console = &consoleSettings{addr: addr, password: password, tlsMode: mode, tlsDir: c.TLSDir, tlsNames: c.TLSNames}
+		prefix, err := tunnel.CleanPrefix(c.Path)
+		if err != nil {
+			return settings{}, fmt.Errorf("config %s: [console] path: %w", path, err)
+		}
+		s.console = &consoleSettings{addr: addr, password: password, tlsMode: mode, tlsDir: c.TLSDir, tlsNames: c.TLSNames, prefix: prefix}
 		if c.Password != "" {
 			if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o004 != 0 {
 				fmt.Fprintf(os.Stderr, "warning: %s holds the console password and is readable by every user; consider chmod 600\n", path)

@@ -486,13 +486,15 @@ func (h *tunnelHub) saveLocked() {
 	}
 }
 
-func (h *tunnelHub) routes(mux *http.ServeMux) {
-	mux.HandleFunc("GET "+tunnel.Path+"/serve", h.guard(h.handleServe))
-	mux.HandleFunc("GET "+tunnel.Path+"/check", h.guard(h.handleCheck))
-	mux.HandleFunc("GET "+tunnel.Path+"/connect", h.guard(h.handleConnect))
-	mux.HandleFunc("GET "+tunnel.Path+"/accept", h.guard(h.handleAccept))
-	mux.HandleFunc("GET "+tunnel.Path+"/version", h.guard(h.handleVersion))
-	mux.HandleFunc("GET "+tunnel.Path+"/quic", h.guard(h.handleQUICDiscovery))
+// routes serves the hub's endpoints under prefix (PROTOCOL.md §2).
+func (h *tunnelHub) routes(mux *http.ServeMux, prefix string) {
+	p := prefix + tunnel.APIPath
+	mux.HandleFunc("GET "+p+"/serve", h.guard(h.handleServe))
+	mux.HandleFunc("GET "+p+"/check", h.guard(h.handleCheck))
+	mux.HandleFunc("GET "+p+"/connect", h.guard(h.handleConnect))
+	mux.HandleFunc("GET "+p+"/accept", h.guard(h.handleAccept))
+	mux.HandleFunc("GET "+p+"/version", h.guard(h.handleVersion))
+	mux.HandleFunc("GET "+p+"/quic", h.guard(h.handleQUICDiscovery))
 }
 
 // guessLimiter counts refusals per source address.
@@ -1369,12 +1371,12 @@ type relayState struct {
 	Anonymous bool `json:"anonymous"`
 	// Reuse is the hub's limits on reusing the serving side's legs
 	// (protocol 2); ReuseFixed says they cannot be changed here.
-	Reuse      reuseSettings         `json:"reuse"`
-	ReuseFixed bool                  `json:"reuseFixed"`
+	Reuse      reuseSettings `json:"reuse"`
+	ReuseFixed bool          `json:"reuseFixed"`
 	// QUIC is the QUIC listener (protocol 3): its settings and state.
-	QUIC *quicStatus `json:"quic,omitempty"`
-	Tenants    []relayTenantSnapshot `json:"tenants"`
-	Words      []relayWordSnapshot   `json:"words"`
+	QUIC    *quicStatus           `json:"quic,omitempty"`
+	Tenants []relayTenantSnapshot `json:"tenants"`
+	Words   []relayWordSnapshot   `json:"words"`
 }
 
 type relayTenantSnapshot struct {

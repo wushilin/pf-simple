@@ -1,6 +1,6 @@
 package main
 
-// The REST API under /pf/api/, for scripts and the console's API tab
+// The REST API under /pf/api/ (the console's prefix + "/api"), for scripts and the console's API tab
 // (Swagger UI over console/openapi.json). Every endpoint takes a console
 // session, or the console password in X-API-Token. Requests that change
 // something also need X-PF-Console: 1 or X-API-Token, so a cross-site form
@@ -17,7 +17,7 @@ import (
 func (s *consoleServer) apiRoutes(mux *http.ServeMux) {
 	read := func(h http.HandlerFunc) http.HandlerFunc { return s.requireAuth(h) }
 	write := func(h http.HandlerFunc) http.HandlerFunc { return s.requireCSRF(s.requireAuth(h)) }
-	p := consolePrefix + "/api"
+	p := s.prefix + "/api"
 	mux.HandleFunc("GET "+p+"/health", s.handleHealth)
 	mux.HandleFunc("GET "+p+"/stats", read(s.handleStats))
 	mux.HandleFunc("GET "+p+"/policy", read(s.handlePolicy))
