@@ -415,7 +415,9 @@ the console:
 pf-simple --console 18222@secret --tunnel "$PF_SERVE_TOKEN"
 ```
 
-The hub is served on the console's own listener, under `/pf/api/tunnel/`;
+The hub is served on the console's own listener, under `/pf/api/tunnel/`
+(or under the console's own path: see
+[Hiding the server behind a path](#hiding-the-server-behind-a-path));
 there is no separate port. Tunnels are https only, at both ends:
 `pf-client` refuses an `http://` server, and the hub refuses a tunnel
 request that did not arrive over TLS, so the word and the tokens never
@@ -620,7 +622,7 @@ protocol in use. The rules for changing the protocol are in
 
 | Argument | Meaning |
 | --- | --- |
-| `<server>` | The pf-simple server: `https://host[:port]/`. The `/pf/api/tunnel` path is added for you. |
+| `<server>` | The pf-simple server: `https://host[:port]/`, followed by the server's path if it has one of its own (`https://host/xzfe-aeeg-e2da/`). Without a path it is `/pf`; the `/api/tunnel` part is added for you. |
 | `<word>` | The tunnel's word, the same on both sides. `serve` may leave it out. |
 | `<target>` (serve) | `host:port`, or a port alone for `127.0.0.1`. `stdio` (any case) or `-` offers pf-client's own stdin/stdout instead: it waits for one connection, carries it, and exits when it ends (exit status 1 if it broke). Further connections meanwhile are refused. |
 | `<listen>` (connect) | `host:port`, or a port alone to listen on `127.0.0.1` only. `stdio` (any case) or `-` carries one connection over stdin/stdout and then exits, for `ssh -o ProxyCommand='pf-client connect https://relay.example.com/ <word> stdio' user@host`; nothing listens locally, and it is silent unless the connection fails. |
@@ -854,6 +856,41 @@ location /pf/ {
 The page builds its WebSocket URL from its own location, so it works at
 whatever host and scheme the proxy presents. The `Origin` of the handshake
 must match the `Host` the proxy forwards, hence `Host $host` above.
+
+### Hiding the server behind a path
+
+At `/pf`, anyone can tell a pf-simple server by asking for `/pf/` or
+`/pf/api/health`. To keep it from whoever does not know where it is, serve
+it under a path of your own, with `path` in `[console]` (or
+`--console-path` without a config file):
+
+```toml
+[console]
+listen = "127.0.0.1:18222"
+path = "/xzfe-aeeg-e2da"
+```
+
+Then everything, the console, its API, the health check and the relay hub,
+is under `/xzfe-aeeg-e2da/`, and nothing answers outside it: `/` and `/pf/`
+are 404, with no redirect. Clients give the path in the server's URL:
+
+```sh
+pf-client connect https://relay.example.com/xzfe-aeeg-e2da/ <word> 2222
+```
+
+- Pick something nobody would guess, e.g. three groups of four random
+  letters and digits. A path is 1 to 64 of `A-Z a-z 0-9 . _ ~ -` per
+  segment, up to 200 characters, case-sensitive.
+- Behind a reverse proxy, forward that path unchanged (`location
+  /xzfe-aeeg-e2da/ { ... }`), and leave everything else to the proxy's own
+  site. Several pf-simple servers can share one host name this way, each
+  under its own path; give each its own QUIC port.
+- Clients older than pf-simple 0.16.3 (or SDK packages older than 0.16.2)
+  know only `/pf`, and cannot reach a server at another path.
+- The QUIC listener answers anyone who knows its protocol name: a QUIC
+  handshake with ALPN `pf-tunnel` shows a self-signed certificate. Since
+  0.16.3 the certificate names only the advertised host, but the listener
+  itself can still be found by probing. Leave QUIC off where that matters.
 
 What it shows (the build version sits next to the name in the top bar;
 `pf-simple --version` prints it too):
