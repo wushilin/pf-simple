@@ -207,9 +207,37 @@ public final class ReuseTest {
         return l;
     }
 
-    /** A TCP echo target. */
+    /**
+     * A ServerSocket whose close() returns only once its accept thread has
+     * left accept(). The JDK defers the real close of a listening socket
+     * that a thread is blocked on until that thread wakes, and until then
+     * the kernel still completes connections to it: without the wait, a
+     * dial just after close() could still reach the target.
+     */
+    private static final class EchoServer extends ServerSocket {
+        volatile Thread acceptor;
+
+        EchoServer() throws IOException {
+            super(0, 50, InetAddress.getLoopbackAddress());
+        }
+
+        @Override
+        public void close() throws IOException {
+            super.close();
+            Thread t = acceptor;
+            if (t != null && t != Thread.currentThread()) {
+                try {
+                    t.join(10_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    /** A TCP echo target. Once close() returns, it refuses connections. */
     static ServerSocket echoTarget() throws IOException {
-        ServerSocket ss = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+        EchoServer ss = new EchoServer();
         Thread t = new Thread(() -> {
             while (true) {
                 Socket s;
@@ -230,6 +258,7 @@ public final class ReuseTest {
             }
         });
         t.setDaemon(true);
+        ss.acceptor = t;
         t.start();
         return ss;
     }
@@ -420,6 +449,12 @@ public final class ReuseTest {
                 WebSocket leg = keepLeg(h, ctl, ID1);
                 text(leg, "bind " + ID2);
                 eq("bound " + ID2, expectText(leg, 5000), "bind is answered");
+                // Wait until the bound attempt has opened. "bound" goes out
+                // before the connection is handed on, so an open message
+                // sent at once may overtake it; the attempt is then given up
+                // before it opens, and reports nothing (it never opened),
+                // which is the other case and not this test's.
+                waitFor("the bound attempt to open", () -> ev.opened.contains(ID2));
                 // the hub never heard bound, and asks again
                 open(ctl, ID2);
                 AcceptReq a = h.nextAccept();
