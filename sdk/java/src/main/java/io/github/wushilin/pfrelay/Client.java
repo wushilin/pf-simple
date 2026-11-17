@@ -29,7 +29,7 @@ import javax.net.ssl.SSLContext;
  */
 public final class Client {
     /** This SDK's version. */
-    public static final String VERSION = "0.16.1";
+    public static final String VERSION = "0.16.2";
     /** What a Client calls itself in the hub's log and console unless told otherwise. */
     public static final String DEFAULT_AGENT = "pfrelay-java " + VERSION;
     /** The target a serving side names when it offers stdin/stdout. */
@@ -37,7 +37,12 @@ public final class Client {
     /** How many idle legs a serving side keeps for reuse unless told otherwise. */
     public static final int DEFAULT_MAX_IDLE_LEGS = 16;
 
-    static final String PATH = "/pf/api/tunnel/";
+    /** The hub's prefix when the server URL names none (docs/PROTOCOL.md §2). */
+    static final String DEFAULT_PREFIX = "/pf";
+    /** Where the endpoints are, under the prefix. */
+    static final String API = "/api/tunnel/";
+    static final int MAX_PREFIX = 200;
+    static final int MAX_SEGMENT = 64;
     static final String H_WORD = "X-PF-Tunnel-Word";
     static final String H_SERVE = "X-PF-Serve-Token";
     static final String H_CONN = "X-PF-Tunnel-Conn";
@@ -52,7 +57,8 @@ public final class Client {
     static final int MAX_CONTROL_FRAME = 4096;
 
     private final Http.Target target;
-    private final String base;
+    private final String base; // https://host[:port]<prefix>
+    private final String prefix;
     private final String word;
     private final SSLContext ssl;
     private final String serveToken;
@@ -73,6 +79,7 @@ public final class Client {
     private Client(Builder b) {
         this.base = normalizeBase(b.server);
         URI u = URI.create(base);
+        this.prefix = u.getRawPath();
         String host = u.getHost();
         int port = u.getPort() < 0 ? 443 : u.getPort();
         String bare = host.startsWith("[") && host.endsWith("]") ? host.substring(1, host.length() - 1) : host;
@@ -199,7 +206,14 @@ public final class Client {
             return this;
         }
 
-        /** The hub: {@code https://host[:port]}, optionally followed by {@code /} or {@code /pf}. */
+        /**
+         * The hub: {@code https://host[:port]}, optionally followed by the
+         * hub's prefix, such as {@code https://host/pf/}. Without one, or
+         * with {@code /}, the prefix is {@code /pf}. A prefix is one or more
+         * segments of 1 to 64 of {@code A-Z a-z 0-9 . _ ~ -} (not {@code .}
+         * or {@code ..}), at most 200 characters in all; one trailing
+         * {@code /} is ignored.
+         */
         public Builder server(String url) {
             this.server = url;
             return this;
@@ -275,30 +289,91 @@ public final class Client {
 
     // ---------- values ----------
 
-    /** Accepts the hub's address with or without the console's /pf path, and insists on https. */
+    /** What a server URL may be, for error messages. */
+    static final String ACCEPTED_URL = "use https://host[:port], optionally followed by the hub's prefix, "
+            + "like https://host/pf/ (the default prefix) or https://host/my-hub/";
+    /** What a prefix may be, for error messages. */
+    static final String ACCEPTED_PREFIX = "the path is the hub's prefix: one or more segments, each a / and 1 to "
+            + MAX_SEGMENT + " of A-Z a-z 0-9 . _ ~ - (but not . or ..), at most " + MAX_PREFIX
+            + " characters in all, with one trailing / allowed";
+
+    /**
+     * Parses and checks the server URL (docs/PROTOCOL.md §2, "Base URL"):
+     * https only; no user information, query or fragment; and a path that
+     * is the hub's prefix, {@code /pf} if it is empty or {@code /}, with one
+     * trailing {@code /} ignored. Returns {@code https://host[:port]<prefix>},
+     * with the host in lower case and the prefix as given (it is
+     * case-sensitive). Every request goes under it ({@link #apiPath}).
+     *
+     * @throws IllegalArgumentException that says what is accepted
+     */
     static String normalizeBase(String raw) {
+        String bad = "invalid server URL \"" + raw + "\": ";
         URI u;
         try {
             u = new URI(raw.strip());
         } catch (URISyntaxException e) {
-            throw new IllegalArgumentException("invalid server URL \"" + raw + "\": use https://host[:port]/");
+            throw new IllegalArgumentException(bad + ACCEPTED_URL);
         }
-        if (u.getHost() == null || u.getRawAuthority() == null) {
-            throw new IllegalArgumentException("invalid server URL \"" + raw + "\": use https://host[:port]/");
+        if (u.isOpaque() || u.getHost() == null || u.getRawAuthority() == null) {
+            throw new IllegalArgumentException(bad + ACCEPTED_URL);
         }
         if (!"https".equalsIgnoreCase(u.getScheme())) {
-            throw new IllegalArgumentException("invalid server URL \"" + raw + "\": only https:// is supported");
+            throw new IllegalArgumentException(bad + "only https:// is supported; " + ACCEPTED_URL);
+        }
+        if (u.getRawUserInfo() != null || u.getRawQuery() != null || u.getRawFragment() != null) {
+            throw new IllegalArgumentException(bad + "it may not have user information, a query or a fragment; "
+                    + ACCEPTED_URL);
         }
         String p = u.getRawPath() == null ? "" : u.getRawPath();
-        if (p.endsWith("/")) {
+        if (p.isEmpty() || p.equals("/")) {
+            p = DEFAULT_PREFIX;
+        } else if (p.endsWith("/")) {
             p = p.substring(0, p.length() - 1);
         }
-        if (!p.isEmpty() && !p.equals("/pf") || u.getRawQuery() != null || u.getRawFragment() != null
-                || u.getRawUserInfo() != null) {
-            throw new IllegalArgumentException("invalid server URL \"" + raw
-                    + "\": give the server's address only, like https://" + u.getRawAuthority() + "/");
+        String why = prefixProblem(p);
+        if (why != null) {
+            throw new IllegalArgumentException(bad + why + "; " + ACCEPTED_PREFIX + ", like https://host/pf/");
         }
-        return "https://" + u.getRawAuthority().toLowerCase(Locale.ROOT);
+        return "https://" + u.getRawAuthority().toLowerCase(Locale.ROOT) + p;
+    }
+
+    /** What is wrong with the prefix p (without a trailing /), or null if nothing is. */
+    private static String prefixProblem(String p) {
+        if (p.length() > MAX_PREFIX) {
+            return "the prefix is longer than " + MAX_PREFIX + " characters";
+        }
+        if (!p.startsWith("/")) {
+            return "the prefix must start with /";
+        }
+        for (String seg : p.substring(1).split("/", -1)) {
+            if (seg.isEmpty()) {
+                return "the prefix has an empty segment (//)";
+            }
+            if (seg.length() > MAX_SEGMENT) {
+                return "a segment of the prefix is longer than " + MAX_SEGMENT + " characters";
+            }
+            if (seg.equals(".") || seg.equals("..")) {
+                return "the prefix has a segment \"" + seg + "\"";
+            }
+            for (int i = 0; i < seg.length(); i++) {
+                char c = seg.charAt(i);
+                if (!(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '_'
+                        || c == '~' || c == '-')) {
+                    return "the prefix has the character '" + c + "'";
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The request path of the tunnel endpoint named endpoint ({@code serve},
+     * {@code connect}, {@code accept}, {@code check}, {@code version},
+     * {@code quic}): {@code <prefix>/api/tunnel/<endpoint>}.
+     */
+    String apiPath(String endpoint) {
+        return prefix + API + endpoint;
     }
 
     /** Serve tokens are 32 to 128, client tokens 8 to 128, printable ASCII characters without spaces. */
@@ -356,7 +431,7 @@ public final class Client {
         return word;
     }
 
-    /** The hub's address, as https://host[:port]. */
+    /** The hub's address with its prefix, as https://host[:port]&lt;prefix&gt;, such as https://host/pf. */
     public String server() {
         return base;
     }
@@ -442,7 +517,7 @@ public final class Client {
             h.put(Proto.HEADER, range);
             h.put(H_VERSION, agent);
         }
-        Http.Response r = Http.request(target, endpoint.path(), h, ssl, upgrade);
+        Http.Response r = Http.request(target, apiPath(endpoint.segment()), h, ssl, upgrade);
         if (r.status != 404) {
             try {
                 answered(endpoint, r.headers);

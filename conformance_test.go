@@ -633,6 +633,22 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 		}
 	})
 
+	t.Run("both sides/a hub at a path of its own", func(t *testing.T) {
+		h := newConformanceHub(t, d)
+		h.mount("/xzfe-aeeg-e2da")
+		h.server = h.srv.URL + "/xzfe-aeeg-e2da/"
+		h.serve(t, echoTarget(t), "--serve-token", testServeToken)
+		addr := h.connect(t)
+		if err := echoTCP(addr, payload[:1000]); err != nil {
+			t.Fatal(err)
+		}
+		// Given the server without the path, the driver finds no hub.
+		h.server = h.srv.URL
+		if code := h.run(t, cmdCheck, "--word", testWord).exit(15 * time.Second); code == exitOK {
+			t.Errorf("check without the hub's path exits %d", code)
+		}
+	})
+
 	t.Run("serve/the target speaks first", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.serve(t, bannerTarget(t), "--serve-token", testServeToken)

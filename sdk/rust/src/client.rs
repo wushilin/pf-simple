@@ -372,8 +372,11 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Starts building a client for the hub at `server` (`https://host[:port]`,
-    /// optionally followed by `/`, `/pf` or `/pf/`) and the tunnel `word`.
+    /// Starts building a client for the hub at `server` and the tunnel `word`.
+    /// `server` is `https://host[:port]`, optionally followed by the hub's
+    /// prefix (PROTOCOL.md §2): `/pf` when none is given, which is where
+    /// every hub is unless its admin chose another, as in
+    /// `https://host/xzfe-aeeg-e2da/`. One trailing `/` is ignored.
     pub fn builder(server: impl Into<String>, word: impl Into<String>) -> ClientBuilder {
         ClientBuilder {
             server: server.into(),
@@ -400,7 +403,8 @@ impl Client {
         &self.inner.word
     }
 
-    /// The hub's base URL, as `https://host[:port]`.
+    /// The hub's base URL, as `https://host[:port]`, followed by the hub's
+    /// prefix when it is not the default `/pf`.
     pub fn server(&self) -> String {
         self.inner.base.url()
     }
@@ -493,7 +497,7 @@ impl Client {
             headers.push((H_VERSION, i.agent.clone()));
         }
         headers.extend(extra);
-        let answer = http::request(&i.base, &i.connector, endpoint.path(), &headers, upgrade).await?;
+        let answer = http::request(&i.base, &i.connector, &i.base.path(endpoint.name()), &headers, upgrade).await?;
         let head = match &answer {
             Answer::Upgraded(u) => Some(&u.head),
             Answer::Plain { head, .. } if head.status != 404 => Some(head),

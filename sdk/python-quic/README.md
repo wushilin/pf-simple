@@ -53,7 +53,12 @@ one.
 
 ## How it reaches the hub
 
-- **Discovery.** `GET /pf/api/tunnel/quic` on the hub's HTTPS endpoint,
+- **The server URL** is the same as pfrelay's: `https://host[:port]`,
+  optionally followed by the hub's prefix (default `/pf`), such as
+  `https://hub.example.com:8443/xzfe-aeeg-e2da/`. See "The server URL" in
+  [pfrelay's README](../python/README.md#the-server-url).
+- **Discovery.** `GET <prefix>/api/tunnel/quic` (`/pf/api/tunnel/quic` at
+  the default prefix) on the hub's HTTPS endpoint,
   with the run's credentials, tells where the QUIC listener is and the
   SHA-256 fingerprints of its certificate. A 404 means the hub offers no
   QUIC (this is final); a 501 means its listener is off (retried).

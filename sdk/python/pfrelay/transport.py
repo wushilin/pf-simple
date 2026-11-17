@@ -155,7 +155,7 @@ class Params:
 
     @property
     def server(self) -> str:
-        """The hub's address, as https://host[:port]."""
+        """The hub's base URL, as https://host[:port]<prefix> (for logs)."""
         return self._c.base
 
     @property
@@ -189,6 +189,11 @@ class Params:
     def agent(self) -> str:
         """What this program calls itself, for the hub's log."""
         return self._c.agent
+
+    def path(self, endpoint: str) -> str:
+        """The request path of an endpoint at the hub's prefix, as
+        <prefix>/api/tunnel/<endpoint> (PROTOCOL.md 2); for get."""
+        return self._c._base.path(endpoint)
 
     async def get(self, path: str, headers: list[tuple[str, str]]) -> HttpAnswer:
         """A GET of path on the hub's HTTPS endpoint, verified as the

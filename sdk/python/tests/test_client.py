@@ -100,6 +100,35 @@ class Requests(unittest.IsolatedAsyncioTestCase):
                 await client(serve_token=SERVE_TOKEN).probe()
 
 
+class Prefix(unittest.IsolatedAsyncioTestCase):
+    """Every request goes under the prefix the base URL gives (PROTOCOL.md 2)."""
+
+    async def test_requests_use_the_prefix(self):
+        server = "https://127.0.0.1:1/xzfe-aeeg-e2da/"
+        c = pfrelay.Client(server, "K3F9-x2mq-7hpa", name="Test", serve_token=SERVE_TOKEN)
+        self.assertEqual(c.base, "https://127.0.0.1:1/xzfe-aeeg-e2da")
+        self.assertEqual(pfrelay.transport.Params(c).path("quic"), "/xzfe-aeeg-e2da/api/tunnel/quic")
+        dial = Fake([(resp(403, x_pf_tunnel_proto="1"), None)])
+        get = Fake([resp(403, x_pf_tunnel_proto="1")])
+        with mock.patch.object(_ws, "ws_dial", dial), mock.patch.object(_ws, "http_get", get):
+            for call in (c.dial, c.listen, c.check, c.probe):
+                with self.assertRaises(pfrelay.AccessDenied):
+                    await call()
+        self.assertEqual(
+            [r[0] for r in dial.requests],
+            ["/xzfe-aeeg-e2da/api/tunnel/connect", "/xzfe-aeeg-e2da/api/tunnel/serve"],
+        )
+        self.assertEqual(
+            [r[0] for r in get.requests],
+            ["/xzfe-aeeg-e2da/api/tunnel/check", "/xzfe-aeeg-e2da/api/tunnel/version"],
+        )
+
+    def test_bad_prefix_is_refused(self):
+        for bad in ["https://h/a//b", "https://h/a%2Fb", "https://h/pf?x"]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                pfrelay.Client(bad, "K3F9-x2mq-7hpa")
+
+
 class Listening(unittest.IsolatedAsyncioTestCase):
     async def test_first_refusal_is_final(self):
         for status, exc in ((403, pfrelay.AccessDenied), (409, pfrelay.StatusError), (426, pfrelay.StatusError)):

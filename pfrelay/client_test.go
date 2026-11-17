@@ -10,16 +10,28 @@ import (
 
 func TestNormalizeBase(t *testing.T) {
 	for in, want := range map[string]string{
-		"https://relay.example.com":      "https://relay.example.com",
-		"https://relay.example.com/":     "https://relay.example.com",
-		"https://relay.example.com:8443": "https://relay.example.com:8443",
-		"https://relay.example.com/pf/":  "https://relay.example.com",
+		"https://relay.example.com":                      "https://relay.example.com/pf",
+		"https://relay.example.com/":                     "https://relay.example.com/pf",
+		"https://relay.example.com:8443":                 "https://relay.example.com:8443/pf",
+		"https://relay.example.com/pf":                   "https://relay.example.com/pf",
+		"https://relay.example.com/pf/":                  "https://relay.example.com/pf",
+		"https://relay.example.com:8443/xzfe-aeeg-e2da/": "https://relay.example.com:8443/xzfe-aeeg-e2da",
+		"https://relay.example.com/a/b.c_d~e-f":          "https://relay.example.com/a/b.c_d~e-f",
+		" https://relay.example.com/x ":                  "https://relay.example.com/x",
 	} {
 		if got, err := normalizeBase(in); err != nil || got != want {
 			t.Errorf("normalizeBase(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"http://relay.example.com/", "relay.example.com", "https://relay.example.com/other", "wss://relay.example.com/"} {
+	for _, in := range []string{
+		"http://relay.example.com/", "relay.example.com", "wss://relay.example.com/",
+		"https://relay.example.com/?x=1", "https://relay.example.com/?", "https://relay.example.com/#f",
+		"https://u:p@relay.example.com/", "https://relay.example.com//", "https://relay.example.com/a//b",
+		"https://relay.example.com/.", "https://relay.example.com/..", "https://relay.example.com/a/../b",
+		"https://relay.example.com/a%2Fb", "https://relay.example.com/a%41", "https://relay.example.com/a b",
+		"https://relay.example.com/" + strings.Repeat("a", 65),
+		"https://relay.example.com" + strings.Repeat("/abcdefghi", 21),
+	} {
 		if got, err := normalizeBase(in); err == nil {
 			t.Errorf("normalizeBase(%q) = %q, want an error", in, got)
 		}

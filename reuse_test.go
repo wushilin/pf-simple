@@ -845,7 +845,7 @@ func TestReuseSettings(t *testing.T) {
 	post("relay/settings", `{"reuse":{"enabled":true,"idleSeconds":45,"minIdle":7,"maxIdle":6,"tenantCap":100,"hubCap":1000}}`, http.StatusBadRequest)
 
 	// A word's own limits; they outlive a restart with the binding.
-	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig}
+	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig, url: srv.URL}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f.goServeWith(t, ctx, echoTarget(t), nil)

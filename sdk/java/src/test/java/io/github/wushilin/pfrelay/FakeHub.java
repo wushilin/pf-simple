@@ -34,6 +34,7 @@ final class FakeHub implements AutoCloseable {
 
     /** One request, and the means to answer it. */
     static final class Req {
+        final String path; // the whole request path, such as /pf/api/tunnel/serve
         final String endpoint;
         final Map<String, String> headers;
         final long atNanos = System.nanoTime();
@@ -41,8 +42,9 @@ final class FakeHub implements AutoCloseable {
         final InputStream in;
         final OutputStream out;
 
-        Req(String endpoint, Map<String, String> headers, Socket socket, InputStream in) throws IOException {
-            this.endpoint = endpoint;
+        Req(String path, Map<String, String> headers, Socket socket, InputStream in) throws IOException {
+            this.path = path;
+            this.endpoint = path.substring(path.lastIndexOf('/') + 1);
             this.headers = headers;
             this.socket = socket;
             this.in = in;
@@ -140,7 +142,7 @@ final class FakeHub implements AutoCloseable {
                 int colon = l.indexOf(':');
                 h.put(l.substring(0, colon).trim(), l.substring(colon + 1).trim());
             }
-            Req r = new Req(path.substring(path.lastIndexOf('/') + 1), h, s, in);
+            Req r = new Req(path, h, s, in);
             requests.add(r);
             handler.handle(r);
         } catch (Exception e) {

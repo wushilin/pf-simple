@@ -26,6 +26,11 @@ password = "change-me"
 # tls = "self_signed"
 # tls_dir = "certs"
 # tls_names = ["relay.example.com"]
+# Everything (the console, its API and the relay hub) is served under /pf.
+# A path of your own hides the server from whoever does not know it:
+# nothing answers outside it, and clients give it in the server's URL
+# (https://relay.example.com/xzfe-aeeg-e2da/).
+# path = "/xzfe-aeeg-e2da"
 # In config mode the console can add, edit, stop, start and delete listeners.
 # Changes are written back to this file (comments are not kept), so the file's
 # directory must be writable by pf-simple. These optional lists fence what the

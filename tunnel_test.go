@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +45,18 @@ type relayFixture struct {
 	hub *tunnelHub
 	srv *httptest.Server
 	tls *tls.Config
+	cs  *consoleServer
+	url string // what the Go clients are given: srv.URL, or with the hub's path
+	// handler is what srv serves; mount replaces it while srv runs.
+	handler *atomic.Pointer[http.Handler]
+}
+
+// mount serves the console and the hub under prefix instead of /pf.
+func (f *relayFixture) mount(prefix string) {
+	f.cs.prefix = prefix // read only when the handler is built, and at login
+	h := f.cs.handler()
+	f.handler.Store(&h)
+	f.url = f.srv.URL + prefix + "/"
 }
 
 func newRelayFixture(t *testing.T, statePath string) *relayFixture {
@@ -61,7 +74,12 @@ func newRelayFixtureTLS(t *testing.T, statePath string, cert tls.Certificate, ro
 	hub.denyDelay = 5 * time.Millisecond
 	hub.guesses.limit = 1 << 30 // the tests poll from one address until the word is served
 	cs.tunnels = hub
-	srv := httptest.NewUnstartedServer(cs.handler())
+	handler := new(atomic.Pointer[http.Handler])
+	h := cs.handler()
+	handler.Store(&h)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		(*handler.Load()).ServeHTTP(w, r)
+	}))
 	if cert.Certificate != nil {
 		srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	}
@@ -75,12 +93,12 @@ func newRelayFixtureTLS(t *testing.T, statePath string, cert tls.Certificate, ro
 	if roots != nil {
 		clientTLS = &tls.Config{RootCAs: roots}
 	}
-	return &relayFixture{hub: hub, srv: srv, tls: clientTLS}
+	return &relayFixture{hub: hub, srv: srv, tls: clientTLS, cs: cs, url: srv.URL, handler: handler}
 }
 
 func (f *relayFixture) client(t *testing.T, word, serveToken string) *pfrelay.Client {
 	t.Helper()
-	c, err := pfrelay.NewClient(f.srv.URL, word, f.tls)
+	c, err := pfrelay.NewClient(f.url, word, f.tls)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +593,7 @@ func TestRelaySwitches(t *testing.T) {
 		srv.CloseClientConnections()
 		srv.Close()
 	}()
-	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig}
+	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig, url: srv.URL}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -901,7 +919,7 @@ func TestRelayTenants(t *testing.T) {
 		srv.CloseClientConnections()
 		srv.Close()
 	}()
-	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig}
+	f := &relayFixture{hub: hub, srv: srv, tls: srv.Client().Transport.(*http.Transport).TLSClientConfig, url: srv.URL}
 
 	post := func(url, body string) (int, map[string]string) {
 		t.Helper()

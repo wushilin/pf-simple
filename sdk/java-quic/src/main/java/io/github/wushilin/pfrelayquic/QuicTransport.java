@@ -32,7 +32,8 @@ import tech.kwik.core.impl.QuicConnectionImpl;
  * and one stream per request. The Client it is plugged into does the rest.
  */
 final class QuicTransport implements Transport {
-    static final String PATH = "/pf/api/tunnel/quic";
+    /** The discovery endpoint, under the hub's prefix (§13.2). */
+    static final String DISCOVERY = "quic";
     static final String H_OP = "X-PF-Tunnel-Op";
     static final String H_WORD = "X-PF-Tunnel-Word";
     static final String H_SERVE = "X-PF-Serve-Token";
@@ -121,7 +122,7 @@ final class QuicTransport implements Transport {
                 h.put(H_CLIENT_TOKEN, p.clientToken());
             }
         }
-        HttpAnswer a = p.get(PATH, h);
+        HttpAnswer a = p.get(p.apiPath(DISCOVERY), h);
         if (a.status() == 404) { // a hub without QUIC does not know the endpoint
             throw new StatusException(404, NO_QUIC, a.headers());
         }

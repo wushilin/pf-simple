@@ -33,7 +33,7 @@ func (f *relayFixture) withQUIC(t *testing.T) *quicHub {
 // quicClient is f.client over QUIC.
 func (f *relayFixture) quicClient(t *testing.T, word, serveToken string) *pfrelay.Client {
 	t.Helper()
-	c, err := pfrelayquic.NewClient(f.srv.URL, word, f.tls)
+	c, err := pfrelayquic.NewClient(f.url, word, f.tls)
 	if err != nil {
 		t.Fatal(err)
 	}

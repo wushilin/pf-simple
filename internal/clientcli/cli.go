@@ -50,6 +50,7 @@ of that server (--token is short for --serve-token): without one a server
 says nothing about itself.
 
 <server>  the pf-simple server, https only:  https://relay.example.com/
+          with its path, if it has one:     https://relay.example.com/xzfe-aeeg-e2da/
 <word>    the tunnel's secret, the same on both sides: three groups of four
           letters or digits, like k3f9-x2mq-7hpa; case does not matter.
           "serve" without a word makes a random one and prints it; it

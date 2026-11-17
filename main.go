@@ -58,6 +58,9 @@ func main() {
 	var console *consoleServer
 	if cfg.console != nil {
 		console = newConsoleServer(cfg.console.addr, cfg.console.password, mgr)
+		if cfg.console.prefix != "" {
+			console.prefix = cfg.console.prefix
+		}
 		// The hub is always there with a console, switched on or off: from
 		// a config file, the console's Relay hub tab can change that.
 		var tenants []tenantSpec
@@ -121,7 +124,7 @@ func run(ctx context.Context, mgr *manager, console *consoleServer) error {
 		if console.tunnels.enabled {
 			mode += ", tunnels on"
 		}
-		log.Printf("console on %s://%s%s/ (%s)", scheme, ln.Addr(), consolePrefix, mode)
+		log.Printf("console on %s://%s%s/ (%s)", scheme, ln.Addr(), console.prefix, mode)
 		if q := console.tunnels.quic; q != nil && q.set.Enabled {
 			if err := q.start(); err != nil {
 				log.Printf("relay: %v; the QUIC listener stays off until it is fixed in the console", err)

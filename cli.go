@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/wushilin/pf-simple/internal/tunnel"
 )
 
 const usageText = `pf-simple: a small TCP port forwarder.
@@ -37,6 +39,12 @@ serve https itself, as its own certificate authority (see ./certs/ca.pem):
 
 With -c, the console's Relay hub tab turns the hub on and off instead.
 
+To hide the server from whoever does not know where it is, serve it under
+a path of your own (path in [console] with -c); clients then give the
+server as https://host/xzfe-aeeg-e2da/:
+
+  pf-simple --console 18222@secret --console-path /xzfe-aeeg-e2da --tunnel <serve-token>
+
 --config/-c cannot be combined with any other flag or argument.
 pf-simple --version prints the version.
 
@@ -64,6 +72,8 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 	fs.StringVar(&consoleValue, "console", "", "web console `listen[@password]`; password defaults to $PF_PASSWORD")
 	var consoleTLS bool
 	fs.BoolVar(&consoleTLS, "console-tls", false, "serve the console (and the relay hub) over https, with a certificate from pf-simple's own CA, kept in ./certs and renewed on its own; needs --console. With -c, use tls / tls_dir / tls_names in [console], or the console's Relay hub tab")
+	var consolePath string
+	fs.StringVar(&consolePath, "console-path", "", "serve the console and the relay hub under this `path` instead of /pf, e.g. /xzfe-aeeg-e2da; nothing answers outside it, and clients give it in the server's URL: https://host/xzfe-aeeg-e2da/. Needs --console; with -c, use path in [console]")
 	var serveTokens forwardsFlag
 	fs.Var(&serveTokens, "tunnel", "relay ad-hoc tunnels between pf-client processes; the value is a `serve-token` (32+ characters) for 'pf-client serve' (repeatable: tenants cli-1, cli-2, ...); needs --console. With -c, tenants are managed in the console instead")
 	fs.StringVar(&configPath, "config", "", "TOML config `file`; excludes every other flag")
@@ -130,6 +140,13 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 	if consoleTLS && consoleValue == "" {
 		return settings{}, errors.New("--console-tls needs --console")
 	}
+	if consolePath != "" && consoleValue == "" {
+		return settings{}, errors.New("--console-path needs --console")
+	}
+	prefix, err := tunnel.CleanPrefix(consolePath)
+	if err != nil {
+		return settings{}, fmt.Errorf("--console-path: %w", err)
+	}
 	if len(forwards) == 0 && !tunnelOn {
 		if consoleValue != "" {
 			return settings{}, errors.New("a console alone cannot add listeners on the command line; give at least one listen@target, or use -c config.toml")
@@ -154,7 +171,7 @@ func parseArgs(args []string, stderr io.Writer, envPassword string) (settings, e
 		if err != nil {
 			return settings{}, err
 		}
-		s.console = &consoleSettings{addr: addr, password: password, tlsMode: tlsOff}
+		s.console = &consoleSettings{addr: addr, password: password, tlsMode: tlsOff, prefix: prefix}
 		if consoleTLS {
 			s.console.tlsMode = tlsSelfSigned
 		}
