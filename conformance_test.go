@@ -349,6 +349,21 @@ func (p *proc) printed(prefix string) []string {
 	return out
 }
 
+// awaitPrinted waits, for up to 10 seconds, until at least n lines that
+// start with prefix have been printed, and returns what printed returns
+// then. Events are not ordered against the answers to queries, nor against
+// what the hub sees, so a check of the events waits for them with this.
+func (p *proc) awaitPrinted(prefix string, n int) []string {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		out := p.printed(prefix)
+		if len(out) >= n || time.Now().After(deadline) {
+			return out
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // ask sends the driver a query on stdin ("stats" or "conns") and decodes
 // the JSON of its answer into v.
 func (p *proc) ask(query driverQuery, v any) {
@@ -804,12 +819,17 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 	t.Run("serve/registers again after losing the hub", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.serve(t, echoTarget(t), "--serve-token", testServeToken)
-		h.hub.mu.Lock()
+		// The hub answers a serve (101) before it records the tunnel, so a
+		// driver can say "ready" a moment before the hub has it: wait.
 		var old *relayTunnel
-		for _, tn := range h.hub.tunnels {
-			old = tn
-		}
-		h.hub.mu.Unlock()
+		waitFor(t, "the hub to record the tunnel", func() bool {
+			h.hub.mu.Lock()
+			defer h.hub.mu.Unlock()
+			for _, tn := range h.hub.tunnels {
+				old = tn
+			}
+			return old != nil
+		})
 		h.hub.drop(old, "dropped by the conformance suite")
 		waitFor(t, "the driver to register again", func() bool {
 			h.hub.mu.Lock()
@@ -994,7 +1014,9 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 		if refused != n-128 {
 			t.Errorf("%d of %d connections were refused, want %d", refused, n, n-128)
 		}
-		if got := len(p.printed(eventRefused)); got != n-128 {
+		// The refused lines are not ordered against what the hub hears:
+		// wait for them, then check there are no more than that.
+		if got := len(p.awaitPrinted(eventRefused, n-128)); got != n-128 {
 			t.Errorf("%d refusals reported as events, want %d", got, n-128)
 		}
 	})
@@ -1282,6 +1304,12 @@ func checkStats(t *testing.T, h *conformanceHub, p *proc, side pfrelay.Side, ope
 	}
 
 	// Every connection was opened once and closed once, with its figures.
+	// The events are not ordered against the answers to queries: an SDK may
+	// count a connection closed in its stats before its close event runs,
+	// and the driver prints events on threads of their own. So wait for the
+	// lines themselves (conformance/README.md, Events).
+	p.awaitPrinted(eventOpened, 4)
+	p.awaitPrinted(eventClosed, 4)
 	opened := map[string]bool{}
 	for _, l := range p.printed(eventOpened) {
 		var id, s string

@@ -188,6 +188,24 @@ func (e *events) closedWith(t *testing.T, id string) []error {
 	return nil
 }
 
+// waitOpened waits until connection id has opened.
+func (e *events) waitOpened(t *testing.T, id string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		e.mu.Lock()
+		for _, o := range e.opened {
+			if o == (ConnID{id}) {
+				e.mu.Unlock()
+				return
+			}
+		}
+		e.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("connection %s never opened", id)
+}
+
 // listenEcho serves with Listen, echoing every connection.
 func listenEcho(t *testing.T, c *Client) *Listener {
 	t.Helper()
@@ -361,6 +379,11 @@ func TestClientReopenedID(t *testing.T) {
 	if v, _ := expectText(t, leg, 5*time.Second); v != tunnel.MsgBound+" 2222222222222222" {
 		t.Fatalf("bind answered with %q", v)
 	}
+	// Wait until the bound attempt has opened. "bound" goes out before the
+	// connection is handed on, so an open message sent at once may overtake
+	// it; the attempt is then given up before it opens, and reports nothing
+	// (it never opened), which is the other case and not this test's.
+	ev.waitOpened(t, "2222222222222222")
 	// The hub never heard bound, and asks again.
 	open(t, ctl, "2222222222222222")
 	a := h.nextAccept()

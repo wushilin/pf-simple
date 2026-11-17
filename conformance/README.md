@@ -105,6 +105,12 @@ separated by single spaces:
 `<id>` is the connection id as the SDK's opaque id type prints it: the
 hub's 16 hex digits.
 
+Event lines are not ordered against the answers to queries, nor against
+what the hub sees. An SDK may count a connection as closed in `stats`
+before its close handler runs, and a driver may print events and answer
+queries on different threads. The suite waits for the event lines it
+expects instead of inferring them from a query's answer.
+
 ### Queries
 
 While `serve` or `connect` runs, the driver reads lines from stdin and
