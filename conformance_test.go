@@ -819,12 +819,17 @@ func conformanceCases(t *testing.T, d driver, main bool) {
 	t.Run("serve/registers again after losing the hub", func(t *testing.T) {
 		h := newConformanceHub(t, d)
 		h.serve(t, echoTarget(t), "--serve-token", testServeToken)
-		h.hub.mu.Lock()
+		// The hub answers a serve (101) before it records the tunnel, so a
+		// driver can say "ready" a moment before the hub has it: wait.
 		var old *relayTunnel
-		for _, tn := range h.hub.tunnels {
-			old = tn
-		}
-		h.hub.mu.Unlock()
+		waitFor(t, "the hub to record the tunnel", func() bool {
+			h.hub.mu.Lock()
+			defer h.hub.mu.Unlock()
+			for _, tn := range h.hub.tunnels {
+				old = tn
+			}
+			return old != nil
+		})
 		h.hub.drop(old, "dropped by the conformance suite")
 		waitFor(t, "the driver to register again", func() bool {
 			h.hub.mu.Lock()
