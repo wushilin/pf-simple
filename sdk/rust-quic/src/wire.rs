@@ -168,7 +168,7 @@ pub(crate) async fn read_message<R: AsyncRead + Unpin, T: for<'de> Deserialize<'
     serde_json::from_slice(&body).map_err(|_| MsgError::Malformed)
 }
 
-/// The answer of `GET /pf/api/tunnel/quic` (§13.2).
+/// The answer of `GET <prefix>/api/tunnel/quic` (§13.2).
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Discovery {
     #[serde(default)]

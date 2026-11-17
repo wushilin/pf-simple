@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
-use crate::testhub::{client, hold, recv, reply, send, upgrade, Req, SERVE_TOKEN};
+use crate::testhub::{client, client_at, hold, recv, reply, send, upgrade, Req, SERVE_TOKEN};
 use crate::ws::{OP_BINARY, OP_CLOSE, OP_TEXT};
 use crate::{ConnId, Error, Events, Side, Timing};
 
@@ -452,4 +452,28 @@ async fn fail_and_close_race_and_one_wins_once() {
         assert_eq!(heard.starting("close").len(), 1, "{:?}", heard.all());
         assert_eq!(c.stats().active, 0);
     }
+}
+
+/// Every request goes under the prefix the server URL gave (PROTOCOL.md §2).
+#[tokio::test]
+async fn requests_use_the_prefix() {
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let seen = paths.clone();
+    let c = client_at("https://127.0.0.1:1/xzfe-aeeg-e2da/", move |req: Req, mut s| {
+        seen.lock().unwrap().push(req.path.clone());
+        async move { reply(&mut s, 200, &[]).await }
+    });
+    assert_eq!(c.server(), "https://127.0.0.1:1/xzfe-aeeg-e2da");
+    c.check().await.unwrap();
+    assert_eq!(paths.lock().unwrap().clone(), ["/xzfe-aeeg-e2da/api/tunnel/check"]);
+
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let seen = paths.clone();
+    let c = client_at("https://127.0.0.1:1", move |req: Req, mut s| {
+        seen.lock().unwrap().push(req.path.clone());
+        async move { reply(&mut s, 200, &[]).await }
+    });
+    assert_eq!(c.server(), "https://127.0.0.1:1");
+    c.check().await.unwrap();
+    assert_eq!(paths.lock().unwrap().clone(), ["/pf/api/tunnel/check"]);
 }

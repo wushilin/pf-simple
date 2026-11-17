@@ -33,7 +33,6 @@ const OPEN_QUEUE: usize = 128;
 /// What a full open queue is refused with: pfrelay's backlog reason (§9).
 const BACKLOG_FULL: &str = "the serving side is not accepting connections fast enough";
 
-const PATH: &str = "/pf/api/tunnel/quic";
 const H_VERSION: &str = "X-PF-Version";
 const H_OP: &str = "X-PF-Tunnel-Op";
 const H_SERVE: &str = "X-PF-Serve-Token";
@@ -110,7 +109,7 @@ impl Quic {
                 }
             }
         }
-        let a = p.get(PATH, &h).await?;
+        let a = p.get(&p.endpoint_path("quic"), &h).await?;
         match a.status {
             200 => {}
             // A hub without QUIC does not know the endpoint.

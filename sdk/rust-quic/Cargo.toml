@@ -1,6 +1,6 @@
 [package]
 name = "pfrelay-quic"
-version = "0.16.1"
+version = "0.16.2"
 edition = "2021"
 description = "Rust SDK for the pf-simple relay hub over QUIC (tunnel protocol 3): serve a tunnel or connect through one"
 readme = "README.md"
@@ -14,7 +14,7 @@ license = "Apache-2.0"
 name = "pfrelay_quic"
 
 [dependencies]
-pfrelay = { path = "../rust", version = "0.16.1" }
+pfrelay = { path = "../rust", version = "0.16.2" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio = { version = "1", features = ["net", "io-util", "io-std", "time", "sync", "rt", "rt-multi-thread", "macros", "signal"] }

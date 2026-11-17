@@ -33,13 +33,19 @@ while let Ok(conn) = listener.accept().await {
 }
 ```
 
+The server URL is the same as pfrelay's: `https://host[:port]`, optionally
+followed by the hub's prefix (`/pf` when none is given, as in
+`https://hub.example/xzfe-aeeg-e2da/` for a hub mounted elsewhere); see
+[pfrelay's README](../rust/README.md#the-hubs-address) for what a prefix
+may be. Discovery goes under that prefix.
+
 The builder takes pfrelay's settings except those of the WebSocket
 protocols (`max_proto`, leg reuse). `ca_file`, `ca_pem` and `tls_config`
 are for the hub's HTTPS endpoint, where the QUIC listener is discovered.
 
 ## How it reaches the hub
 
-- **Discovery.** `GET /pf/api/tunnel/quic` on the hub's HTTPS endpoint,
+- **Discovery.** `GET <prefix>/api/tunnel/quic` on the hub's HTTPS endpoint,
   with the run's credentials, tells where the QUIC listener is and the
   SHA-256 fingerprints of its certificate. A 404 means the hub offers no
   QUIC (this is final); a 501 means its listener is off (retried).

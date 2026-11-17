@@ -91,13 +91,15 @@ pub(crate) enum Endpoint {
 }
 
 impl Endpoint {
-    pub(crate) fn path(self) -> &'static str {
+    /// The endpoint's name, the last segment of its path
+    /// `<prefix>/api/tunnel/<name>` (PROTOCOL.md §2).
+    pub(crate) fn name(self) -> &'static str {
         match self {
-            Endpoint::Serve => "/pf/api/tunnel/serve",
-            Endpoint::Connect => "/pf/api/tunnel/connect",
-            Endpoint::Accept => "/pf/api/tunnel/accept",
-            Endpoint::Check => "/pf/api/tunnel/check",
-            Endpoint::Version => "/pf/api/tunnel/version",
+            Endpoint::Serve => "serve",
+            Endpoint::Connect => "connect",
+            Endpoint::Accept => "accept",
+            Endpoint::Check => "check",
+            Endpoint::Version => "version",
         }
     }
 }
