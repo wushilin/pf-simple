@@ -1234,6 +1234,21 @@ func (h *tunnelHub) relay(t *relayTunnel, connID string, client *tunnel.Stream) 
 	}()
 	var up net.Conn = upstream
 	if served.leg != nil {
+		// A failure the serving side reports after its own half-close
+		// arrives while nobody reads the leg but its watch. On a leg offered
+		// reuse it reaches the connecting side at once, as one before the
+		// half-close does (reusableUpstream.Read, §12.7).
+		over := make(chan struct{})
+		defer close(over)
+		go func() {
+			select {
+			case <-upstream.Gone():
+				if r := upstream.GoneReason(); r != "" {
+					client.Fail(cleanHeader(r))
+				}
+			case <-over:
+			}
+		}()
 		// Closing it offers the leg back for the next connection, after a
 		// clean finish (protocol 2, §12.5).
 		up = &reusableUpstream{Stream: upstream, h: h, t: t, leg: served.leg, client: client, pipeID: id}
@@ -1242,13 +1257,14 @@ func (h *tunnelHub) relay(t *relayTunnel, connID string, client *tunnel.Stream) 
 }
 
 // remoteReason is the reason the far end of s gave for failing it, if it
-// did.
+// did: before its half-close, when Read returns it, or after, when only
+// the stream's watch reads it (§8.3).
 func remoteReason(s *tunnel.Stream) string {
 	var remote *tunnel.RemoteError
 	if errors.As(s.Failure(), &remote) {
 		return remote.Reason
 	}
-	return ""
+	return s.GoneReason()
 }
 
 // relayCloseReason is what the hub tells the pf-client on leg self when it
@@ -1279,6 +1295,11 @@ func relayCloseReason(pipeID uint64, t *relayTunnel, self, other *tunnel.Stream,
 			return silentLink(otherClient)
 		}
 		return "the link between " + otherClient + " and the server was lost"
+	}
+	if r := other.GoneReason(); r != "" {
+		// The other leg failed after its own half-close: its reason, not
+		// the half-close it came after.
+		return r
 	}
 	if err := self.Failure(); err != nil {
 		// The hub heard nothing from this leg; what it sends may still arrive.

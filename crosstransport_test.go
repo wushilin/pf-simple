@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wushilin/pf-simple/internal/quictun"
+	"github.com/wushilin/pf-simple/internal/tunnel"
 	"github.com/wushilin/pf-simple/pfrelay"
 )
 
@@ -264,6 +265,44 @@ func endOf(c *pfrelay.Conn, within time.Duration) string {
 	return err.Error()
 }
 
+// lateFailure half-closes failing, waits until other has read that
+// half-close, and then fails failing with reason. With thenHalfClose,
+// other then half-closes as well, once the hub has the reason: an eof that
+// reaches the hub first finishes the connection cleanly, as it may.
+func lateFailure(e *crossEnv, failing, other *pfrelay.Conn, reason string, thenHalfClose bool) {
+	e.t.Helper()
+	_ = failing.CloseWrite()
+	_ = other.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, _ = io.ReadAll(other)
+	_ = other.SetReadDeadline(time.Time{})
+	failing.Fail(reason)
+	if thenHalfClose {
+		waitFor(e.t, "the hub to read the late err", func() bool { return hubHeard(reason) || other.Err() != nil })
+		_ = other.CloseWrite()
+	}
+}
+
+// hubHeard reports whether a leg of a pipe at the hub failed with reason
+// after its half-close.
+func hubHeard(reason string) bool {
+	live, _ := pipes.list(1 << 10)
+	for _, p := range live {
+		for _, c := range []net.Conn{p.client, p.upstream} {
+			var s *tunnel.Stream
+			switch x := c.(type) {
+			case *tunnel.Stream:
+				s = x
+			case *reusableUpstream:
+				s = x.Stream
+			}
+			if s != nil && s.GoneReason() == reason {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // crossCase is one way for a connection to end.
 type crossCase struct {
 	name string
@@ -356,6 +395,29 @@ var crossCases = []struct {
 		_, _ = io.ReadAll(e.target)
 		e.target.Fail("a late failure")
 		return endOf(e.app, 10*time.Second), errText(e.target.Err())
+	}},
+	// A side that fails after its own half-close: the err follows its eof
+	// (§8.3, §13.5), and must not be lost behind it, whether the other
+	// side then half-closes too or the connection falls idle.
+	{name: "target fails after its own half-close", app: "a late failure of the target", run: func(e *crossEnv) (string, string) {
+		e.open()
+		lateFailure(e, e.target, e.app, "a late failure of the target", false)
+		return endOf(e.app, 10*time.Second), errText(e.target.Err())
+	}},
+	{name: "target fails after its own half-close, then the application half-closes", app: "a late failure of the target", run: func(e *crossEnv) (string, string) {
+		e.open()
+		lateFailure(e, e.target, e.app, "a late failure of the target", true)
+		return endOf(e.app, 10*time.Second), errText(e.target.Err())
+	}},
+	{name: "application fails after its own half-close", target: "a late failure of the application", onReuse: ptr(""), keepsLeg: true, run: func(e *crossEnv) (string, string) {
+		e.open()
+		lateFailure(e, e.app, e.target, "a late failure of the application", false)
+		return errText(e.app.Err()), endOf(e.target, 10*time.Second)
+	}},
+	{name: "application fails after its own half-close, then the target half-closes", target: "a late failure of the application", onReuse: ptr(""), keepsLeg: true, run: func(e *crossEnv) (string, string) {
+		e.open()
+		lateFailure(e, e.app, e.target, "a late failure of the application", true)
+		return errText(e.app.Err()), endOf(e.target, 10*time.Second)
 	}},
 	{name: "half-closed and silent", app: "the application closed its end, the target kept its own open, and the connection was idle",
 		target: "the application closed its end, and the connection was idle", onReuse: ptr(""), keepsLeg: true, run: func(e *crossEnv) (string, string) {
