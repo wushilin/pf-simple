@@ -29,7 +29,7 @@ import io.github.wushilin.pfrelay.Client;
  */
 public final class QuicClient {
     /** This SDK's version. */
-    public static final String VERSION = "0.16.1";
+    public static final String VERSION = "0.16.2";
     /** What a client calls itself in the hub's log and console unless told otherwise. */
     public static final String DEFAULT_AGENT = "pfrelay-quic-java " + VERSION;
     /**

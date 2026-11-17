@@ -6,8 +6,8 @@ import java.util.Locale;
 enum Endpoint {
     SERVE, CONNECT, ACCEPT, CHECK, VERSION;
 
-    /** The request path, under /pf/api/tunnel/. */
-    String path() {
-        return Client.PATH + name().toLowerCase(Locale.ROOT);
+    /** The endpoint's last path segment: serve, connect, ... (see {@link Client#apiPath}). */
+    String segment() {
+        return name().toLowerCase(Locale.ROOT);
     }
 }

@@ -19,6 +19,27 @@ sdk/java/build.sh        # compiles, runs the tests, writes build/pfrelay.jar
 
 `pom.xml` is there for publishing; `build.sh` needs only `javac` and `jar`.
 
+## The server URL
+
+`server(url)` takes the hub as `https://host[:port]`, optionally followed
+by the hub's **prefix**: the path where the hub is mounted
+([PROTOCOL.md §2](../../docs/PROTOCOL.md)). Without a path, or with `/`,
+the prefix is `/pf`, where every hub is unless its admin chose another; one
+trailing `/` is ignored. So `https://hub.example.com` and
+`https://hub.example.com/pf/` are the same hub, and
+`https://hub.example.com/xzfe-aeeg-e2da/` is a hub mounted at
+`/xzfe-aeeg-e2da`. Every request goes to
+`https://host[:port]<prefix>/api/tunnel/<endpoint>`.
+
+- A prefix is one or more segments, each a `/` and 1 to 64 of
+  `A-Z a-z 0-9 . _ ~ -`, none of them `.` or `..`; at most 200 characters
+  in all. It is case-sensitive.
+- `build()` refuses anything else with an `IllegalArgumentException` that
+  says what is accepted: `http://`, user information, a query, a fragment,
+  an empty segment (`//`), `%`-escapes, spaces and other characters.
+- A wrong prefix is not detected up front: the hub answers 404 to every
+  request. Versions before 0.16.2 accept only the default prefix.
+
 ## Serving a tunnel
 
 ```java
@@ -180,7 +201,7 @@ unaffected in every combination.
 
 | Type | What it is |
 |---|---|
-| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.16.1`), `logger`, `events`, `maxProto`, `noReuse`, `maxIdleLegs`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
+| `Client` | One hub and one word. Built with `Client.builder()`: `server`, `word`, `sslContext` or `caFile`, `serveToken`, `clientToken`, `name`, `target`, `agent` (default `pfrelay-java 0.16.2`), `logger`, `events`, `maxProto`, `noReuse`, `maxIdleLegs`. `build()` checks every value (PROTOCOL.md §3) and throws `IllegalArgumentException`. |
 | `Client.listen()`, `listen(Duration)` | Register, and return a `Listener`. |
 | `Client.serve(target)`, `serve(target, Duration)` | Register, and forward each connection to a TCP `host:port`; returns a `Forwarder`. |
 | `Client.dial()` | Open one connection; a `Conn`. |

@@ -6,7 +6,7 @@ tunnel from your own program, or connect through one, over UDP instead of
 WebSockets. It passes the [conformance suite](../../conformance/README.md).
 
 - Java 17 or later.
-- Maven: `io.github.wushilin:pfrelay-quic:0.16.1`. It depends on
+- Maven: `io.github.wushilin:pfrelay-quic:0.16.2`. It depends on
   [pfrelay](../java) (the WebSocket SDK, same version) and on
   [kwik](https://github.com/ptrd/kwik) (`tech.kwik:kwik`), a QUIC
   implementation in pure Java.
@@ -24,7 +24,7 @@ import io.github.wushilin.pfrelay.*;
 import io.github.wushilin.pfrelayquic.QuicClient;
 
 Client client = QuicClient.builder()           // instead of Client.builder()
-        .server("https://hub.example.com")     // the hub's HTTPS address, as with pfrelay
+        .server("https://hub.example.com")     // the hub's HTTPS address and prefix, as with pfrelay
         .word("k3f9-x2mq-7hpa")
         .build();
 
@@ -41,14 +41,20 @@ Serving is the same too: `client.listen()` and `accept()`, or
 `client.serve("localhost:22")`. See [pfrelay's README](../java/README.md)
 for the whole API. What differs:
 
+- **The server URL** is the same as pfrelay's
+  ([its README](../java/README.md#the-server-url)): `https://host[:port]`,
+  optionally followed by the hub's prefix, `/pf` when none is given, such
+  as `https://hub.example.com/xzfe-aeeg-e2da/` for a hub mounted at
+  `/xzfe-aeeg-e2da`. Discovery goes under that prefix.
 - **Discovery.** The client asks the hub's HTTPS endpoint
-  (`GET /pf/api/tunnel/quic`, with the run's own credentials) where its
-  QUIC listener is and which certificate it uses. `caFile` and
+  (`GET <prefix>/api/tunnel/quic`, `/pf/api/tunnel/quic` by default, with
+  the run's own credentials) where its QUIC listener is and which
+  certificate it uses. `caFile` and
   `sslContext` verify that HTTPS endpoint, as with pfrelay. It discovers
   again before each new QUIC connection.
 - **Certificate pinning.** The QUIC listener's certificate is accepted if
   and only if the SHA-256 of its DER encoding is one that discovery
-  announced. Its chain, name and dates are not checked; the TLS 1.3
+  announced. Its chain, name, subject and dates are not checked; the TLS 1.3
   handshake is, the CertificateVerify signature included, so a peer must
   hold the pinned certificate's key. On a mismatch the client discovers
   once more; a second mismatch is an error.

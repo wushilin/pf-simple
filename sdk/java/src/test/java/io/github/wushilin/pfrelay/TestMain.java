@@ -113,14 +113,61 @@ public final class TestMain {
     }
 
     public static void testBaseURL() {
-        eq("https://hub.example", Client.normalizeBase("https://hub.example"), "bare");
-        eq("https://hub.example:8443", Client.normalizeBase(" https://HUB.example:8443/ "), "slash");
-        eq("https://hub.example", Client.normalizeBase("https://hub.example/pf"), "/pf");
-        eq("https://hub.example", Client.normalizeBase("https://hub.example/pf/"), "/pf/");
-        eq("https://[::1]:9", Client.normalizeBase("https://[::1]:9/"), "ipv6");
-        for (String bad : new String[] {"http://hub.example", "hub.example", "https://hub.example/x",
-                "https://hub.example/pf/api", "https://", "https://hub.example/?a=b"}) {
-            throwsA(IllegalArgumentException.class, () -> Client.normalizeBase(bad), "url " + bad);
+        // the path is the hub's prefix; none, or /, is /pf; one trailing / is ignored
+        eq("https://h/pf", Client.normalizeBase("https://h"), "bare");
+        eq("https://h/pf", Client.normalizeBase("https://h/"), "slash");
+        eq("https://h/pf", Client.normalizeBase("https://h/pf"), "/pf");
+        eq("https://h/pf", Client.normalizeBase("https://h/pf/"), "/pf/");
+        eq("https://h:8443/xzfe-aeeg-e2da", Client.normalizeBase("https://h:8443/xzfe-aeeg-e2da/"), "custom prefix");
+        eq("https://h/a/b.c_d~e-f", Client.normalizeBase("https://h/a/b.c_d~e-f"), "every allowed character");
+        eq("https://hub.example:8443/pf", Client.normalizeBase(" https://HUB.example:8443/ "), "host lower-cased");
+        eq("https://h/My-Hub", Client.normalizeBase("https://h/My-Hub"), "the prefix keeps its case");
+        eq("https://[::1]:9/pf", Client.normalizeBase("https://[::1]:9/"), "ipv6");
+        eq("https://h/pf/api", Client.normalizeBase("https://h/pf/api"), "a two-segment prefix");
+        eq("https://h/" + "a".repeat(64), Client.normalizeBase("https://h/" + "a".repeat(64)), "a 64-char segment");
+        String long200 = ("/" + "a".repeat(49)).repeat(4); // 200 characters
+        eq("https://h" + long200, Client.normalizeBase("https://h" + long200 + "/"), "a 200-char prefix");
+        for (String bad : new String[] {
+                "http://h", "http://h/pf", // only https
+                "hub.example", "https://", "https:h", // no host
+                "https://h/?a=b", "https://h/pf?a=b", // a query
+                "https://h/#x", "https://h/pf#x", // a fragment
+                "https://u@h/", "https://u:p@h/pf", // user info
+                "https://h//", "https://h//pf", "https://h/pf//", // an empty segment
+                "https://h/a//b", //
+                "https://h/.", "https://h/./", "https://h/a/./b", // . and ..
+                "https://h/..", "https://h/../pf", "https://h/a/..",
+                "https://h/a%2Fb", "https://h/%70f", // escapes
+                "https://h/a b", "https://h/a%20b", // a space
+                "https://h/a+b", "https://h/a:b", "https://h/a@b", "https://h/a;b", "https://h/é", // other characters
+                "https://h/" + "a".repeat(65), // a 65-char segment
+                "https://h" + long200 + "a", // a 201-char prefix
+        }) {
+            IllegalArgumentException e = throwsA(IllegalArgumentException.class, () -> Client.normalizeBase(bad),
+                    "url " + bad);
+            check(e.getMessage().contains("https://host"), "the error for " + bad + " says what is accepted: "
+                    + e.getMessage());
+        }
+        String msg = throwsA(IllegalArgumentException.class, () -> Client.normalizeBase("https://h/a//b"), "//")
+                .getMessage();
+        check(msg.contains("prefix") && msg.contains("A-Z a-z 0-9 . _ ~ -") && msg.contains("200"),
+                "the error for a bad prefix gives its grammar: " + msg);
+    }
+
+    public static void testRequestPathUnderPrefix() throws Exception {
+        Client c = Client.builder().server("https://h:8443/xzfe-aeeg-e2da/").word("aaaa-bbbb-cccc").build();
+        eq("https://h:8443/xzfe-aeeg-e2da", c.server(), "server");
+        for (Endpoint e : Endpoint.values()) {
+            eq("/xzfe-aeeg-e2da/api/tunnel/" + e.segment(), c.apiPath(e.segment()), "path of " + e);
+        }
+        eq("/xzfe-aeeg-e2da/api/tunnel/quic", new Transport.Params(c, null).apiPath("quic"), "quic discovery");
+        eq("/pf/api/tunnel/serve", Client.builder().server("https://h").build().apiPath("serve"), "default prefix");
+        // what goes on the wire
+        try (FakeHub hub = new FakeHub(r -> r.respond(204, null))) {
+            hub.client().server(hub.url() + "/xzfe-aeeg-e2da/").build().check();
+            hub.client().server(hub.url()).build().check();
+            eq("/xzfe-aeeg-e2da/api/tunnel/check", hub.requests.get(0).path, "request path under a custom prefix");
+            eq("/pf/api/tunnel/check", hub.requests.get(1).path, "request path under the default prefix");
         }
     }
 
