@@ -112,9 +112,18 @@ public interface Transport {
             this.canceller = canceller;
         }
 
-        /** The hub's address, as https://host[:port]. */
+        /** The hub's address with its prefix, as https://host[:port]&lt;prefix&gt;, such as https://host/pf. */
         public String server() {
             return client.server();
+        }
+
+        /**
+         * The request path of a tunnel endpoint under the hub's prefix, for
+         * {@link #get}: {@code <prefix>/api/tunnel/<endpoint>}, such as
+         * {@code /pf/api/tunnel/quic} (docs/PROTOCOL.md §2).
+         */
+        public String apiPath(String endpoint) {
+            return client.apiPath(endpoint);
         }
 
         public String word() {
@@ -153,9 +162,9 @@ public interface Transport {
         }
 
         /**
-         * A GET of the hub's HTTPS endpoint, verified as the Client's own
-         * requests are. Any answer comes back; only a failure to get one
-         * throws.
+         * A GET of path (made with {@link #apiPath}) on the hub's HTTPS
+         * endpoint, verified as the Client's own requests are. Any answer
+         * comes back; only a failure to get one throws.
          */
         public HttpAnswer get(String path, Map<String, String> headers) throws IOException {
             Map<String, String> h = Http.headers();
